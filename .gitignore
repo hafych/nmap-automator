@@ -1,0 +1,81 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments and secrets — НИКОГДА не коммить!
+.env
+.env.local
+.env.*.local
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs and runtime-generated data
+scan_log.txt
+scan_log.json
+scan_log.db
+
+# Encrypted results — генерируются при работе
+encrypted_results/
+*.enc
+
+
+# Dependency management
+poetry.lock
+pdm.lock
+.pdm.toml
+.pdm-python
+.pdm-build/
+__pypackages__/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+MANIFEST
+*.spec
+*.manifest
+
+# Test, coverage, cache
+.coverage
+.pytest_cache/
+htmlcov/
+.nox/
+.tox/
+.cache/
+.hypothesis/
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Type checkers and linters
+.mypy_cache/
+.pytype/
+.pyre/
+.dmypy.json
+dmypy.json
+
+# Jupyter / Notebooks
+.ipynb_checkpoints/
+
+# Cython / C extensions
+*.so
+cython_debug/
+
+# Project-specific
+.spyderproject
+.spyproject
+.ropeproject
+/site
+*.sage.py
+celerybeat-schedule
+celerybeat.pid
