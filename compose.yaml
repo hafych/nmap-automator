@@ -1,0 +1,26 @@
+services:
+  nmap-automator:
+    build:
+      context: .
+      dockerfile: dockerfile
+    environment:
+      APP_HOST: 0.0.0.0
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN in .env}
+      FERNET_KEY: ${FERNET_KEY:?Set FERNET_KEY in .env}
+    ports:
+      - "127.0.0.1:5000:5000"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - scan-results:/app/encrypted_results
+      - scan-logs:/app/logs
+    restart: unless-stopped
+    stop_grace_period: 40s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  scan-results:
+  scan-logs:
