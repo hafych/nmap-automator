@@ -37,7 +37,7 @@ UI_HTML = r"""<!doctype html>
     }
 
     button {
-      min-height: 40px;
+      min-height: 44px;
       border: 1px solid var(--ink);
       border-radius: var(--radius);
       background: var(--ink);
@@ -154,7 +154,25 @@ UI_HTML = r"""<!doctype html>
       background: #fff;
       color: var(--ink);
       padding: 10px 11px;
-      outline: none;
+    }
+
+    input, select { min-height: 44px; }
+
+    :focus-visible {
+      outline: 3px solid #0b6bcb;
+      outline-offset: 2px;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
 
     textarea {
@@ -199,7 +217,7 @@ UI_HTML = r"""<!doctype html>
       background: #fff;
       color: var(--ink);
       border-color: var(--line);
-      min-height: 34px;
+      min-height: 44px;
     }
 
     .tabs button.active {
@@ -306,7 +324,7 @@ UI_HTML = r"""<!doctype html>
         <h1>Nmap Operator Console</h1>
         <p class="hint">Authorized network scanning, task control, and AI-readable output.</p>
       </div>
-      <div class="status-strip" id="statusStrip">
+      <div class="status-strip" id="statusStrip" aria-live="polite">
         <span class="pill">API <strong id="apiStatus">checking</strong></span>
         <span class="pill">Nmap <strong id="nmapStatus">unknown</strong></span>
         <span class="pill">Tasks <strong id="taskCount">0</strong></span>
@@ -346,7 +364,7 @@ UI_HTML = r"""<!doctype html>
             <button class="secondary" id="scheduleBtn" type="button">Schedule</button>
           </div>
           <p class="hint">The token stays in browser session storage. Results are returned by the existing API.</p>
-          <div class="toast" id="toast"></div>
+          <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
         </div>
       </aside>
 
@@ -377,6 +395,7 @@ UI_HTML = r"""<!doctype html>
               <div class="metric"><b id="toolMissing">0</b><span>missing</span></div>
               <div class="metric"><b id="toolProfiles">0</b><span>profiles</span></div>
             </div>
+            <label class="sr-only" for="toolsBox">Tool inventory output</label>
             <textarea id="toolsBox" readonly placeholder="Refresh to build a Kali tool inventory and AI handoff."></textarea>
           </div>
         </section>
@@ -384,11 +403,11 @@ UI_HTML = r"""<!doctype html>
         <section class="panel">
           <header>
             <h2>Result Workspace</h2>
-            <div class="tabs">
-              <button class="active" data-view="summary" type="button">Summary</button>
-              <button data-view="json" type="button">JSON</button>
-              <button data-view="jsonl" type="button">JSONL</button>
-              <button data-view="plan" type="button">Recon Plan</button>
+            <div class="tabs" role="tablist" aria-label="Result view">
+              <button class="active" data-view="summary" type="button" role="tab" aria-selected="true" aria-controls="resultBox">Summary</button>
+              <button data-view="json" type="button" role="tab" aria-selected="false" aria-controls="resultBox">JSON</button>
+              <button data-view="jsonl" type="button" role="tab" aria-selected="false" aria-controls="resultBox">JSONL</button>
+              <button data-view="plan" type="button" role="tab" aria-selected="false" aria-controls="resultBox">Recon Plan</button>
             </div>
           </header>
           <div class="panel-body">
@@ -404,7 +423,8 @@ UI_HTML = r"""<!doctype html>
                 <button class="secondary" id="copyBtn" type="button">Copy View</button>
               </div>
             </div>
-            <textarea id="resultBox" readonly></textarea>
+            <label class="sr-only" for="resultBox">Selected scan result view</label>
+            <textarea id="resultBox" role="tabpanel" readonly></textarea>
           </div>
         </section>
       </div>
@@ -453,7 +473,7 @@ UI_HTML = r"""<!doctype html>
       try { body = text ? JSON.parse(text) : null; } catch { body = text; }
       if (!response.ok) {
         const detail = body && body.error ? body.error : response.statusText;
-        throw new Error(detail);
+        throw new Error(`${response.status}: ${detail}`);
       }
       return body;
     }
@@ -545,7 +565,7 @@ UI_HTML = r"""<!doctype html>
       }
     }
 
-    async function refresh() {
+    async function refresh({ announce = true } = {}) {
       try {
         const docs = await api("/api/docs");
         state.apiHeader = docs?.security?.api_auth_header || "X-API-KEY";
@@ -557,7 +577,7 @@ UI_HTML = r"""<!doctype html>
         $("taskCount").textContent = tasks.length;
         $("runningCount").textContent = tasks.filter((task) => task.running).length;
         renderTasks(tasks);
-        say("Dashboard refreshed.");
+        if (announce) say("Dashboard refreshed.");
       } catch (error) {
         $("apiStatus").textContent = "auth needed";
         say(error.message, true);
@@ -576,11 +596,14 @@ UI_HTML = r"""<!doctype html>
         row.className = "task";
         row.innerHTML = `<div><code></code><div class="mini">${task.running ? "running" : "stopped"}${task.cancelled ? " / cancelled" : ""}</div></div><button class="danger" type="button">Cancel</button>`;
         row.querySelector("code").textContent = task.id;
-        row.querySelector("button").addEventListener("click", async () => {
+        const cancelButton = row.querySelector("button");
+        cancelButton.setAttribute("aria-label", `Cancel scheduled task ${task.id}`);
+        cancelButton.addEventListener("click", async () => {
+          if (!window.confirm(`Cancel scheduled task ${task.id}?`)) return;
           try {
             await api(`/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" });
             say("Task cancelled.");
-            await refresh();
+            await refresh({ announce: false });
           } catch (error) {
             say(error.message, true);
           }
@@ -638,7 +661,7 @@ UI_HTML = r"""<!doctype html>
         });
         renderResult();
         say("Scan complete.");
-        await refresh();
+        await refresh({ announce: false });
       } catch (error) {
         say(error.message, true);
       } finally {
@@ -658,7 +681,11 @@ UI_HTML = r"""<!doctype html>
           body: JSON.stringify({ scan: state.lastResult })
         });
         state.view = "plan";
-        document.querySelectorAll(".tabs button").forEach((item) => item.classList.toggle("active", item.dataset.view === "plan"));
+        document.querySelectorAll(".tabs button").forEach((item) => {
+          const selected = item.dataset.view === "plan";
+          item.classList.toggle("active", selected);
+          item.setAttribute("aria-selected", String(selected));
+        });
         renderResult();
         say(`Recon plan built: ${(state.lastPlan.summary || {}).recommendations || 0} steps.`);
       } catch (error) {
@@ -674,7 +701,7 @@ UI_HTML = r"""<!doctype html>
         const body = { target: $("target").value, scan_type: $("scanType").value, interval: Number($("interval").value) };
         await api("/schedule", { method: "POST", body: JSON.stringify(body) });
         say("Scan scheduled.");
-        await refresh();
+        await refresh({ announce: false });
       } catch (error) {
         say(error.message, true);
       } finally {
@@ -684,22 +711,30 @@ UI_HTML = r"""<!doctype html>
 
     $("scanBtn").addEventListener("click", runScan);
     $("scheduleBtn").addEventListener("click", scheduleScan);
-    $("refreshBtn").addEventListener("click", refresh);
+    $("refreshBtn").addEventListener("click", () => refresh());
     $("toolsBtn").addEventListener("click", refreshTools);
     $("planBtn").addEventListener("click", buildPlan);
-    $("copyToolsBtn").addEventListener("click", async () => {
-      await navigator.clipboard.writeText(state.toolsContext || $("toolsBox").value);
-      say("Copied tool AI context.");
-    });
-    $("copyBtn").addEventListener("click", async () => {
-      await navigator.clipboard.writeText($("resultBox").value);
-      say("Copied current view.");
-    });
+    async function copyText(content, successMessage) {
+      try {
+        await navigator.clipboard.writeText(content);
+        say(successMessage);
+      } catch {
+        say("Copy failed. Select the text and copy it manually.", true);
+      }
+    }
+
+    $("copyToolsBtn").addEventListener("click", () =>
+      copyText(state.toolsContext || $("toolsBox").value, "Copied tool AI context."));
+    $("copyBtn").addEventListener("click", () =>
+      copyText($("resultBox").value, "Copied current view."));
 
     document.querySelectorAll(".tabs button").forEach((button) => {
       button.addEventListener("click", () => {
-        document.querySelectorAll(".tabs button").forEach((item) => item.classList.remove("active"));
-        button.classList.add("active");
+        document.querySelectorAll(".tabs button").forEach((item) => {
+          const selected = item === button;
+          item.classList.toggle("active", selected);
+          item.setAttribute("aria-selected", String(selected));
+        });
         state.view = button.dataset.view;
         renderResult();
       });

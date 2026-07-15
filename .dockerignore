@@ -2,11 +2,16 @@
 .github
 .gitignore
 .venv
+.ruff_cache
 __pycache__
 *.py[cod]
 *.log
+.coverage*
+.DS_Store
 .env
 ai_reports
 encrypted_results
 logs
+scan_log.txt
 test_*.py
+*.md
