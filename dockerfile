@@ -1,3 +1,4 @@
+# Recon Operator — multi-tool recon control plane
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -19,12 +20,12 @@ COPY requirements.txt ./
 RUN python -m pip install -r requirements.txt
 
 COPY --chown=app:app . .
-RUN mkdir -p encrypted_results logs \
-    && chown -R app:app encrypted_results logs
+RUN mkdir -p encrypted_results logs data \
+    && chown -R app:app encrypted_results logs data
 
 USER app
 EXPOSE 5000
-VOLUME ["/app/encrypted_results", "/app/logs"]
+VOLUME ["/app/encrypted_results", "/app/logs", "/app/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]

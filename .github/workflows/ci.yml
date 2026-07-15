@@ -68,5 +68,5 @@ jobs:
 
       - name: Security checks
         run: |
-          bandit -q -ll -r . -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_tool_inventory.py
+          bandit -q -ll -r . -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_scan_engine.py,./test_state_store.py,./test_tool_inventory.py
           pip-audit -r requirements.txt

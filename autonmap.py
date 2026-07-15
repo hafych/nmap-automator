@@ -12,50 +12,57 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-import nmap
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from quart import Quart, jsonify, request
 from telegram import Bot
 from telegram.error import TelegramError
 
 from recon_planner import build_recon_plan, recon_plan_to_jsonl, recon_plan_to_markdown
+from scan_engine import (
+    PRODUCT_NAME,
+    DiscoveryError,
+    NmapNotFoundError,
+    NmapScanError,
+    NmapTimeoutError,
+    available_discovery_engines,
+    diff_scan_results,
+    import_nmap_xml,
+    run_nmap_scan,
+    supported_scan_types,
+    validate_discovery,
+    validate_ports_expression,
+    validate_scripts_expression,
+)
+from state_store import StateStore
 from tool_inventory import build_tool_inventory, inventory_to_jsonl, inventory_to_markdown
 from ui import UI_HTML
 
 load_dotenv()
 
 """
-Быстрое сканирование:
-curl -X POST http://localhost:5000/scan \
-    -H "Content-Type: application/json" \
-    -d '{"target": "127.0.0.1", "scan_type": "Ping"}'
+Recon Operator — multi-tool recon control plane (Nmap engine, Kali inventory, planner).
 
-Планирование сканирования:
-curl -X POST http://localhost:5000/schedule \
-    -H "Content-Type: application/json" \
-    -d '{"target": "192.168.1.1", "scan_type": "TCP", "interval": 10}'
+Immediate scan (async job):
+curl -X POST http://127.0.0.1:5000/scan \\
+  -H "X-API-KEY: $API_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"target":"127.0.0.1","scan_type":"Ping"}'
 
-Управление задачами:
-# Список задач
-curl http://localhost:5000/tasks
-
-# Отмена задачи
-curl -X DELETE http://localhost:5000/tasks/192.168.1.1-TCP
-
-# Health check
-curl http://localhost:5000/health
+Poll job:
+curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 """
 
 
-# Глобальные переменные
-start_time = datetime.now()
-VERSION = "1.1.0"
+start_time = datetime.now(timezone.utc)
+VERSION = "1.4.0"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -113,12 +120,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Конфиденциальные данные из переменных среды
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN and CHAT_ID else None
 
-# Безопасные настройки API
 API_AUTH_REQUIRED = _parse_bool_env("API_AUTH_REQUIRED", True)
 API_AUTH_HEADER = os.getenv("API_AUTH_HEADER", "X-API-KEY").strip() or "X-API-KEY"
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
@@ -127,7 +132,6 @@ if API_AUTH_REQUIRED and not API_AUTH_TOKEN:
         "API_AUTH_REQUIRED=true, but API_AUTH_TOKEN is empty. Set API_AUTH_TOKEN for security."
     )
 
-# Защита от перегруза
 RATE_LIMIT_WINDOW_SECONDS = _parse_int_env(
     "RATE_LIMIT_WINDOW_SECONDS", default=60, min_value=1, max_value=3600
 )
@@ -141,6 +145,7 @@ MAX_CONCURRENT_SCANS = _parse_int_env("MAX_CONCURRENT_SCANS", default=2, min_val
 MAX_SCHEDULED_TASKS = _parse_int_env(
     "MAX_SCHEDULED_TASKS", default=100, min_value=1, max_value=10_000
 )
+MAX_SCAN_JOBS = _parse_int_env("MAX_SCAN_JOBS", default=200, min_value=10, max_value=10_000)
 SCAN_TIMEOUT_SECONDS = _parse_int_env(
     "SCAN_TIMEOUT_SECONDS", default=1800, min_value=60, max_value=7200
 )
@@ -160,46 +165,59 @@ MIN_SCHEDULE_INTERVAL_MINUTES = _parse_int_env(
 MAX_SCHEDULE_INTERVAL_MINUTES = _parse_int_env(
     "MAX_SCHEDULE_INTERVAL_MINUTES", default=10_080, min_value=1, max_value=525_600
 )
+RESULTS_MAX_FILES = _parse_int_env("RESULTS_MAX_FILES", default=500, min_value=1, max_value=100_000)
+RESULTS_MAX_AGE_DAYS = _parse_int_env(
+    "RESULTS_MAX_AGE_DAYS", default=0, min_value=0, max_value=3650
+)
+MAX_IMPORT_XML_BYTES = _parse_int_env(
+    "MAX_IMPORT_XML_BYTES", default=64 * 1024 * 1024, min_value=1024, max_value=64 * 1024 * 1024
+)
+STATE_DB_PATH = (
+    os.getenv("STATE_DB_PATH", "data/recon_operator.db").strip() or "data/recon_operator.db"
+)
 if MIN_SCHEDULE_INTERVAL_MINUTES > MAX_SCHEDULE_INTERVAL_MINUTES:
     raise RuntimeError(
         "MIN_SCHEDULE_INTERVAL_MINUTES must not exceed MAX_SCHEDULE_INTERVAL_MINUTES"
     )
 
-# Таймауты/настройки Nmap из окружения
 HOST_TIMEOUT_SEC = _parse_int_env("NMAP_HOST_TIMEOUT_SEC", default=300, min_value=1, max_value=3600)
 NMAP_MAX_RETRIES = _parse_int_env("NMAP_MAX_RETRIES", default=2, min_value=0, max_value=10)
 
-# Генерация/загрузка ключа для шифрования
 FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
 if not FERNET_KEY:
     raise RuntimeError(
-        "FERNET_KEY не задан! Укажите его в .env или переменных окружения. "
-        "Без него нельзя расшифровать результаты."
+        "FERNET_KEY is not set. Provide it in .env or the environment. "
+        "Without it stored results cannot be decrypted."
     )
 try:
     cipher = Fernet(FERNET_KEY.encode())
 except Exception as exc:
     raise RuntimeError(
-        "Неверный FERNET_KEY. Проверьте формат (должен быть валидным Fernet key)."
+        "Invalid FERNET_KEY. Check the format (must be a valid Fernet key)."
     ) from exc
 
 
 app = Quart(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BODY_BYTES
-scan_tasks = {}
+scan_tasks: Dict[str, asyncio.Task] = {}
+scan_jobs: Dict[str, Dict[str, Any]] = {}
 rate_limits = defaultdict(list)
 tool_inventory_cache = {}
 tool_inventory_locks = defaultdict(threading.Lock)
 _scan_semaphore: Optional[asyncio.Semaphore] = None
+_jobs_lock = asyncio.Lock()
+state_store = StateStore(STATE_DB_PATH)
 
-SUPPORTED_SCAN_TYPES = {
-    "SYN": "-sS",
-    "TCP": "-sT",
-    "UDP": "-sU",
-    "Aggressive": "-A",
-    "OS": "-O",
-    "Ping": "-sn",
-}
+SUPPORTED_SCAN_TYPES = {name: name for name in supported_scan_types()}
+RESULT_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}_\w+_\d{8}_\d{6}_\d+\.json$")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    return _utc_now().isoformat()
 
 
 def _normalize_scan_type(scan_type: str) -> Optional[str]:
@@ -212,12 +230,6 @@ def _normalize_scan_type(scan_type: str) -> Optional[str]:
             return key
 
     return None
-
-
-auth_domain_re = re.compile(
-    r"^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}|localhost)$",
-    re.IGNORECASE,
-)
 
 
 def _get_scan_semaphore() -> asyncio.Semaphore:
@@ -238,21 +250,29 @@ def log_event(event: str):
 
 def _validate_scan_payload(
     payload: Optional[Dict],
-) -> Tuple[Optional[str], Optional[str], Optional[float], Optional[str]]:
-    """Return target, scan_type, interval (optional), error_code."""
+) -> Tuple[
+    Optional[str],
+    Optional[str],
+    Optional[float],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    """Return target, scan_type, interval, ports, scripts, discovery, error."""
     if not isinstance(payload, dict):
-        return None, None, None, "Отсутствуют или некорректные данные запроса"
+        return None, None, None, None, None, None, "Missing or invalid request body"
 
     target = payload.get("target")
     if isinstance(target, str):
         target = target.strip()
 
     if not target:
-        return None, None, None, "Не указан target"
+        return None, None, None, None, None, None, "target is required"
 
     scan_type = payload.get("scan_type", "TCP")
     if not isinstance(scan_type, str):
-        return None, None, None, "scan_type должен быть строкой"
+        return None, None, None, None, None, None, "scan_type must be a string"
 
     normalized_scan_type = _normalize_scan_type(scan_type)
     if normalized_scan_type is None:
@@ -260,42 +280,101 @@ def _validate_scan_payload(
             None,
             None,
             None,
-            f"Недопустимый scan_type. Допустимые: {get_scan_type_choices()}",
+            None,
+            None,
+            None,
+            f"Invalid scan_type. Allowed: {get_scan_type_choices()}",
         )
     scan_type = normalized_scan_type
+
+    ports, ports_error = validate_ports_expression(payload.get("ports"))
+    if ports_error:
+        return target, scan_type, None, None, None, None, ports_error
+    scripts, scripts_error = validate_scripts_expression(payload.get("scripts"))
+    if scripts_error:
+        return target, scan_type, None, None, None, None, scripts_error
+    discovery, discovery_error = validate_discovery(payload.get("discovery"))
+    if discovery_error:
+        return target, scan_type, None, None, None, None, discovery_error
 
     interval = payload.get("interval", 30)
     interval_value = None
     if interval is not None:
         if isinstance(interval, bool) or not isinstance(interval, (int, float)):
-            return target, scan_type, None, "Интервал должен быть числом"
+            return target, scan_type, None, ports, scripts, discovery, "interval must be a number"
         try:
             interval_value = float(interval)
         except (OverflowError, ValueError):
-            return target, scan_type, None, "Интервал должен быть конечным числом"
+            return (
+                target,
+                scan_type,
+                None,
+                ports,
+                scripts,
+                discovery,
+                "interval must be a finite number",
+            )
         if not math.isfinite(interval_value):
-            return target, scan_type, None, "Интервал должен быть конечным числом"
+            return (
+                target,
+                scan_type,
+                None,
+                ports,
+                scripts,
+                discovery,
+                "interval must be a finite number",
+            )
         if interval_value <= 0:
-            return target, scan_type, None, "Интервал должен быть положительным числом"
+            return (
+                target,
+                scan_type,
+                None,
+                ports,
+                scripts,
+                discovery,
+                "interval must be a positive number",
+            )
         if interval_value < MIN_SCHEDULE_INTERVAL_MINUTES:
             return (
                 target,
                 scan_type,
                 None,
-                f"Интервал должен быть не меньше {MIN_SCHEDULE_INTERVAL_MINUTES} мин.",
+                ports,
+                scripts,
+                discovery,
+                f"interval must be at least {MIN_SCHEDULE_INTERVAL_MINUTES} minutes",
             )
         if interval_value > MAX_SCHEDULE_INTERVAL_MINUTES:
             return (
                 target,
                 scan_type,
                 None,
-                f"Интервал должен быть не больше {MAX_SCHEDULE_INTERVAL_MINUTES} мин.",
+                ports,
+                scripts,
+                discovery,
+                f"interval must be at most {MAX_SCHEDULE_INTERVAL_MINUTES} minutes",
             )
 
     if not validate_ip_or_host(target):
-        return target, scan_type, interval_value, "Неверный IP, CIDR или домен"
+        return (
+            target,
+            scan_type,
+            interval_value,
+            ports,
+            scripts,
+            discovery,
+            "Invalid IP, CIDR, or hostname",
+        )
 
-    return _canonicalize_valid_target(target), scan_type, interval_value, None
+    return (
+        _canonicalize_valid_target(target),
+        scan_type,
+        interval_value,
+        ports,
+        scripts,
+        discovery,
+        None,
+    )
 
 
 def require_api_auth():
@@ -304,9 +383,9 @@ def require_api_auth():
 
     token = request.headers.get(API_AUTH_HEADER)
     if not token:
-        return jsonify({"error": f"Не указан API токен ({API_AUTH_HEADER})"}), 401
+        return jsonify({"error": f"API token missing ({API_AUTH_HEADER})"}), 401
     if not secrets.compare_digest(token, API_AUTH_TOKEN):
-        return jsonify({"error": "Неверный API токен"}), 403
+        return jsonify({"error": "Invalid API token"}), 403
     return None
 
 
@@ -323,13 +402,13 @@ def _cleanup_finished_tasks() -> list:
         try:
             task = scan_tasks.pop(task_id)
             if task.cancelled():
-                log_event(f"Задача {task_id} удалена из реестра после отмены")
+                log_event(f"Task {task_id} removed from registry after cancellation")
             else:
                 exception = task.exception()
                 if exception is not None:
-                    log_event(f"Задача {task_id} завершилась с ошибкой: {exception}")
+                    log_event(f"Task {task_id} finished with error: {exception}")
         except Exception as e:
-            log_event(f"Ошибка удаления задачи {task_id}: {e}")
+            log_event(f"Error removing task {task_id}: {e}")
 
     return finished_task_ids
 
@@ -396,18 +475,18 @@ def get_cached_tool_inventory(expand: bool = False) -> Dict:
 
 async def send_telegram_message(message: str):
     if not bot:
-        log_event("Telegram не настроен. Сообщение не отправлено.")
+        log_event("Telegram is not configured. Message not sent.")
         return
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message)
     except TelegramError as e:
-        log_event(f"Ошибка отправки сообщения в Telegram: {e}")
+        log_event(f"Telegram send error: {e}")
     except Exception as e:
-        log_event(f"Неожиданная ошибка при отправке Telegram сообщения: {e}")
+        log_event(f"Unexpected Telegram error: {e}")
 
 
 def validate_ip_or_host(target: str) -> bool:
-    """Валидация IP, сети и домена."""
+    """Validate IP, network, or domain syntax."""
     if not isinstance(target, str) or not target:
         return False
 
@@ -415,7 +494,6 @@ def validate_ip_or_host(target: str) -> bool:
     if len(target) > 253:
         return False
 
-    # Блокируем наиболее опасные символы для предотвращения нестабильного поведения
     dangerous_chars = [";", "&", "|", "`", "$", "(", ")", "<", ">", "\\", "\n", "\r", "\t"]
     if any(char in target for char in dangerous_chars):
         log_event(f"Potential injection-like input detected in target: {target}")
@@ -430,6 +508,10 @@ def validate_ip_or_host(target: str) -> bool:
             return False
         return True
     except ValueError:
+        auth_domain_re = re.compile(
+            r"^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}|localhost)$",
+            re.IGNORECASE,
+        )
         return auth_domain_re.fullmatch(target) is not None
 
 
@@ -445,60 +527,86 @@ def _canonicalize_valid_target(target: str) -> str:
 
 
 def build_scan_args(scan_type: str) -> str:
+    """Legacy helper retained for tests and docs; engine builds argv lists."""
     if scan_type not in SUPPORTED_SCAN_TYPES:
-        raise ValueError(f"Недопустимый scan_type: {scan_type}")
-
-    base = SUPPORTED_SCAN_TYPES[scan_type]
-    extra = [f"--host-timeout {HOST_TIMEOUT_SEC}s", f"--max-retries {NMAP_MAX_RETRIES}"]
-
-    return f"{base} {' '.join(extra)}"
+        raise ValueError(f"Invalid scan_type: {scan_type}")
+    return f"{scan_type} --host-timeout {HOST_TIMEOUT_SEC}s --max-retries {NMAP_MAX_RETRIES}"
 
 
-def scan_network(target: str, scan_type: str):
+def scan_network(
+    target: str,
+    scan_type: str,
+    ports: Optional[str] = None,
+    scripts: Optional[str] = None,
+    discovery: Optional[str] = None,
+) -> dict:
     """
-    СИНХРОННАЯ функция, запускается в ThreadPool.
-    Исключения НЕ глотаем — пусть летят в async слой.
+    Synchronous scan entry point used by the async executor.
+    Exceptions propagate to the async layer.
     """
-    scanner = nmap.PortScanner()
-    scan_args = build_scan_args(scan_type)
-    log_event(f"Запуск сканирования {target} с типом {scan_type} и аргументами: {scan_args}")
-
+    log_event(
+        f"Starting scan {target} type={scan_type} ports={ports} "
+        f"scripts={scripts} discovery={discovery}"
+    )
     try:
-        scanner.scan(target, arguments=scan_args, timeout=SCAN_TIMEOUT_SECONDS)
-    except nmap.PortScannerTimeout as exc:
-        raise TimeoutError(f"Nmap did not finish within {SCAN_TIMEOUT_SECONDS} seconds") from exc
-    return process_scan_results(scanner)
+        return run_nmap_scan(
+            target,
+            scan_type,
+            host_timeout_sec=HOST_TIMEOUT_SEC,
+            max_retries=NMAP_MAX_RETRIES,
+            scan_timeout_sec=SCAN_TIMEOUT_SECONDS,
+            ports=ports,
+            scripts=scripts,
+            discovery=discovery,
+        )
+    except NmapTimeoutError as exc:
+        raise TimeoutError(str(exc)) from exc
+    except DiscoveryError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
-def process_scan_results(scanner: nmap.PortScanner) -> dict:
-    results = {
-        "scan_time": datetime.now().isoformat(),
-        "scan_count": len(scanner.all_hosts()),
-        "hosts": [],
-    }
-    for host in scanner.all_hosts():
-        host_data = {
-            "host": host,
-            "hostname": scanner[host].hostname() or "N/A",
-            "state": scanner[host].state(),
-            "protocols": {},
-        }
-        for proto in scanner[host].all_protocols():
-            ports = []
-            for port in sorted(scanner[host][proto].keys()):
-                pi = scanner[host][proto][port]
-                ports.append(
-                    {
-                        "port": port,
-                        "state": pi.get("state", "unknown"),
-                        "name": pi.get("name", "unknown"),
-                        "product": pi.get("product", "unknown"),
-                        "version": pi.get("version", "unknown"),
-                    }
-                )
-            host_data["protocols"][proto] = ports
-        results["hosts"].append(host_data)
-    return results
+def _result_files() -> List[Path]:
+    directory = Path(RESULTS_DIR)
+    if not directory.is_dir():
+        return []
+    return sorted(
+        (path for path in directory.iterdir() if path.is_file() and path.suffix == ".json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def apply_results_retention(directory: Optional[str] = None) -> Dict[str, int]:
+    """Delete old encrypted results by count and optional age."""
+    root = Path(directory or RESULTS_DIR)
+    if not root.is_dir():
+        return {"deleted": 0, "remaining": 0}
+
+    files = [path for path in root.iterdir() if path.is_file() and path.suffix == ".json"]
+    deleted = 0
+    now = time.time()
+
+    if RESULTS_MAX_AGE_DAYS > 0:
+        max_age_seconds = RESULTS_MAX_AGE_DAYS * 86400
+        for path in list(files):
+            try:
+                if now - path.stat().st_mtime > max_age_seconds:
+                    path.unlink()
+                    deleted += 1
+                    files.remove(path)
+            except OSError as exc:
+                log_event(f"Retention age cleanup failed for {path}: {exc}")
+
+    files.sort(key=lambda path: path.stat().st_mtime)
+    while len(files) > RESULTS_MAX_FILES:
+        path = files.pop(0)
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError as exc:
+            log_event(f"Retention count cleanup failed for {path}: {exc}")
+
+    return {"deleted": deleted, "remaining": len(files)}
 
 
 def _write_encrypted_result(path: str, encrypted_data: bytes) -> None:
@@ -521,9 +629,9 @@ def _write_encrypted_result(path: str, encrypted_data: bytes) -> None:
             os.unlink(temporary_path)
 
 
-async def save_scan_results_async(results: dict, target: str, scan_type: str):
+async def save_scan_results_async(results: dict, target: str, scan_type: str) -> Optional[str]:
     if not results:
-        return
+        return None
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_target = "".join(c if c.isalnum() or c in [".", "_", "-"] else "_" for c in target)[:120]
@@ -533,37 +641,244 @@ async def save_scan_results_async(results: dict, target: str, scan_type: str):
     try:
         encrypted_data = cipher.encrypt(json.dumps(results, indent=2).encode())
         await asyncio.to_thread(_write_encrypted_result, path, encrypted_data)
-        log_event(f"Результаты сохранены в {path}")
-        await send_telegram_message(f"Сканирование {target} завершено. Результаты: {filename}")
+        await asyncio.to_thread(apply_results_retention, RESULTS_DIR)
+        log_event(f"Results saved to {path}")
+        await send_telegram_message(f"Scan {target} finished. Results: {filename}")
+        return filename
     except Exception as e:
-        err = f"Ошибка сохранения результатов: {e}"
+        err = f"Error saving results: {e}"
         log_event(err)
-        await send_telegram_message(f"Ошибка сохранения результатов для {target}: {e}")
+        await send_telegram_message(f"Error saving results for {target}: {e}")
         raise
 
 
-async def async_scan(target: str, scan_type: str):
+def _job_public_view(job: Dict[str, Any], *, include_result: bool = True) -> Dict[str, Any]:
+    view = {
+        "job_id": job["job_id"],
+        "target": job["target"],
+        "scan_type": job["scan_type"],
+        "ports": job.get("ports"),
+        "scripts": job.get("scripts"),
+        "discovery": job.get("discovery"),
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "error": job.get("error"),
+        "result_file": job.get("result_file"),
+        "kind": job.get("kind", "immediate"),
+    }
+    if include_result and job.get("status") == "completed":
+        view["result"] = job.get("result")
+    return view
+
+
+def _persist_job(job: Dict[str, Any]) -> None:
+    try:
+        state_store.upsert_job(job)
+        state_store.prune_jobs(MAX_SCAN_JOBS)
+    except Exception as exc:
+        log_event(f"Failed to persist job {job.get('job_id')}: {exc}")
+
+
+async def _prune_jobs_locked() -> None:
+    """Keep completed/failed jobs within MAX_SCAN_JOBS."""
+    if len(scan_jobs) <= MAX_SCAN_JOBS:
+        return
+    terminal = [
+        job
+        for job in scan_jobs.values()
+        if job["status"] in {"completed", "failed", "cancelled", "timeout"}
+    ]
+    terminal.sort(key=lambda item: item.get("finished_at") or item.get("created_at") or "")
+    overflow = len(scan_jobs) - MAX_SCAN_JOBS
+    for job in terminal[:overflow]:
+        removed = scan_jobs.pop(job["job_id"], None)
+        if removed:
+            try:
+                state_store.delete_job(job["job_id"])
+            except Exception as exc:
+                log_event(f"Failed to delete persisted job {job['job_id']}: {exc}")
+
+
+async def _set_job_fields(job_id: str, **fields: Any) -> None:
+    async with _jobs_lock:
+        job = scan_jobs.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        _persist_job(job)
+
+
+async def _run_scan_job(job_id: str) -> None:
+    async with _jobs_lock:
+        job = scan_jobs.get(job_id)
+        if not job or job["status"] == "cancelled":
+            return
+        job["status"] = "running"
+        job["started_at"] = _utc_now_iso()
+        target = job["target"]
+        scan_type = job["scan_type"]
+        ports = job.get("ports")
+        scripts = job.get("scripts")
+        discovery = job.get("discovery")
+        _persist_job(job)
+
     loop = asyncio.get_running_loop()
     try:
         async with _get_scan_semaphore():
             results = await asyncio.wait_for(
-                loop.run_in_executor(None, scan_network, target, scan_type),
+                loop.run_in_executor(
+                    None,
+                    lambda: scan_network(
+                        target,
+                        scan_type,
+                        ports=ports,
+                        scripts=scripts,
+                        discovery=discovery,
+                    ),
+                ),
                 timeout=SCAN_TIMEOUT_SECONDS + 5,
             )
-    except asyncio.TimeoutError as e:
-        err = f"Таймаут сканирования {target} ({scan_type})"
-        log_event(err)
-        await send_telegram_message(f" {err}")
-        raise TimeoutError(err) from e
-    except Exception as e:
-        err = f"Ошибка при сканировании {target} ({scan_type}): {e}"
-        log_event(err)
-        await send_telegram_message(f" {err}")
+        result_file = await save_scan_results_async(results, target, scan_type)
+        await _set_job_fields(
+            job_id,
+            status="completed",
+            finished_at=_utc_now_iso(),
+            result=results,
+            result_file=result_file,
+            error=None,
+        )
+    except asyncio.CancelledError:
+        await _set_job_fields(
+            job_id,
+            status="cancelled",
+            finished_at=_utc_now_iso(),
+            error="Scan cancelled",
+        )
         raise
+    except asyncio.TimeoutError:
+        err = f"Scan timeout for {target} ({scan_type})"
+        log_event(err)
+        await send_telegram_message(err)
+        await _set_job_fields(
+            job_id,
+            status="timeout",
+            finished_at=_utc_now_iso(),
+            error=err,
+        )
+    except TimeoutError as exc:
+        err = str(exc)
+        log_event(err)
+        await send_telegram_message(err)
+        await _set_job_fields(
+            job_id,
+            status="timeout",
+            finished_at=_utc_now_iso(),
+            error=err,
+        )
+    except (NmapNotFoundError, NmapScanError, Exception) as exc:
+        err = f"Scan error for {target} ({scan_type}): {exc}"
+        log_event(err)
+        await send_telegram_message(err)
+        await _set_job_fields(
+            job_id,
+            status="failed",
+            finished_at=_utc_now_iso(),
+            error=str(exc),
+        )
+    finally:
+        async with _jobs_lock:
+            job = scan_jobs.get(job_id)
+            if job:
+                job["task"] = None
+            await _prune_jobs_locked()
 
-    if results:
-        await save_scan_results_async(results, target, scan_type)
-    return results
+
+async def create_scan_job(
+    target: str,
+    scan_type: str,
+    *,
+    kind: str = "immediate",
+    ports: Optional[str] = None,
+    scripts: Optional[str] = None,
+    discovery: Optional[str] = None,
+) -> Dict[str, Any]:
+    async with _jobs_lock:
+        await _prune_jobs_locked()
+        active = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
+        if active >= MAX_SCAN_JOBS:
+            raise RuntimeError("Scan job capacity reached")
+
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "target": target,
+            "scan_type": scan_type,
+            "ports": ports,
+            "scripts": scripts,
+            "discovery": discovery,
+            "status": "queued",
+            "created_at": _utc_now_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+            "result": None,
+            "result_file": None,
+            "kind": kind,
+            "task": None,
+        }
+        scan_jobs[job_id] = job
+        _persist_job(job)
+        task = asyncio.create_task(_run_scan_job(job_id))
+        job["task"] = task
+        return _job_public_view(job, include_result=False)
+
+
+async def async_scan(
+    target: str,
+    scan_type: str,
+    ports: Optional[str] = None,
+    scripts: Optional[str] = None,
+    discovery: Optional[str] = None,
+) -> dict:
+    """Run a scan and wait for completion (used by scheduled scans)."""
+    job = await create_scan_job(
+        target,
+        scan_type,
+        kind="scheduled",
+        ports=ports,
+        scripts=scripts,
+        discovery=discovery,
+    )
+    job_id = job["job_id"]
+    while True:
+        async with _jobs_lock:
+            current = scan_jobs.get(job_id)
+            if not current:
+                raise RuntimeError("Scan job disappeared")
+            status = current["status"]
+            if status in {"completed", "failed", "cancelled", "timeout"}:
+                if status == "completed":
+                    return current.get("result") or {}
+                if status == "timeout":
+                    raise TimeoutError(current.get("error") or "Scan timed out")
+                if status == "cancelled":
+                    raise asyncio.CancelledError()
+                raise RuntimeError(current.get("error") or "Scan failed")
+            task = current.get("task")
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Job state is the source of truth; continue loop.
+                pass
+        else:
+            await asyncio.sleep(0.05)
 
 
 @app.route("/scan", methods=["POST"])
@@ -574,55 +889,137 @@ async def start_scan():
             return auth_error
 
         if not check_rate_limit():
-            return jsonify({"error": "Превышен лимит запросов"}), 429
+            return jsonify({"error": "Rate limit exceeded"}), 429
 
         data = await request.get_json(silent=True)
-        target, scan_type, _, error = _validate_scan_payload(data)
+        target, scan_type, _, ports, scripts, discovery, error = _validate_scan_payload(data)
         if error:
             return jsonify({"error": error}), 400
 
-        log_event(f"Получен запрос на сканирование: {target}, тип: {scan_type}")
-        results = await async_scan(target, scan_type)
-        return jsonify(results or {"message": "Сканирование завершено без результатов"}), 200
-    except TimeoutError as e:
-        err = f"Таймаут сканирования: {e}"
-        log_event(err)
-        await send_telegram_message(f"API timeout: {err}")
-        return jsonify({"error": str(e)}), 504
+        wait = _bool_query_param("wait", False)
+        log_event(f"Scan requested: {target}, type={scan_type}, wait={wait}")
+
+        if wait:
+            try:
+                results = await async_scan(
+                    target,
+                    scan_type,
+                    ports=ports,
+                    scripts=scripts,
+                    discovery=discovery,
+                )
+            except TimeoutError as e:
+                return jsonify({"error": str(e)}), 504
+            except Exception as e:
+                log_event(f"API error in /scan wait mode: {e}")
+                return jsonify({"error": "Internal scan error"}), 500
+            return jsonify(results or {"message": "Scan completed with no results"}), 200
+
+        job = await create_scan_job(
+            target,
+            scan_type,
+            kind="immediate",
+            ports=ports,
+            scripts=scripts,
+            discovery=discovery,
+        )
+        return jsonify(job), 202
     except Exception as e:
-        err = f"API ошибка в /scan: {e}"
+        err = f"API error in /scan: {e}"
         log_event(err)
-        await send_telegram_message(f"API ошибка: {e}")
-        return jsonify({"error": "Внутренняя ошибка сканирования"}), 500
+        await send_telegram_message(f"API error: {e}")
+        return jsonify({"error": "Internal scan error"}), 500
 
 
-async def periodic_scan(target: str, scan_type: str, interval_minutes: float):
-    """Асинхронное периодическое сканирование"""
+@app.route("/jobs", methods=["GET"])
+async def list_jobs():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+
+    async with _jobs_lock:
+        jobs = [
+            _job_public_view(job, include_result=False)
+            for job in sorted(
+                scan_jobs.values(),
+                key=lambda item: item.get("created_at") or "",
+                reverse=True,
+            )
+        ]
+    return jsonify(jobs), 200
+
+
+@app.route("/jobs/<job_id>", methods=["GET"])
+async def get_job(job_id: str):
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+
+    async with _jobs_lock:
+        job = scan_jobs.get(job_id)
+    if not job:
+        job = await asyncio.to_thread(state_store.get_job, job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+    return jsonify(_job_public_view(job, include_result=True)), 200
+
+
+@app.route("/jobs/<job_id>", methods=["DELETE"])
+async def cancel_job(job_id: str):
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+
+    async with _jobs_lock:
+        job = scan_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] in {"completed", "failed", "cancelled", "timeout"}:
+            return jsonify({"message": f"Job already {job['status']}", "job_id": job_id}), 200
+        task = job.get("task")
+        job["status"] = "cancelled"
+        job["finished_at"] = _utc_now_iso()
+        job["error"] = "Scan cancelled"
+        if task is not None and not task.done():
+            task.cancel()
+    log_event(f"Job {job_id} cancelled")
+    return jsonify({"message": f"Job {job_id} cancelled", "job_id": job_id}), 200
+
+
+async def periodic_scan(
+    target: str,
+    scan_type: str,
+    interval_minutes: float,
+    ports: Optional[str] = None,
+    scripts: Optional[str] = None,
+    discovery: Optional[str] = None,
+):
+    """Async recurring scan loop."""
     try:
         interval = float(interval_minutes)
     except (TypeError, ValueError):
-        raise ValueError("Интервал должен быть числом")
+        raise ValueError("interval must be a number")
 
     if interval <= 0:
-        raise ValueError("Интервал должен быть положительным числом")
+        raise ValueError("interval must be a positive number")
 
-    log_event(f"Запущено периодическое сканирование {target} каждые {interval} минут")
+    log_event(f"Started periodic scan {target} every {interval} minutes")
     await send_telegram_message(
-        f"Запущено периодическое сканирование {target} каждые {interval} минут"
+        f"{PRODUCT_NAME}: started periodic scan {target} every {interval} minutes"
     )
 
     while True:
         _cleanup_finished_tasks()
         try:
-            log_event(f"Выполняется периодическое сканирование: {target}")
-            await async_scan(target, scan_type)
+            log_event(f"Running periodic scan: {target}")
+            await async_scan(target, scan_type, ports=ports, scripts=scripts, discovery=discovery)
         except asyncio.CancelledError:
-            log_event(f"Периодическое сканирование {target} отменено")
+            log_event(f"Periodic scan {target} cancelled")
             break
         except Exception as e:
-            err = f"Ошибка периодического сканирования {target}: {e}"
+            err = f"Periodic scan error for {target}: {e}"
             log_event(err)
-            await send_telegram_message(f" {err}")
+            await send_telegram_message(err)
 
         try:
             await asyncio.sleep(interval * 60)
@@ -638,10 +1035,10 @@ async def add_scheduled_scan():
             return auth_error
 
         if not check_rate_limit():
-            return jsonify({"error": "Превышен лимит запросов"}), 429
+            return jsonify({"error": "Rate limit exceeded"}), 429
 
         data = await request.get_json(silent=True)
-        target, scan_type, interval, error = _validate_scan_payload(data)
+        target, scan_type, interval, ports, scripts, discovery, error = _validate_scan_payload(data)
         if error:
             return jsonify({"error": error}), 400
 
@@ -651,24 +1048,46 @@ async def add_scheduled_scan():
         task_id = f"{target}-{scan_type}"
         _cleanup_finished_tasks()
         if task_id in scan_tasks:
-            return jsonify({"error": "Сканирование уже запланировано"}), 400
+            return jsonify({"error": "Scan already scheduled"}), 400
         if len(scan_tasks) >= MAX_SCHEDULED_TASKS:
-            return jsonify({"error": "Достигнут лимит запланированных задач"}), 429
+            return jsonify({"error": "Scheduled task limit reached"}), 429
 
-        task = asyncio.create_task(periodic_scan(target, scan_type, interval))
+        task = asyncio.create_task(
+            periodic_scan(
+                target,
+                scan_type,
+                interval,
+                ports=ports,
+                scripts=scripts,
+                discovery=discovery,
+            )
+        )
         scan_tasks[task_id] = task
-        log_event(f"Сканирование {target} запланировано каждые {interval} минут")
+        try:
+            state_store.upsert_scheduled_task(
+                task_id,
+                target,
+                scan_type,
+                interval,
+                ports=ports,
+                scripts=scripts,
+                discovery=discovery,
+                created_at=_utc_now_iso(),
+            )
+        except Exception as exc:
+            log_event(f"Failed to persist scheduled task {task_id}: {exc}")
+        log_event(f"Scan {target} scheduled every {interval} minutes")
 
         return jsonify(
             {
-                "message": f"Сканирование {target} запланировано каждые {interval} минут",
+                "message": f"Scan {target} scheduled every {interval} minutes",
                 "task_id": task_id,
             }
         ), 200
     except Exception as e:
-        err = f"Ошибка в /schedule: {e}"
+        err = f"Error in /schedule: {e}"
         log_event(err)
-        return jsonify({"error": "Внутренняя ошибка планировщика"}), 500
+        return jsonify({"error": "Internal scheduler error"}), 500
 
 
 @app.route("/tasks", methods=["GET"])
@@ -700,10 +1119,196 @@ async def cancel_task(task_id):
     if task_id in scan_tasks:
         scan_tasks[task_id].cancel()
         del scan_tasks[task_id]
-        log_event(f"Задача {task_id} отменена")
-        await send_telegram_message(f"Задача {task_id} отменена")
-        return jsonify({"message": f"Задача {task_id} отменена"}), 200
-    return jsonify({"error": "Задача не найдена"}), 404
+        try:
+            state_store.delete_scheduled_task(task_id)
+        except Exception as exc:
+            log_event(f"Failed to delete persisted task {task_id}: {exc}")
+        log_event(f"Task {task_id} cancelled")
+        await send_telegram_message(f"Task {task_id} cancelled")
+        return jsonify({"message": f"Task {task_id} cancelled"}), 200
+    return jsonify({"error": "Task not found"}), 404
+
+
+def _safe_result_path(result_id: str) -> Optional[Path]:
+    name = os.path.basename(result_id.strip())
+    if name != result_id.strip() or ".." in name:
+        return None
+    if not RESULT_FILENAME_RE.fullmatch(name) and not re.fullmatch(
+        r"^[A-Za-z0-9._-]{1,220}\.json$", name
+    ):
+        return None
+    path = Path(RESULTS_DIR).resolve() / name
+    try:
+        path.resolve().relative_to(Path(RESULTS_DIR).resolve())
+    except ValueError:
+        return None
+    return path if path.is_file() else None
+
+
+@app.route("/results", methods=["GET"])
+async def list_results():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+
+    limit = _parse_optional_limit(request.args.get("limit"), default=50, max_value=500)
+    files = await asyncio.to_thread(_result_files)
+    items = []
+    for path in files[:limit]:
+        try:
+            stat = path.stat()
+            items.append(
+                {
+                    "id": path.name,
+                    "filename": path.name,
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                }
+            )
+        except OSError:
+            continue
+    return jsonify({"count": len(items), "results": items}), 200
+
+
+def _parse_optional_limit(raw: Optional[str], default: int, max_value: int) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < 1:
+        return default
+    return min(value, max_value)
+
+
+@app.route("/results/<path:result_id>", methods=["GET"])
+async def get_result(result_id: str):
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+
+    path = _safe_result_path(result_id)
+    if path is None:
+        return jsonify({"error": "Result not found"}), 404
+
+    try:
+        encrypted = await asyncio.to_thread(path.read_bytes)
+        plaintext = cipher.decrypt(encrypted)
+        payload = json.loads(plaintext.decode("utf-8"))
+    except InvalidToken:
+        return jsonify({"error": "Unable to decrypt result with configured FERNET_KEY"}), 500
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log_event(f"Result read error for {result_id}: {exc}")
+        return jsonify({"error": "Result file is unreadable"}), 500
+
+    return jsonify({"id": path.name, "filename": path.name, "result": payload}), 200
+
+
+async def _load_result_reference(ref: Any) -> Tuple[Optional[dict], Optional[str]]:
+    """Resolve a result object or {id: filename} reference."""
+    if isinstance(ref, dict) and isinstance(ref.get("hosts"), list):
+        return ref, None
+    if isinstance(ref, dict) and ref.get("result") and isinstance(ref["result"], dict):
+        return ref["result"], None
+    result_id = None
+    if isinstance(ref, str):
+        result_id = ref
+    elif isinstance(ref, dict):
+        result_id = ref.get("id") or ref.get("filename") or ref.get("result_id")
+    if not result_id or not isinstance(result_id, str):
+        return None, "Expected a scan result object or result id"
+    path = _safe_result_path(result_id)
+    if path is None:
+        return None, f"Result not found: {result_id}"
+    try:
+        encrypted = await asyncio.to_thread(path.read_bytes)
+        plaintext = cipher.decrypt(encrypted)
+        return json.loads(plaintext.decode("utf-8")), None
+    except InvalidToken:
+        return None, "Unable to decrypt result with configured FERNET_KEY"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log_event(f"Result load error for {result_id}: {exc}")
+        return None, "Result file is unreadable"
+
+
+@app.route("/results/import", methods=["POST"])
+async def import_result_xml():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    content_type = (request.content_type or "").lower()
+    target_label = ""
+    scan_type = "Import"
+    xml_bytes: Optional[bytes] = None
+
+    if "application/json" in content_type:
+        data = await request.get_json(silent=True)
+        if not isinstance(data, dict) or not isinstance(data.get("xml"), str):
+            return jsonify({"error": "Expected JSON body with xml string"}), 400
+        xml_bytes = data["xml"].encode("utf-8")
+        if isinstance(data.get("target"), str):
+            target_label = data["target"].strip()
+        if isinstance(data.get("scan_type"), str) and data["scan_type"].strip():
+            scan_type = data["scan_type"].strip()[:40]
+    else:
+        xml_bytes = await request.get_data(cache=False)
+        target_label = (request.args.get("target") or "").strip()
+
+    if not xml_bytes:
+        return jsonify({"error": "Empty XML payload"}), 400
+    if len(xml_bytes) > MAX_IMPORT_XML_BYTES:
+        return jsonify(
+            {"error": f"XML exceeds {MAX_IMPORT_XML_BYTES // (1024 * 1024)} MiB limit"}
+        ), 413
+
+    try:
+        result = await asyncio.to_thread(
+            import_nmap_xml,
+            xml_bytes,
+            target=target_label or "xml-import",
+            scan_type=scan_type,
+        )
+    except Exception as exc:
+        log_event(f"XML import failed: {exc}")
+        return jsonify({"error": f"XML import failed: {exc}"}), 400
+
+    filename = await save_scan_results_async(
+        result, result.get("target") or "xml-import", scan_type
+    )
+    return jsonify({"id": filename, "filename": filename, "result": result}), 201
+
+
+@app.route("/results/diff", methods=["POST"])
+async def diff_results():
+    auth_error = require_api_auth()
+    if auth_error:
+        return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    data = await request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected JSON with baseline and current"}), 400
+
+    baseline, baseline_error = await _load_result_reference(
+        data.get("baseline") or data.get("old") or data.get("a")
+    )
+    if baseline_error:
+        return jsonify({"error": f"baseline: {baseline_error}"}), 400
+    current, current_error = await _load_result_reference(
+        data.get("current") or data.get("new") or data.get("b")
+    )
+    if current_error:
+        return jsonify({"error": f"current: {current_error}"}), 400
+
+    diff = await asyncio.to_thread(diff_scan_results, baseline, current)
+    return jsonify(diff), 200
 
 
 @app.route("/tools", methods=["GET"])
@@ -712,7 +1317,7 @@ async def tools_inventory():
     if auth_error:
         return auth_error
     if not check_rate_limit():
-        return jsonify({"error": "Превышен лимит запросов"}), 429
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     expand = _bool_query_param("expand", False)
     inventory = await asyncio.to_thread(get_cached_tool_inventory, expand=expand)
@@ -725,7 +1330,7 @@ async def tools_ai_context():
     if auth_error:
         return auth_error
     if not check_rate_limit():
-        return jsonify({"error": "Превышен лимит запросов"}), 429
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     expand = _bool_query_param("expand", False)
     output_format = request.args.get("format", "jsonl").strip().lower()
@@ -749,7 +1354,7 @@ async def recon_plan():
     if auth_error:
         return auth_error
     if not check_rate_limit():
-        return jsonify({"error": "Превышен лимит запросов"}), 429
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     data = await request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -816,22 +1421,35 @@ async def health_check():
     _cleanup_finished_tasks()
     nmap_available = _check_nmap_available()
     status = "healthy" if nmap_available else "unhealthy"
+    async with _jobs_lock:
+        jobs_count = len(scan_jobs)
+        active_jobs = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
 
     return (
         jsonify(
             {
                 "status": status,
+                "product": PRODUCT_NAME,
                 "version": VERSION,
                 "tasks_count": len(scan_tasks),
+                "jobs_count": jobs_count,
+                "active_jobs": active_jobs,
                 "telegram_configured": bot is not None,
-                "uptime": str(datetime.now() - start_time),
+                "uptime": str(_utc_now() - start_time),
                 "fernet_key_configured": bool(FERNET_KEY),
                 "nmap_available": nmap_available,
                 "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
                 "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
                 "max_concurrent_scans": MAX_CONCURRENT_SCANS,
                 "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
+                "max_scan_jobs": MAX_SCAN_JOBS,
                 "max_target_addresses": MAX_TARGET_ADDRESSES,
+                "results_max_files": RESULTS_MAX_FILES,
+                "results_max_age_days": RESULTS_MAX_AGE_DAYS,
+                "state_db": STATE_DB_PATH,
+                "discovery_engines": {
+                    name: bool(path) for name, path in available_discovery_engines().items()
+                },
             }
         ),
         200 if nmap_available else 503,
@@ -842,7 +1460,8 @@ async def health_check():
 async def api_docs():
     return jsonify(
         {
-            "name": "Nmap Automation Framework API",
+            "name": f"{PRODUCT_NAME} API",
+            "product": PRODUCT_NAME,
             "version": VERSION,
             "security": {
                 "api_auth_required": API_AUTH_REQUIRED,
@@ -850,21 +1469,35 @@ async def api_docs():
                 "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} requests per {RATE_LIMIT_WINDOW_SECONDS} seconds",
                 "max_concurrent_scans": MAX_CONCURRENT_SCANS,
             },
+            "scan_types": list(SUPPORTED_SCAN_TYPES.keys()),
             "endpoints": {
                 "POST /scan": {
-                    "description": "Немедленное сканирование сети",
+                    "description": "Queue an immediate scan (202 job) or wait with ?wait=1",
                     "request": {
-                        "target": "IP адрес, диапазон или домен",
-                        "scan_type": "SYN|TCP|UDP|Aggressive|OS|Ping",
+                        "target": "IP address, CIDR, or hostname",
+                        "scan_type": "TCP|SYN|UDP|OS|Aggressive|Ping|Version|Safe|Vuln|Full|Hybrid|HybridNaabu|HybridRustScan",
+                        "ports": "Optional Nmap port expression",
+                        "scripts": "Optional extra NSE script names",
+                        "discovery": "Optional auto|naabu|rustscan|none",
                     },
-                    "example": {"target": "192.168.1.1", "scan_type": "TCP"},
+                    "query": {"wait": "If true, block until the scan finishes"},
+                    "example": {
+                        "target": "192.168.1.1",
+                        "scan_type": "Version",
+                        "ports": "22,80,443",
+                    },
                 },
+                "GET /jobs": {"description": "List recent scan jobs"},
+                "GET /jobs/<job_id>": {"description": "Get scan job status and result"},
+                "DELETE /jobs/<job_id>": {"description": "Cancel a queued or running job"},
                 "POST /schedule": {
-                    "description": "Планирование периодического сканирования",
+                    "description": "Schedule a recurring scan",
                     "request": {
-                        "target": "IP адрес, диапазон или домен",
-                        "scan_type": "Тип сканирования",
-                        "interval": "Интервал в минутах",
+                        "target": "IP address, range, or hostname",
+                        "scan_type": "Scan type",
+                        "interval": "Interval in minutes",
+                        "ports": "Optional ports",
+                        "scripts": "Optional NSE scripts",
                     },
                     "example": {
                         "target": "192.168.1.0/24",
@@ -872,18 +1505,28 @@ async def api_docs():
                         "interval": 30,
                     },
                 },
-                "GET /tasks": {"description": "Список активных задач"},
-                "DELETE /tasks/<task_id>": {"description": "Отмена задачи по ID"},
-                "GET /health": {"description": "Проверка состояния сервиса"},
+                "GET /tasks": {"description": "List scheduled tasks"},
+                "DELETE /tasks/<task_id>": {"description": "Cancel a scheduled task"},
+                "GET /results": {"description": "List encrypted result files"},
+                "GET /results/<id>": {"description": "Decrypt and return a stored result"},
+                "POST /results/import": {
+                    "description": "Import Nmap XML, encrypt, and return parsed result",
+                    "request": {"xml": "Nmap XML string", "target": "optional label"},
+                },
+                "POST /results/diff": {
+                    "description": "Diff two scan results (objects or stored result ids)",
+                    "request": {"baseline": "result or {id}", "current": "result or {id}"},
+                },
+                "GET /health": {"description": "Service health check"},
                 "GET /tools": {
-                    "description": "Инвентаризация официальных Kali/pentest инструментов"
+                    "description": "Inventory of Kali/pentest tools across recon categories"
                 },
                 "GET /tools/ai-context": {
-                    "description": "JSONL/Markdown контекст инструментов для GPT/Claude"
+                    "description": "JSONL/Markdown tool context for GPT/Claude"
                 },
                 "POST /recon/plan": {
-                    "description": "AI-readable next-step recon plan from parsed Nmap results",
-                    "request": {"scan": "Parsed /scan response or object with hosts[]"},
+                    "description": "Review-only multi-tool recon plan from parsed scan results",
+                    "request": {"scan": "Parsed scan response or object with hosts[]"},
                     "formats": "json|jsonl|markdown",
                 },
             },
@@ -892,7 +1535,7 @@ async def api_docs():
 
 
 async def load_initial_tasks():
-    """Загрузка начальных задач из переменной окружения"""
+    """Load startup scheduled tasks from the environment."""
     initial_tasks_raw = os.getenv("INITIAL_TASKS", "[]")
     if not initial_tasks_raw.strip():
         return
@@ -900,20 +1543,22 @@ async def load_initial_tasks():
     try:
         initial_tasks = json.loads(initial_tasks_raw)
         if not isinstance(initial_tasks, list):
-            log_event("INITIAL_TASKS должен быть массивом")
+            log_event("INITIAL_TASKS must be an array")
             return
 
         for task_config in initial_tasks:
             if len(scan_tasks) >= MAX_SCHEDULED_TASKS:
                 log_event(
-                    f"INITIAL_TASKS: достигнут лимит {MAX_SCHEDULED_TASKS}; остальные задачи пропущены"
+                    f"INITIAL_TASKS: reached limit {MAX_SCHEDULED_TASKS}; remaining tasks skipped"
                 )
                 break
             if not isinstance(task_config, dict):
-                log_event("INITIAL_TASKS содержит некорректный элемент")
+                log_event("INITIAL_TASKS contains an invalid element")
                 continue
 
-            target, scan_type, interval, error = _validate_scan_payload(task_config)
+            target, scan_type, interval, ports, scripts, discovery, error = _validate_scan_payload(
+                task_config
+            )
             if error:
                 log_event(f"INITIAL_TASKS: skipped task ({error}). Payload: {task_config}")
                 continue
@@ -925,21 +1570,93 @@ async def load_initial_tasks():
             if task_id in scan_tasks:
                 continue
 
-            task = asyncio.create_task(periodic_scan(target, scan_type, interval))
+            task = asyncio.create_task(
+                periodic_scan(
+                    target,
+                    scan_type,
+                    interval,
+                    ports=ports,
+                    scripts=scripts,
+                    discovery=discovery,
+                )
+            )
             scan_tasks[task_id] = task
-            log_event(f"Загружена начальная задача: {target} ({scan_type}) каждые {interval} минут")
+            try:
+                state_store.upsert_scheduled_task(
+                    task_id,
+                    target,
+                    scan_type,
+                    interval,
+                    ports=ports,
+                    scripts=scripts,
+                    discovery=discovery,
+                    created_at=_utc_now_iso(),
+                )
+            except Exception as exc:
+                log_event(f"Failed to persist INITIAL_TASKS entry {task_id}: {exc}")
+            log_event(f"Loaded initial task: {target} ({scan_type}) every {interval} minutes")
     except json.JSONDecodeError as e:
-        log_event(f"Ошибка парсинга INITIAL_TASKS (JSON): {e}")
+        log_event(f"INITIAL_TASKS JSON parse error: {e}")
     except (KeyError, TypeError) as e:
-        log_event(f"Ошибка в структуре INITIAL_TASKS: {e}")
+        log_event(f"INITIAL_TASKS structure error: {e}")
     except Exception as e:
-        log_event(f"Ошибка загрузки INITIAL_TASKS: {e}")
+        log_event(f"INITIAL_TASKS load error: {e}")
+
+
+async def load_persisted_state():
+    """Restore job history and scheduled tasks from SQLite after restart."""
+    try:
+        jobs = await asyncio.to_thread(state_store.list_jobs, MAX_SCAN_JOBS)
+    except Exception as exc:
+        log_event(f"Failed to load persisted jobs: {exc}")
+        jobs = []
+
+    async with _jobs_lock:
+        for job in jobs:
+            # Do not resume in-flight work across restarts.
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "failed"
+                job["error"] = "Interrupted by service restart"
+                job["finished_at"] = job.get("finished_at") or _utc_now_iso()
+                try:
+                    state_store.upsert_job(job)
+                except Exception as exc:
+                    log_event(f"Failed to finalize interrupted job {job.get('job_id')}: {exc}")
+            scan_jobs[job["job_id"]] = job
+        log_event(f"Loaded {len(scan_jobs)} persisted scan jobs from {STATE_DB_PATH}")
+
+    try:
+        tasks = await asyncio.to_thread(state_store.list_scheduled_tasks)
+    except Exception as exc:
+        log_event(f"Failed to load persisted scheduled tasks: {exc}")
+        return
+
+    for row in tasks:
+        if len(scan_tasks) >= MAX_SCHEDULED_TASKS:
+            log_event("Persisted scheduled tasks: limit reached; remaining skipped")
+            break
+        task_id = row["task_id"]
+        if task_id in scan_tasks:
+            continue
+        task = asyncio.create_task(
+            periodic_scan(
+                row["target"],
+                row["scan_type"],
+                float(row["interval_minutes"]),
+                ports=row.get("ports"),
+                scripts=row.get("scripts"),
+                discovery=row.get("discovery"),
+            )
+        )
+        scan_tasks[task_id] = task
+        log_event(f"Restored scheduled task {task_id} every {row['interval_minutes']} minutes")
 
 
 async def main():
-    log_event(f"Сервис запущен (версия {VERSION})")
-    await send_telegram_message(f"Nmap Automation Framework v{VERSION} запущен")
+    log_event(f"{PRODUCT_NAME} started (version {VERSION})")
+    await send_telegram_message(f"{PRODUCT_NAME} v{VERSION} started")
 
+    await load_persisted_state()
     await load_initial_tasks()
 
     loop = asyncio.get_running_loop()
@@ -979,34 +1696,43 @@ async def main():
             stop_waiter.cancel()
 
         if stop_event.is_set():
-            log_event("Получен сигнал остановки")
-        await send_telegram_message("Nmap Automation Framework останавливается")
+            log_event("Stop signal received")
+        await send_telegram_message(f"{PRODUCT_NAME} is shutting down")
 
         _cleanup_finished_tasks()
         scheduled_tasks = list(scan_tasks.values())
         for task in scheduled_tasks:
             task.cancel()
 
-        shutdown_tasks = [*scheduled_tasks, server_task]
+        async with _jobs_lock:
+            job_tasks = [
+                job["task"]
+                for job in scan_jobs.values()
+                if job.get("task") is not None and not job["task"].done()
+            ]
+            for task in job_tasks:
+                task.cancel()
+
+        shutdown_tasks = [*scheduled_tasks, *job_tasks, server_task]
         try:
             await asyncio.wait_for(
                 asyncio.gather(*shutdown_tasks, return_exceptions=True),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
-            log_event("Принудительная остановка задач по таймауту")
+            log_event("Forced task shutdown after timeout")
             for task in shutdown_tasks:
                 task.cancel()
             await asyncio.gather(*shutdown_tasks, return_exceptions=True)
 
-        log_event("Сервис остановлен")
-        await send_telegram_message("Nmap Automation Framework остановлен")
+        log_event("Service stopped")
+        await send_telegram_message(f"{PRODUCT_NAME} stopped")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log_event("Получен сигнал KeyboardInterrupt")
+        log_event("KeyboardInterrupt received")
     except Exception as e:
-        log_event(f"Критическая ошибка: {e}")
+        log_event(f"Critical error: {e}")

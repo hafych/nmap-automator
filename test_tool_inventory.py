@@ -6,6 +6,7 @@ os.environ.setdefault("API_AUTH_TOKEN", "test-token")
 os.environ.setdefault("FERNET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "")
+os.environ.setdefault("STATE_DB_PATH", "/tmp/recon-operator-test.db")
 
 import autonmap
 import tool_inventory

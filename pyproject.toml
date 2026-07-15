@@ -17,6 +17,8 @@ source = [
   "decrypt",
   "kali_ai_scan",
   "recon_planner",
+  "scan_engine",
+  "state_store",
   "tool_inventory",
   "ui",
 ]
@@ -24,4 +26,4 @@ source = [
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-fail_under = 55
+fail_under = 58
