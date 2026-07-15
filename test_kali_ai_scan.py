@@ -1,5 +1,6 @@
 import contextlib
 import io
+import stat
 import tempfile
 import unittest
 from argparse import Namespace
@@ -148,6 +149,66 @@ class KaliAiScanTests(unittest.TestCase):
                 kali_ai_scan.subprocess.run = original_run
 
             self.assertEqual(exit_code, 124)
+
+    def test_artifacts_are_private_and_output_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xml_path = root / "sample.xml"
+            output_path = root / "report"
+            xml_path.write_text(SAMPLE_XML, encoding="utf-8")
+
+            original_version = kali_ai_scan.nmap_version
+            original_packages = kali_ai_scan.package_status
+            original_policy = kali_ai_scan.apt_policy
+            kali_ai_scan.nmap_version = lambda: {"ok": True}
+            kali_ai_scan.package_status = lambda _packages: {"available": False}
+            kali_ai_scan.apt_policy = lambda _package: {"available": False}
+            try:
+                kali_ai_scan.create_artifacts(xml_path, output_path)
+            finally:
+                kali_ai_scan.nmap_version = original_version
+                kali_ai_scan.package_status = original_packages
+                kali_ai_scan.apt_policy = original_policy
+
+            self.assertEqual(stat.S_IMODE(output_path.stat().st_mode), 0o700)
+            for artifact in output_path.iterdir():
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600, artifact.name)
+            self.assertEqual(list(output_path.glob(".*.tmp")), [])
+
+
+class CliValidationRegressionTests(unittest.TestCase):
+    def test_cli_rejects_unbounded_or_invalid_nmap_limits(self):
+        invalid_arguments = (
+            ["run", "127.0.0.1", "--scan-timeout", "0"],
+            ["run", "127.0.0.1", "--scan-timeout", "-1"],
+            ["run", "127.0.0.1", "--host-timeout", "0s"],
+            ["run", "127.0.0.1", "--host-timeout", "nan"],
+            ["run", "127.0.0.1", "--max-retries", "-1"],
+        )
+
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        kali_ai_scan.build_parser().parse_args(arguments)
+
+    def test_cli_accepts_bounded_limits_and_zero_retries(self):
+        args = kali_ai_scan.build_parser().parse_args(
+            [
+                "run",
+                "127.0.0.1",
+                "--scan-timeout",
+                "1",
+                "--host-timeout",
+                "500ms",
+                "--max-retries",
+                "0",
+            ]
+        )
+
+        self.assertEqual(args.scan_timeout, 1)
+        self.assertEqual(args.host_timeout, "500ms")
+        self.assertEqual(args.max_retries, 0)
 
 
 if __name__ == "__main__":
