@@ -169,8 +169,8 @@ Missing tools не устанавливались автоматически: э
 ### P1 — выполнить перед multi-user/public deployment
 
 - [x] ~~SQLite persistence for jobs/schedules (single-node).~~ Redis multi-worker still open.
-- [x] ~~Multi API tokens (`API_AUTH_TOKENS`) — shared operators, not full tenant isolation.~~
-- [ ] Full tenant/user model + ownership of tasks/results.
+- [x] ~~Multi API tokens (`API_AUTH_TOKENS`) + per-token ownership of jobs/tasks/new results.~~
+- [ ] Full multi-tenant RBAC / UI accounts (token isolation only today).
 - [ ] Redis multi-worker rate limits / leases.
 - [ ] Поднять `autonmap.py` coverage до ≥75% (improved, still below target).
 - [ ] Добавить CI browser E2E + axe-core для keyboard/ARIA/responsive regressions.
@@ -179,9 +179,9 @@ Missing tools не устанавливались автоматически: э
 
 - [x] ~~CSP without `'unsafe-inline'` via per-response nonces for dashboard HTML.~~
 - [x] ~~Разделить liveness/readiness: `/live`, `/ready`, detailed `/health`.~~
-- [ ] Pin Docker base image и GitHub Actions по immutable digest/SHA; Dependabot должен обновлять их автоматически.
+- [x] ~~Pin Docker base image by digest.~~ (GitHub Actions digests still open)
 - [x] ~~OpenAPI 3 schema at `/openapi.json` (plus human `/api/docs`).~~
-- [ ] Retention для CLI `ai_reports` volumes (API encrypted retention уже есть).
+- [x] ~~Retention для CLI `ai_reports` (`AI_REPORTS_MAX_DIRS` / `AI_REPORTS_MAX_AGE_DAYS`).~~
 - [ ] Повторить GitNexus taint/PDG анализ после обновления index session.
 - [ ] Generated contract tests from OpenAPI (optional next step).
 

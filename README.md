@@ -231,7 +231,9 @@ This is not a multi-tenant authorization system. See [SECURITY.md](SECURITY.md).
 | `API_AUTH_HEADER` | `X-API-KEY` | Header carrying the API token |
 
 \* At least one of `API_AUTH_TOKEN` / `API_AUTH_TOKENS` is required when auth is enabled.
-Multiple tokens allow shared single-operator deployments without full multi-tenant isolation.
+Multiple tokens are isolated by ownership: jobs, scheduled tasks, and new encrypted
+results are tagged with a hash of the presenting token. Legacy untagged result files
+remain visible to any authenticated operator.
 | `APP_HOST` | `127.0.0.1` | Bind address |
 | `APP_PORT` | `5000` | Listen port |
 | `MAX_CONCURRENT_SCANS` | `2` | Maximum concurrent scans |
@@ -252,6 +254,8 @@ Multiple tokens allow shared single-operator deployments without full multi-tena
 | `RESULTS_MAX_FILES` | `500` | Max encrypted result files retained |
 | `RESULTS_MAX_AGE_DAYS` | `0` | Delete results older than N days (`0` = off) |
 | `STATE_DB_PATH` | `data/recon_operator.db` | SQLite for jobs + scheduled tasks |
+| `AI_REPORTS_MAX_DIRS` | `100` | Max CLI `ai_reports` run directories retained |
+| `AI_REPORTS_MAX_AGE_DAYS` | `0` | Delete CLI report dirs older than N days (`0` = off) |
 | `SCAN_LOG_PATH` | `logs/scan_log.txt` | Rotating application log |
 | `TOOL_INVENTORY_CACHE_SECONDS` | `300` | Kali inventory cache lifetime |
 | `INITIAL_TASKS` | `[]` | JSON array of startup recurring scans |
