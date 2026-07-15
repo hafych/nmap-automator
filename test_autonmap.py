@@ -7,6 +7,8 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
+from unittest import mock
 
 os.environ["API_AUTH_REQUIRED"] = "true"
 os.environ["API_AUTH_TOKEN"] = "test-token"
@@ -14,27 +16,41 @@ os.environ["FERNET_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 os.environ["SCAN_LOG_PATH"] = "/tmp/nmap-automator-test.log"
 os.environ["TELEGRAM_BOT_TOKEN"] = ""
 os.environ["TELEGRAM_CHAT_ID"] = ""
+os.environ["RESULTS_MAX_FILES"] = "500"
+os.environ["RESULTS_MAX_AGE_DAYS"] = "0"
+os.environ["STATE_DB_PATH"] = "/tmp/recon-operator-test.db"
 
 import autonmap
 
 
 class PayloadValidationTests(unittest.TestCase):
     def test_scan_type_is_case_insensitive_and_canonical(self):
-        target, scan_type, interval, error = autonmap._validate_scan_payload(
-            {"target": "127.0.0.1", "scan_type": "tcp", "interval": 5}
+        target, scan_type, interval, ports, scripts, discovery, error = (
+            autonmap._validate_scan_payload(
+                {
+                    "target": "127.0.0.1",
+                    "scan_type": "tcp",
+                    "interval": 5,
+                    "ports": "22,80",
+                    "discovery": "auto",
+                }
+            )
         )
 
         self.assertIsNone(error)
         self.assertEqual(target, "127.0.0.1")
         self.assertEqual(scan_type, "TCP")
         self.assertEqual(interval, 5.0)
+        self.assertEqual(ports, "22,80")
+        self.assertIsNone(scripts)
+        self.assertEqual(discovery, "auto")
 
     def test_bad_interval_is_rejected(self):
         *_, error = autonmap._validate_scan_payload(
             {"target": "127.0.0.1", "scan_type": "Ping", "interval": 0}
         )
 
-        self.assertEqual(error, "Интервал должен быть положительным числом")
+        self.assertEqual(error, "interval must be a positive number")
 
     def test_schedule_interval_is_bounded(self):
         *_, short_error = autonmap._validate_scan_payload(
@@ -52,11 +68,11 @@ class PayloadValidationTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("не меньше", short_error)
-        self.assertIn("не больше", long_error)
+        self.assertIn("at least", short_error)
+        self.assertIn("at most", long_error)
 
     def test_default_scan_type_is_unprivileged_tcp(self):
-        _, scan_type, _, error = autonmap._validate_scan_payload({"target": "127.0.0.1"})
+        _, scan_type, _, _, _, _, error = autonmap._validate_scan_payload({"target": "127.0.0.1"})
 
         self.assertIsNone(error)
         self.assertEqual(scan_type, "TCP")
@@ -64,37 +80,68 @@ class PayloadValidationTests(unittest.TestCase):
     def test_oversized_network_is_rejected(self):
         *_, error = autonmap._validate_scan_payload({"target": "10.0.0.0/8", "scan_type": "Ping"})
 
-        self.assertEqual(error, "Неверный IP, CIDR или домен")
+        self.assertEqual(error, "Invalid IP, CIDR, or hostname")
+
+    def test_version_and_vuln_profiles_are_accepted(self):
+        for profile in ("Version", "Safe", "Vuln", "Full", "Hybrid", "HybridNaabu"):
+            with self.subTest(profile=profile):
+                _, scan_type, _, _, _, _, error = autonmap._validate_scan_payload(
+                    {"target": "127.0.0.1", "scan_type": profile}
+                )
+                self.assertIsNone(error)
+                self.assertEqual(scan_type, profile)
+
+    def test_invalid_ports_are_rejected(self):
+        *_, error = autonmap._validate_scan_payload(
+            {"target": "127.0.0.1", "scan_type": "TCP", "ports": "80;id"}
+        )
+        self.assertIn("ports", error.lower())
 
     def test_syntactically_valid_domain_does_not_require_dns(self):
         self.assertTrue(autonmap.validate_ip_or_host("offline-host.example.invalid"))
 
 
 class ScanExecutionTests(unittest.TestCase):
-    def test_nmap_process_receives_total_timeout(self):
+    def test_scan_network_uses_unified_engine(self):
         captured = {}
 
-        class FakeScanner:
-            def scan(self, target, arguments, timeout):
-                captured.update({"target": target, "arguments": arguments, "timeout": timeout})
+        def fake_run(
+            target,
+            scan_type,
+            host_timeout_sec,
+            max_retries,
+            scan_timeout_sec,
+            ports=None,
+            scripts=None,
+            discovery=None,
+            **_kwargs,
+        ):
+            captured.update(
+                {
+                    "target": target,
+                    "scan_type": scan_type,
+                    "host_timeout_sec": host_timeout_sec,
+                    "max_retries": max_retries,
+                    "scan_timeout_sec": scan_timeout_sec,
+                    "ports": ports,
+                    "scripts": scripts,
+                    "discovery": discovery,
+                }
+            )
+            return {"hosts": [], "scan_count": 0}
 
-            def all_hosts(self):
-                return []
-
-        original_scanner = autonmap.nmap.PortScanner
-        autonmap.nmap.PortScanner = FakeScanner
-        try:
+        with mock.patch("autonmap.run_nmap_scan", side_effect=fake_run):
             result = autonmap.scan_network("127.0.0.1", "Ping")
-        finally:
-            autonmap.nmap.PortScanner = original_scanner
 
         self.assertEqual(result["hosts"], [])
-        self.assertEqual(captured["timeout"], autonmap.SCAN_TIMEOUT_SECONDS)
+        self.assertEqual(captured["scan_timeout_sec"], autonmap.SCAN_TIMEOUT_SECONDS)
+        self.assertEqual(captured["scan_type"], "Ping")
 
 
 class TaskCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         autonmap.scan_tasks.clear()
+        autonmap.scan_jobs.clear()
         autonmap.rate_limits.clear()
 
     async def test_finished_tasks_are_removed(self):
@@ -146,20 +193,42 @@ class ResultPersistenceTests(unittest.IsolatedAsyncioTestCase):
             autonmap.RESULTS_DIR = tmp
             autonmap.send_telegram_message = ignore_message
             try:
-                await autonmap.save_scan_results_async({"hosts": []}, "127.0.0.1", "Ping")
+                filename = await autonmap.save_scan_results_async(
+                    {"hosts": []}, "127.0.0.1", "Ping"
+                )
             finally:
                 autonmap.RESULTS_DIR = original_results_dir
                 autonmap.send_telegram_message = original_sender
 
             files = os.listdir(tmp)
             self.assertEqual(len(files), 1)
+            self.assertEqual(filename, files[0])
             mode = stat.S_IMODE(os.stat(os.path.join(tmp, files[0])).st_mode)
             self.assertEqual(mode, 0o600)
+
+    def test_retention_deletes_excess_files(self):
+        original_max = autonmap.RESULTS_MAX_FILES
+        autonmap.RESULTS_MAX_FILES = 2
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                for index in range(4):
+                    path = Path(tmp) / f"host_Ping_20260101_00000{index}_00000{index}.json"
+                    path.write_bytes(b"x")
+                    os.utime(path, (index + 1, index + 1))
+                summary = autonmap.apply_results_retention(tmp)
+                remaining = list(Path(tmp).glob("*.json"))
+        finally:
+            autonmap.RESULTS_MAX_FILES = original_max
+
+        self.assertEqual(summary["remaining"], 2)
+        self.assertEqual(summary["deleted"], 2)
+        self.assertEqual(len(remaining), 2)
 
 
 class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         autonmap.scan_tasks.clear()
+        autonmap.scan_jobs.clear()
         autonmap.rate_limits.clear()
         self.client = autonmap.app.test_client()
 
@@ -179,14 +248,19 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["status"], "healthy")
+        self.assertIn("jobs_count", payload)
 
     async def test_dashboard_loads(self):
         response = await self.client.get("/")
         body = await response.get_data(as_text=True)
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Nmap Operator Console", body)
+        self.assertIn("Recon Operator", body)
         self.assertIn("observations", body)
+        self.assertIn("Scan History", body)
+        self.assertIn("waitForJob", body)
+        self.assertIn("Import XML", body)
+        self.assertIn("Diff last two", body)
 
     async def test_responses_include_security_headers(self):
         response = await self.client.get("/health")
@@ -195,16 +269,68 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
 
+    async def test_scan_queues_job_by_default(self):
+        async def fake_create(
+            target, scan_type, kind="immediate", ports=None, scripts=None, discovery=None
+        ):
+            return {
+                "job_id": "job-1",
+                "target": target,
+                "scan_type": scan_type,
+                "status": "queued",
+                "created_at": "now",
+                "kind": kind,
+                "ports": ports,
+                "scripts": scripts,
+                "discovery": discovery,
+            }
+
+        original = autonmap.create_scan_job
+        autonmap.create_scan_job = fake_create
+        try:
+            response = await self.client.post(
+                "/scan",
+                headers={"X-API-KEY": "test-token"},
+                json={"target": "127.0.0.1", "scan_type": "Ping"},
+            )
+            payload = await response.get_json()
+        finally:
+            autonmap.create_scan_job = original
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(payload["job_id"], "job-1")
+        self.assertEqual(payload["status"], "queued")
+
+    async def test_scan_wait_mode_returns_result(self):
+        original_scan = autonmap.async_scan
+
+        async def fake_scan(target, scan_type, ports=None, scripts=None, discovery=None):
+            return {"hosts": [], "target": target, "scan_type": scan_type}
+
+        autonmap.async_scan = fake_scan
+        try:
+            response = await self.client.post(
+                "/scan?wait=1",
+                headers={"X-API-KEY": "test-token"},
+                json={"target": "127.0.0.1", "scan_type": "Ping"},
+            )
+            payload = await response.get_json()
+        finally:
+            autonmap.async_scan = original_scan
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["target"], "127.0.0.1")
+
     async def test_scan_timeout_returns_gateway_timeout(self):
         original_scan = autonmap.async_scan
 
-        async def timeout_scan(target, scan_type):
+        async def timeout_scan(target, scan_type, ports=None, scripts=None, discovery=None):
             raise TimeoutError("scan took too long")
 
         autonmap.async_scan = timeout_scan
         try:
             response = await self.client.post(
-                "/scan",
+                "/scan?wait=1",
                 headers={"X-API-KEY": "test-token"},
                 json={"target": "127.0.0.1", "scan_type": "Ping"},
             )
@@ -236,7 +362,182 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             autonmap.scan_tasks.clear()
 
         self.assertEqual(response.status_code, 429)
-        self.assertIn("лимит", payload["error"])
+        self.assertIn("limit", payload["error"].lower())
+
+    async def test_jobs_and_results_endpoints(self):
+        sample = {
+            "hosts": [{"host": "127.0.0.1", "hostname": "N/A", "state": "up", "protocols": {}}],
+            "scan_count": 1,
+        }
+        original_results_dir = autonmap.RESULTS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            filename = await autonmap.save_scan_results_async(sample, "127.0.0.1", "Ping")
+            list_response = await self.client.get("/results", headers={"X-API-KEY": "test-token"})
+            list_payload = await list_response.get_json()
+            get_response = await self.client.get(
+                f"/results/{filename}", headers={"X-API-KEY": "test-token"}
+            )
+            get_payload = await get_response.get_json()
+            autonmap.RESULTS_DIR = original_results_dir
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_payload["count"], 1)
+        self.assertEqual(get_response.status_code, 200)
+        self.assertEqual(get_payload["result"]["scan_count"], 1)
+
+        autonmap.scan_jobs["job-x"] = {
+            "job_id": "job-x",
+            "target": "127.0.0.1",
+            "scan_type": "Ping",
+            "status": "completed",
+            "created_at": "t0",
+            "started_at": "t1",
+            "finished_at": "t2",
+            "error": None,
+            "result": sample,
+            "result_file": filename,
+            "kind": "immediate",
+            "task": None,
+        }
+        job_response = await self.client.get("/jobs/job-x", headers={"X-API-KEY": "test-token"})
+        job_payload = await job_response.get_json()
+        self.assertEqual(job_response.status_code, 200)
+        self.assertEqual(job_payload["status"], "completed")
+        self.assertEqual(job_payload["result"]["scan_count"], 1)
+
+        list_jobs = await self.client.get("/jobs", headers={"X-API-KEY": "test-token"})
+        list_jobs_payload = await list_jobs.get_json()
+        self.assertEqual(list_jobs.status_code, 200)
+        self.assertTrue(any(job["job_id"] == "job-x" for job in list_jobs_payload))
+
+    async def test_create_scan_job_completes_with_mocked_engine(self):
+        original_results_dir = autonmap.RESULTS_DIR
+        original_scan = autonmap.scan_network
+        original_sender = autonmap.send_telegram_message
+
+        async def ignore_message(_message):
+            return None
+
+        def fake_scan(target, scan_type, ports=None, scripts=None, discovery=None):
+            return {
+                "hosts": [{"host": target, "hostname": "N/A", "state": "up", "protocols": {}}],
+                "scan_count": 1,
+                "target": target,
+                "scan_type": scan_type,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            autonmap.scan_network = fake_scan
+            autonmap.send_telegram_message = ignore_message
+            try:
+                job = await autonmap.create_scan_job("127.0.0.1", "Ping")
+                job_id = job["job_id"]
+                for _ in range(50):
+                    async with autonmap._jobs_lock:
+                        status = autonmap.scan_jobs[job_id]["status"]
+                        result_file = autonmap.scan_jobs[job_id].get("result_file")
+                    if status in {"completed", "failed", "timeout"}:
+                        break
+                    await asyncio.sleep(0.02)
+            finally:
+                autonmap.RESULTS_DIR = original_results_dir
+                autonmap.scan_network = original_scan
+                autonmap.send_telegram_message = original_sender
+
+        self.assertEqual(status, "completed")
+        self.assertIsNotNone(result_file)
+
+    async def test_import_and_diff_endpoints(self):
+        sample_xml = """<?xml version="1.0"?>
+<nmaprun scanner="nmap" args="nmap" start="1" version="7.95" xmloutputversion="1.05">
+  <host>
+    <status state="up"/>
+    <address addr="192.0.2.10" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22"><state state="open"/><service name="ssh"/></port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+        baseline = {
+            "hosts": [
+                {
+                    "host": "192.0.2.10",
+                    "hostname": "N/A",
+                    "state": "up",
+                    "protocols": {"tcp": [{"port": 22, "state": "open", "name": "ssh"}]},
+                }
+            ]
+        }
+        current = {
+            "hosts": [
+                {
+                    "host": "192.0.2.10",
+                    "hostname": "N/A",
+                    "state": "up",
+                    "protocols": {
+                        "tcp": [
+                            {"port": 22, "state": "open", "name": "ssh"},
+                            {"port": 80, "state": "open", "name": "http"},
+                        ]
+                    },
+                }
+            ]
+        }
+        original_results_dir = autonmap.RESULTS_DIR
+        original_sender = autonmap.send_telegram_message
+
+        async def ignore_message(_message):
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            autonmap.send_telegram_message = ignore_message
+            try:
+                import_response = await self.client.post(
+                    "/results/import",
+                    headers={"X-API-KEY": "test-token"},
+                    json={"xml": sample_xml, "target": "192.0.2.10"},
+                )
+                import_payload = await import_response.get_json()
+                diff_response = await self.client.post(
+                    "/results/diff",
+                    headers={"X-API-KEY": "test-token"},
+                    json={"baseline": baseline, "current": current},
+                )
+                diff_payload = await diff_response.get_json()
+            finally:
+                autonmap.RESULTS_DIR = original_results_dir
+                autonmap.send_telegram_message = original_sender
+
+        self.assertEqual(import_response.status_code, 201)
+        self.assertEqual(import_payload["result"]["hosts"][0]["host"], "192.0.2.10")
+        self.assertEqual(diff_response.status_code, 200)
+        self.assertTrue(diff_payload["summary"]["changed"])
+        self.assertEqual(diff_payload["summary"]["ports_opened"], 1)
+
+    async def test_cancel_job_endpoint(self):
+        autonmap.scan_jobs["job-cancel"] = {
+            "job_id": "job-cancel",
+            "target": "127.0.0.1",
+            "scan_type": "Ping",
+            "status": "queued",
+            "created_at": "t0",
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+            "result": None,
+            "result_file": None,
+            "kind": "immediate",
+            "task": None,
+        }
+        response = await self.client.delete("/jobs/job-cancel", headers={"X-API-KEY": "test-token"})
+        payload = await response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("cancelled", payload["message"].lower())
+        self.assertEqual(autonmap.scan_jobs["job-cancel"]["status"], "cancelled")
 
     async def test_dashboard_exposes_accessible_controls_and_feedback(self):
         response = await self.client.get("/")
@@ -259,7 +560,7 @@ class PayloadHardeningRegressionTests(unittest.TestCase):
                     {"target": "127.0.0.1", "scan_type": "Ping", "interval": interval}
                 )
 
-                self.assertEqual(error, "Интервал должен быть конечным числом")
+                self.assertEqual(error, "interval must be a finite number")
 
     def test_targets_are_canonicalized_before_task_ids_are_built(self):
         cases = {
@@ -271,7 +572,7 @@ class PayloadHardeningRegressionTests(unittest.TestCase):
 
         for supplied, expected in cases.items():
             with self.subTest(target=supplied):
-                target, _, _, error = autonmap._validate_scan_payload(
+                target, _, _, _, _, _, error = autonmap._validate_scan_payload(
                     {"target": supplied, "scan_type": "Ping", "interval": 5}
                 )
 

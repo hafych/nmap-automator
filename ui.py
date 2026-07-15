@@ -3,7 +3,7 @@ UI_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Nmap Automator Console</title>
+  <title>Recon Operator</title>
   <style>
     :root {
       --bg: #eef2ee;
@@ -321,13 +321,14 @@ UI_HTML = r"""<!doctype html>
   <main class="shell">
     <div class="topbar">
       <div>
-        <h1>Nmap Operator Console</h1>
-        <p class="hint">Authorized network scanning, task control, and AI-readable output.</p>
+        <h1>Recon Operator</h1>
+        <p class="hint">Multi-tool recon control plane: Nmap engine, Kali inventory, review-only planner, encrypted results.</p>
       </div>
       <div class="status-strip" id="statusStrip" aria-live="polite">
         <span class="pill">API <strong id="apiStatus">checking</strong></span>
         <span class="pill">Nmap <strong id="nmapStatus">unknown</strong></span>
         <span class="pill">Tasks <strong id="taskCount">0</strong></span>
+        <span class="pill">Jobs <strong id="jobCount">0</strong></span>
       </div>
     </div>
 
@@ -345,12 +346,19 @@ UI_HTML = r"""<!doctype html>
             <input id="target" value="127.0.0.1" spellcheck="false">
           </label>
           <div class="row">
-            <label>Scan type
+            <label>Scan profile
               <select id="scanType">
                 <option>Ping</option>
                 <option selected>TCP</option>
                 <option>SYN</option>
                 <option>UDP</option>
+                <option>Version</option>
+                <option>Safe</option>
+                <option>Vuln</option>
+                <option>Full</option>
+                <option>Hybrid</option>
+                <option>HybridNaabu</option>
+                <option>HybridRustScan</option>
                 <option>OS</option>
                 <option>Aggressive</option>
               </select>
@@ -359,11 +367,34 @@ UI_HTML = r"""<!doctype html>
               <input id="interval" type="number" value="30" min="1" step="1">
             </label>
           </div>
+          <div class="row">
+            <label>Ports (optional)
+              <input id="ports" placeholder="22,80,443 or 1-1000" spellcheck="false">
+            </label>
+            <label>Extra NSE (optional)
+              <input id="scripts" placeholder="banner,http-title" spellcheck="false">
+            </label>
+          </div>
+          <label>Discovery frontend (optional)
+            <select id="discovery">
+              <option value="" selected>none (Nmap only)</option>
+              <option value="auto">auto (Naabu → RustScan)</option>
+              <option value="naabu">naabu</option>
+              <option value="rustscan">rustscan</option>
+            </select>
+          </label>
           <div class="actions">
             <button id="scanBtn" type="button">Run Scan</button>
             <button class="secondary" id="scheduleBtn" type="button">Schedule</button>
           </div>
-          <p class="hint">The token stays in browser session storage. Results are returned by the existing API.</p>
+          <label>Import Nmap XML
+            <textarea id="xmlImport" rows="3" placeholder="Paste Nmap XML to import into encrypted history."></textarea>
+          </label>
+          <div class="actions">
+            <button class="secondary" id="importBtn" type="button">Import XML</button>
+            <button class="secondary" id="diffBtn" type="button">Diff last two</button>
+          </div>
+          <p class="hint">Token stays in session storage. Jobs + multi-tool inventory + recon plans — not Nmap-only.</p>
           <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
         </div>
       </aside>
@@ -376,6 +407,19 @@ UI_HTML = r"""<!doctype html>
           </header>
           <div class="panel-body">
             <div class="task-list" id="tasks"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <header>
+            <h2>Scan History</h2>
+            <span class="pill"><strong id="historyCount">0</strong> stored</span>
+          </header>
+          <div class="panel-body">
+            <div class="actions">
+              <button class="secondary" id="historyBtn" type="button">Refresh History</button>
+            </div>
+            <div class="task-list" id="history"></div>
           </div>
         </section>
 
@@ -408,6 +452,7 @@ UI_HTML = r"""<!doctype html>
               <button data-view="json" type="button" role="tab" aria-selected="false" aria-controls="resultBox">JSON</button>
               <button data-view="jsonl" type="button" role="tab" aria-selected="false" aria-controls="resultBox">JSONL</button>
               <button data-view="plan" type="button" role="tab" aria-selected="false" aria-controls="resultBox">Recon Plan</button>
+              <button data-view="diff" type="button" role="tab" aria-selected="false" aria-controls="resultBox">Diff</button>
             </div>
           </header>
           <div class="panel-body">
@@ -415,7 +460,9 @@ UI_HTML = r"""<!doctype html>
               <div class="metric"><b id="hostMetric">0</b><span>hosts</span></div>
               <div class="metric"><b id="upMetric">0</b><span>up</span></div>
               <div class="metric"><b id="openMetric">0</b><span>open ports</span></div>
+              <div class="metric"><b id="serviceMetric">0</b><span>services</span></div>
             </div>
+            <div id="serviceBars" class="hint" style="margin-bottom:10px"></div>
             <div class="result-head">
               <span class="hint" id="resultLabel">No scan result yet.</span>
               <div class="actions">
@@ -434,16 +481,25 @@ UI_HTML = r"""<!doctype html>
   <script>
     const state = {
       lastResult: null,
+      previousResult: null,
       lastPlan: null,
+      lastDiff: null,
       toolsContext: "",
       view: "summary",
       apiHeader: "X-API-KEY",
+      activeJobId: null,
+      historyIds: [],
     };
     const $ = (id) => document.getElementById(id);
 
     const tokenInput = $("apiToken");
-    tokenInput.value = sessionStorage.getItem("nmap_api_token") || "";
-    tokenInput.addEventListener("input", () => sessionStorage.setItem("nmap_api_token", tokenInput.value));
+    tokenInput.value = sessionStorage.getItem("recon_api_token")
+      || sessionStorage.getItem("nmap_api_token")
+      || "";
+    tokenInput.addEventListener("input", () => {
+      sessionStorage.setItem("recon_api_token", tokenInput.value);
+      sessionStorage.setItem("nmap_api_token", tokenInput.value);
+    });
 
     function headers() {
       const token = tokenInput.value.trim();
@@ -458,12 +514,34 @@ UI_HTML = r"""<!doctype html>
       $("refreshBtn").disabled = isBusy;
       $("toolsBtn").disabled = isBusy;
       $("planBtn").disabled = isBusy;
+      $("historyBtn").disabled = isBusy;
+      $("importBtn").disabled = isBusy;
+      $("diffBtn").disabled = isBusy;
+    }
+
+    function scanPayload() {
+      const body = {
+        target: $("target").value,
+        scan_type: $("scanType").value,
+        interval: Number($("interval").value),
+      };
+      const ports = $("ports").value.trim();
+      const scripts = $("scripts").value.trim();
+      const discovery = $("discovery").value.trim();
+      if (ports) body.ports = ports;
+      if (scripts) body.scripts = scripts;
+      if (discovery) body.discovery = discovery;
+      return body;
     }
 
     function say(message, isError = false) {
       const toast = $("toast");
       toast.textContent = message;
       toast.style.color = isError ? "var(--danger)" : "var(--accent-2)";
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     async function api(path, options = {}) {
@@ -476,6 +554,17 @@ UI_HTML = r"""<!doctype html>
         throw new Error(`${response.status}: ${detail}`);
       }
       return body;
+    }
+
+    async function waitForJob(jobId) {
+      const terminal = new Set(["completed", "failed", "cancelled", "timeout"]);
+      while (true) {
+        const job = await api(`/jobs/${encodeURIComponent(jobId)}`);
+        state.activeJobId = jobId;
+        if (terminal.has(job.status)) return job;
+        say(`Scan ${job.status}...`);
+        await sleep(1000);
+      }
     }
 
     function observations(result) {
@@ -503,14 +592,28 @@ UI_HTML = r"""<!doctype html>
     function metrics(result) {
       const hosts = Array.isArray(result?.hosts) ? result.hosts : [];
       const openPorts = observations(result).filter((row) => row.type === "service" && row.state === "open").length;
+      const services = result?.stats?.services || {};
       $("hostMetric").textContent = hosts.length;
       $("upMetric").textContent = hosts.filter((host) => host.state === "up").length;
       $("openMetric").textContent = openPorts;
+      $("serviceMetric").textContent = Object.keys(services).length;
+      const bars = Object.entries(services).slice(0, 8).map(([name, count]) => {
+        const width = Math.max(8, Math.min(100, Number(count) * 12));
+        return `${name} (${count}) ${"█".repeat(Math.ceil(width / 12))}`;
+      });
+      $("serviceBars").textContent = bars.length ? `Top services: ${bars.join(" · ")}` : "";
     }
 
     function summary(result) {
       if (!result) return "";
-      const lines = [`Scan time: ${result.scan_time || "unknown"}`, ""];
+      const lines = [
+        `Product: ${result.product || "Recon Operator"}`,
+        `Scan time: ${result.scan_time || "unknown"}`,
+        `Profile: ${result.scan_type || "unknown"}`,
+        result.ports ? `Ports: ${result.ports}` : "",
+        result.scripts ? `Scripts: ${result.scripts}` : "",
+        "",
+      ].filter((line) => line !== undefined);
       for (const host of result.hosts || []) {
         lines.push(`${host.host} (${host.state})`);
         if (host.hostname && host.hostname !== "N/A") lines.push(`  hostname: ${host.hostname}`);
@@ -524,6 +627,26 @@ UI_HTML = r"""<!doctype html>
           }
         }
         lines.push("");
+      }
+      return lines.join("\n").trim();
+    }
+
+    function diffText(diff) {
+      if (!diff) return "Run Diff last two (or compare after two scans).";
+      const s = diff.summary || {};
+      const lines = [
+        `Changed: ${s.changed ? "yes" : "no"}`,
+        `Hosts added: ${s.hosts_added || 0}`,
+        `Hosts removed: ${s.hosts_removed || 0}`,
+        `Ports opened: ${s.ports_opened || 0}`,
+        `Ports closed: ${s.ports_closed || 0}`,
+        "",
+      ];
+      for (const row of diff.ports_opened || []) {
+        lines.push(`+ ${row.host} ${row.protocol}/${row.port} ${row.service}`);
+      }
+      for (const row of diff.ports_closed || []) {
+        lines.push(`- ${row.host} ${row.protocol}/${row.port} ${row.service}`);
       }
       return lines.join("\n").trim();
     }
@@ -554,10 +677,13 @@ UI_HTML = r"""<!doctype html>
       if (state.view === "json") content = result ? JSON.stringify(result, null, 2) : "";
       if (state.view === "jsonl") content = observations(result).map((row) => JSON.stringify(row)).join("\n");
       if (state.view === "plan") content = planText(state.lastPlan);
+      if (state.view === "diff") content = diffText(state.lastDiff);
       if (state.view === "summary") content = summary(result);
       $("resultBox").value = content;
       if (state.view === "plan") {
         $("resultLabel").textContent = state.lastPlan ? "PLAN view" : "Build a recon plan first.";
+      } else if (state.view === "diff") {
+        $("resultLabel").textContent = state.lastDiff ? "DIFF view" : "No diff yet.";
       } else if (result) {
         $("resultLabel").textContent = `${state.view.toUpperCase()} view`;
       } else {
@@ -573,14 +699,64 @@ UI_HTML = r"""<!doctype html>
         const health = await api("/health", { headers: {} });
         $("apiStatus").textContent = health.status || "online";
         $("nmapStatus").textContent = health.nmap_available ? "ready" : "missing";
+        $("jobCount").textContent = health.jobs_count || 0;
         const tasks = await api("/tasks");
         $("taskCount").textContent = tasks.length;
         $("runningCount").textContent = tasks.filter((task) => task.running).length;
         renderTasks(tasks);
+        await refreshHistory({ announce: false });
         if (announce) say("Dashboard refreshed.");
       } catch (error) {
         $("apiStatus").textContent = "auth needed";
         say(error.message, true);
+      }
+    }
+
+    function renderHistory(items) {
+      const root = $("history");
+      root.innerHTML = "";
+      $("historyCount").textContent = items.length;
+      if (!items.length) {
+        root.innerHTML = '<div class="empty">No encrypted results yet.</div>';
+        return;
+      }
+      for (const item of items) {
+        const row = document.createElement("div");
+        row.className = "task";
+        row.innerHTML = `<div><code></code><div class="mini"></div></div><button class="secondary" type="button">Open</button>`;
+        row.querySelector("code").textContent = item.filename || item.id;
+        row.querySelector(".mini").textContent = item.modified_at || "";
+        const openButton = row.querySelector("button");
+        openButton.setAttribute("aria-label", `Open result ${item.id}`);
+        openButton.addEventListener("click", async () => {
+          try {
+            const payload = await api(`/results/${encodeURIComponent(item.id)}`);
+            rememberResult(payload.result);
+            state.view = "summary";
+            document.querySelectorAll(".tabs button").forEach((tab) => {
+              const selected = tab.dataset.view === "summary";
+              tab.classList.toggle("active", selected);
+              tab.setAttribute("aria-selected", String(selected));
+            });
+            renderResult();
+            say(`Loaded result ${item.id}`);
+          } catch (error) {
+            say(error.message, true);
+          }
+        });
+        root.appendChild(row);
+      }
+    }
+
+    async function refreshHistory({ announce = true } = {}) {
+      try {
+        const payload = await api("/results?limit=20");
+        const items = payload.results || [];
+        state.historyIds = items.map((item) => item.id || item.filename);
+        renderHistory(items);
+        if (announce) say(`History refreshed: ${items.length} results.`);
+      } catch (error) {
+        if (announce) say(error.message, true);
       }
     }
 
@@ -650,18 +826,93 @@ UI_HTML = r"""<!doctype html>
       }
     }
 
+    function rememberResult(result) {
+      if (state.lastResult) state.previousResult = state.lastResult;
+      state.lastResult = result;
+      state.lastPlan = null;
+    }
+
     async function runScan() {
       setBusy(true);
-      say("Scanning...");
+      say("Queueing scan...");
       try {
-        state.lastPlan = null;
-        state.lastResult = await api("/scan", {
+        const job = await api("/scan", {
           method: "POST",
-          body: JSON.stringify({ target: $("target").value, scan_type: $("scanType").value })
+          body: JSON.stringify(scanPayload())
+        });
+        const finished = await waitForJob(job.job_id);
+        if (finished.status !== "completed") {
+          throw new Error(finished.error || `Scan ${finished.status}`);
+        }
+        rememberResult(finished.result);
+        renderResult();
+        say(finished.result_file ? `Scan complete. Saved ${finished.result_file}` : "Scan complete.");
+        await refresh({ announce: false });
+      } catch (error) {
+        say(error.message, true);
+      } finally {
+        setBusy(false);
+        state.activeJobId = null;
+      }
+    }
+
+    async function importXml() {
+      const xml = $("xmlImport").value.trim();
+      if (!xml) {
+        say("Paste Nmap XML first.", true);
+        return;
+      }
+      setBusy(true);
+      try {
+        const payload = await api("/results/import", {
+          method: "POST",
+          body: JSON.stringify({ xml, target: $("target").value || "xml-import" }),
+        });
+        rememberResult(payload.result);
+        state.view = "summary";
+        document.querySelectorAll(".tabs button").forEach((tab) => {
+          const selected = tab.dataset.view === "summary";
+          tab.classList.toggle("active", selected);
+          tab.setAttribute("aria-selected", String(selected));
         });
         renderResult();
-        say("Scan complete.");
-        await refresh({ announce: false });
+        say(`Imported ${payload.filename || "XML"}`);
+        await refreshHistory({ announce: false });
+      } catch (error) {
+        say(error.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function diffLastTwo() {
+      setBusy(true);
+      try {
+        let baseline = state.previousResult;
+        let current = state.lastResult;
+        if ((!baseline || !current) && state.historyIds.length >= 2) {
+          const [newer, older] = state.historyIds;
+          const currentPayload = await api(`/results/${encodeURIComponent(newer)}`);
+          const baselinePayload = await api(`/results/${encodeURIComponent(older)}`);
+          current = currentPayload.result;
+          baseline = baselinePayload.result;
+        }
+        if (!baseline || !current) {
+          throw new Error("Need two results to diff (run two scans or open history).");
+        }
+        state.lastDiff = await api("/results/diff", {
+          method: "POST",
+          body: JSON.stringify({ baseline, current }),
+        });
+        state.view = "diff";
+        document.querySelectorAll(".tabs button").forEach((tab) => {
+          const selected = tab.dataset.view === "diff";
+          tab.classList.toggle("active", selected);
+          tab.setAttribute("aria-selected", String(selected));
+        });
+        renderResult();
+        const s = state.lastDiff.summary || {};
+        say(s.changed ? `Diff: ${s.ports_opened || 0} opened, ${s.ports_closed || 0} closed.` : "Diff: no changes.");
       } catch (error) {
         say(error.message, true);
       } finally {
@@ -698,8 +949,7 @@ UI_HTML = r"""<!doctype html>
     async function scheduleScan() {
       setBusy(true);
       try {
-        const body = { target: $("target").value, scan_type: $("scanType").value, interval: Number($("interval").value) };
-        await api("/schedule", { method: "POST", body: JSON.stringify(body) });
+        await api("/schedule", { method: "POST", body: JSON.stringify(scanPayload()) });
         say("Scan scheduled.");
         await refresh({ announce: false });
       } catch (error) {
@@ -711,7 +961,10 @@ UI_HTML = r"""<!doctype html>
 
     $("scanBtn").addEventListener("click", runScan);
     $("scheduleBtn").addEventListener("click", scheduleScan);
+    $("importBtn").addEventListener("click", importXml);
+    $("diffBtn").addEventListener("click", diffLastTwo);
     $("refreshBtn").addEventListener("click", () => refresh());
+    $("historyBtn").addEventListener("click", () => refreshHistory());
     $("toolsBtn").addEventListener("click", refreshTools);
     $("planBtn").addEventListener("click", buildPlan);
     async function copyText(content, successMessage) {

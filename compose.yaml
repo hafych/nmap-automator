@@ -1,5 +1,5 @@
 services:
-  nmap-automator:
+  recon-operator:
     build:
       context: .
       dockerfile: dockerfile
@@ -7,6 +7,7 @@ services:
       APP_HOST: 0.0.0.0
       API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN in .env}
       FERNET_KEY: ${FERNET_KEY:?Set FERNET_KEY in .env}
+      STATE_DB_PATH: /app/data/recon_operator.db
     ports:
       - "127.0.0.1:5000:5000"
     init: true
@@ -16,6 +17,7 @@ services:
     volumes:
       - scan-results:/app/encrypted_results
       - scan-logs:/app/logs
+      - scan-state:/app/data
     restart: unless-stopped
     stop_grace_period: 40s
     security_opt:
@@ -24,3 +26,4 @@ services:
 volumes:
   scan-results:
   scan-logs:
+  scan-state:

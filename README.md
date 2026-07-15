@@ -1,157 +1,166 @@
-# Nmap Automator
+# Recon Operator
 
-An async, security-focused Nmap service for authorized network assessments. It combines a
-Quart API, scheduled scans, encrypted result storage, a browser dashboard, Kali tool
-inventory, and AI-readable reporting and recon plans.
+**A security-focused multi-tool recon control plane: Nmap engine, Kali inventory, review-only planner, encrypted results, and an operator dashboard.**
 
+[![CI](https://github.com/hafych/nmap-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/hafych/nmap-automator/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Nmap](https://img.shields.io/badge/scanner-Nmap-214478)](https://nmap.org/)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+
+> Formerly **Nmap Automator**. The product is not Nmap-only: it orchestrates authorized recon around Nmap, Kali tool inventory, multi-tool follow-up plans, AI-readable exports, and encrypted history.
+
+> [!WARNING]
 > Use this project only on systems you own or are explicitly authorized to assess.
 > Unauthorized scanning may be illegal and disruptive.
 
-## What it provides
+## Why Recon Operator?
 
-- Immediate and recurring Nmap scans: TCP, SYN, UDP, OS, aggressive, and ping discovery.
-- API-key authentication, per-client rate limiting, request-size limits, scan concurrency
-  limits, target-range limits, and total scan timeouts.
-- Fernet-encrypted results written atomically with owner-only file permissions.
-- A built-in operator dashboard at `/` with tasks, results, JSON/JSONL views, tool inventory,
-  and recon planning.
-- Telegram notifications when configured.
-- A standalone `kali_ai_scan.py` CLI that creates raw XML plus JSON, JSONL, Markdown, and a
-  manifest suitable for GPT, Claude, or another analysis workflow.
-- XXE-safe XML parsing and shell-safe generation of follow-up recon commands.
+Running one scanner is easy. Operating repeatable recon safely is harder. This project adds the controls and artifacts operators need without auto-exploiting targets.
 
-## Requirements
-
-- Python 3.10 or newer.
-- Nmap available on `PATH`.
-- A Fernet key and a strong API token.
-
-Install Nmap first:
-
-```bash
-# Debian, Ubuntu, Kali
-sudo apt-get update
-sudo apt-get install -y nmap
-
-# macOS
-brew install nmap
-```
-
-Some profiles (`SYN`, `UDP`, `OS`, and parts of `Aggressive`) need elevated network
-privileges. The default profile is unprivileged `TCP`.
+| Need | What Recon Operator adds |
+| --- | --- |
+| Repeatable recon | Immediate and recurring profiles: TCP, SYN, UDP, Version, Safe, Vuln, Full, OS, Aggressive, Ping |
+| Multi-tool awareness | Kali essentials + 13 metapackage profiles; review-only recon plans (curl, whatweb, ssh-audit, …) |
+| Control surface | Async Quart API plus a responsive browser dashboard |
+| Safer operation | API-key auth, target bounds, rate limits, concurrency limits, timeouts |
+| Protected results | Fernet encryption, atomic replacement, retention, owner-only permissions |
+| Automation handoff | XML, JSON, JSONL, Markdown, manifests, job history, scan diffs |
+| AI-assisted analysis | Compact observation streams and install-aware follow-up suggestions (never auto-executed) |
 
 ## Quick start
+
+### Docker Compose
 
 ```bash
 git clone https://github.com/hafych/nmap-automator.git
 cd nmap-automator
 
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-
 cp .env.example .env
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
 openssl rand -hex 32
 ```
 
-Put the generated values into `.env` as `FERNET_KEY` and `API_AUTH_TOKEN`, then start the
-service:
+Put the generated values into `.env` as `FERNET_KEY` and `API_AUTH_TOKEN`, then run:
 
 ```bash
+docker compose up --build -d
+docker compose ps
+```
+
+Open [http://127.0.0.1:5000](http://127.0.0.1:5000), enter the API token, and run a
+TCP or Ping scan against an authorized target.
+
+### Local Python
+
+Requirements: Python 3.10+, Nmap on `PATH`, a Fernet key, and a strong API token.
+
+```bash
+# Debian, Ubuntu, or Kali
+sudo apt-get update && sudo apt-get install -y nmap
+
+# macOS
+brew install nmap
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 python autonmap.py
 ```
 
-The service binds to `127.0.0.1:5000` by default. Open
-[http://127.0.0.1:5000](http://127.0.0.1:5000), enter the API token in the dashboard, and
-run a TCP scan against an authorized target.
+The service binds to `127.0.0.1:5000` by default. Default `TCP` is unprivileged;
+`SYN`, `UDP`, `OS`, and parts of `Aggressive` may require elevated network privileges.
 
-## Configuration
+## How it works
 
-All options are environment variables and may be placed in `.env`.
-
-| Variable | Default | Purpose |
-| --- | ---: | --- |
-| `FERNET_KEY` | required | Key used to encrypt stored results. |
-| `API_AUTH_TOKEN` | required | Token expected in the API authentication header. |
-| `API_AUTH_REQUIRED` | `true` | Disabling authentication is intended only for isolated local development. |
-| `API_AUTH_HEADER` | `X-API-KEY` | Header carrying the API token. |
-| `APP_HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` only behind appropriate network controls. |
-| `APP_PORT` | `5000` | Listen port. |
-| `MAX_CONCURRENT_SCANS` | `2` | Maximum scans running concurrently. |
-| `MAX_SCHEDULED_TASKS` | `100` | Maximum recurring scans retained at once. |
-| `SCAN_TIMEOUT_SECONDS` | `1800` | Total Nmap process timeout. |
-| `NMAP_HOST_TIMEOUT_SEC` | `300` | Nmap per-host timeout. |
-| `NMAP_MAX_RETRIES` | `2` | Nmap probe retries. |
-| `MAX_TARGET_ADDRESSES` | `4096` | Largest accepted CIDR range. |
-| `MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum JSON request body size. |
-| `MAX_REQUESTS_PER_WINDOW` | `10` | Per-client request limit for costly endpoints. |
-| `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum number of client buckets kept in memory. |
-| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window. |
-| `MIN_SCHEDULE_INTERVAL_MINUTES` | `1` | Smallest allowed recurring-scan interval. |
-| `MAX_SCHEDULE_INTERVAL_MINUTES` | `10080` | Largest allowed recurring-scan interval (one week). |
-| `RESULTS_DIR` | `encrypted_results` | Encrypted result directory. |
-| `SCAN_LOG_PATH` | `logs/scan_log.txt` | Rotating application log. |
-| `TOOL_INVENTORY_CACHE_SECONDS` | `300` | Kali inventory cache lifetime. |
-| `INITIAL_TASKS` | `[]` | JSON array of recurring scans loaded at startup. |
-| `TELEGRAM_BOT_TOKEN` | empty | Optional Telegram bot token. |
-| `TELEGRAM_CHAT_ID` | empty | Optional Telegram destination. |
-
-Example recurring task:
-
-```dotenv
-INITIAL_TASKS=[{"target":"192.168.1.0/24","scan_type":"TCP","interval":30}]
+```mermaid
+flowchart LR
+    Operator[Operator or API client] -->|API key| Quart[Recon Operator API and dashboard]
+    Quart --> Jobs[Scan job queue]
+    Jobs --> Limits[Validation, rate limits, concurrency, timeouts]
+    Limits --> Engine[scan_engine]
+    Engine --> Nmap[Nmap XML]
+    Nmap --> Parse[defused XML parse]
+    Parse --> Encrypt[Fernet-encrypted storage]
+    Parse --> Export[JSON, JSONL, XML, Markdown]
+    Parse --> Planner[Review-only multi-tool recon planner]
+    Inventory[Kali tool inventory] --> Quart
+    Planner --> Export
+    Encrypt --> ResultsAPI[History, import, diff]
 ```
 
-## API
+The planner never executes its recommendations. It shell-quotes fields, marks each
+command as `ready`, `missing`, or `unknown`, and leaves execution to the operator.
 
-Health and dashboard routes are public. Operational routes require the configured API token
-unless authentication was explicitly disabled.
+## Core workflows
+
+### Run an immediate scan
+
+Scans are queued as jobs by default (`202 Accepted`). Poll until completion, or pass
+`?wait=1` for a blocking response.
 
 ```bash
 export API_TOKEN='replace-with-your-token'
 
-# Health and API description
-curl http://127.0.0.1:5000/health
-curl http://127.0.0.1:5000/api/docs
-
-# Immediate scan
 curl -X POST http://127.0.0.1:5000/scan \
   -H "X-API-KEY: $API_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"target":"127.0.0.1","scan_type":"TCP"}'
+  -d '{"target":"127.0.0.1","scan_type":"Version","ports":"22,80,443"}'
+# -> {"job_id":"...","status":"queued",...}
 
-# Recurring scan, every 30 minutes
+curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
+
+curl -X POST 'http://127.0.0.1:5000/scan?wait=1' \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"127.0.0.1","scan_type":"Ping"}'
+```
+
+Supported `scan_type` values: `TCP`, `SYN`, `UDP`, `OS`, `Aggressive`, `Ping`,
+`Version`, `Safe`, `Vuln`, `Full`, plus hybrid discovery profiles `Hybrid`,
+`HybridNaabu`, and `HybridRustScan` (fast port discovery → Nmap `-sV` on open ports).
+Optional `ports`, `scripts`, and `discovery` (`auto`|`naabu`|`rustscan`|`none`) fields
+are accepted. Naabu/RustScan are optional PATH tools — not required for pure Nmap profiles.
+
+Scheduled tasks and job history are stored in SQLite (`STATE_DB_PATH`, default
+`data/recon_operator.db`) so restarts restore schedules and completed job metadata.
+
+### Schedule, history, import, diff
+
+```bash
 curl -X POST http://127.0.0.1:5000/schedule \
   -H "X-API-KEY: $API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"target":"192.168.1.0/24","scan_type":"TCP","interval":30}'
 
-# List and cancel scheduled scans
-curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/tasks
-curl -X DELETE -H "X-API-KEY: $API_TOKEN" \
-  http://127.0.0.1:5000/tasks/192.168.1.0%2F24-TCP
+curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/results
+curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/results/<filename>
+
+curl -X POST http://127.0.0.1:5000/results/import \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"xml":"<?xml ... nmaprun ...>","target":"lab"}'
+
+curl -X POST http://127.0.0.1:5000/results/diff \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline":{"id":"old.json"},"current":{"id":"new.json"}}'
 ```
 
-Supported `scan_type` values are `TCP`, `SYN`, `UDP`, `OS`, `Aggressive`, and `Ping`.
-Targets may be an IP, a bounded CIDR network, `localhost`, or a syntactically valid DNS name.
-
-## Kali inventory and recon planning
-
-The inventory endpoint checks official Kali metapackages, locally installed packages, and
-commands. `expand=1` follows metapackage dependencies and is therefore slower.
+### AI-readable scan artifacts (CLI)
 
 ```bash
-curl -H "X-API-KEY: $API_TOKEN" \
-  'http://127.0.0.1:5000/tools?expand=0'
-
-curl -H "X-API-KEY: $API_TOKEN" \
-  'http://127.0.0.1:5000/tools/ai-context?format=jsonl&expand=0'
+python kali_ai_scan.py deps
+python kali_ai_scan.py run 127.0.0.1 --profile tcp --out ai_reports
+python kali_ai_scan.py parse nmap.xml --out ai_reports/imported-scan
 ```
 
-A parsed scan response can be turned into non-exploitative, service-specific next steps:
+### Inventory Kali tools and build a recon plan
 
 ```bash
+curl -H "X-API-KEY: $API_TOKEN" 'http://127.0.0.1:5000/tools?expand=0'
+curl -H "X-API-KEY: $API_TOKEN" 'http://127.0.0.1:5000/tools/ai-context?format=jsonl'
+
 curl -X POST \
   -H "X-API-KEY: $API_TOKEN" \
   -H 'Content-Type: application/json' \
@@ -159,106 +168,132 @@ curl -X POST \
   'http://127.0.0.1:5000/recon/plan?format=markdown'
 ```
 
-The planner does not execute recommendations. It validates and shell-quotes scan fields,
-labels each command as `ready`, `missing`, or `unknown`, and leaves execution to the operator.
+## API surface
 
-## AI-readable CLI
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/` and `/ui` | Browser dashboard |
+| `GET` | `/health` | Service and Nmap health |
+| `GET` | `/api/docs` | Runtime API description |
+| `POST` | `/scan` | Queue immediate scan (`202`); `?wait=1` blocks |
+| `GET` | `/jobs` | List scan jobs |
+| `GET` | `/jobs/<id>` | Job status and result |
+| `DELETE` | `/jobs/<id>` | Cancel a queued or running job |
+| `POST` | `/schedule` | Recurring scan |
+| `GET` | `/tasks` | List scheduled tasks |
+| `DELETE` | `/tasks/<id>` | Cancel a scheduled task |
+| `GET` | `/results` | List encrypted result files |
+| `GET` | `/results/<id>` | Decrypt and return a stored result |
+| `POST` | `/results/import` | Import Nmap XML into encrypted history |
+| `POST` | `/results/diff` | Diff two scan results |
+| `GET` | `/tools` | Kali tool inventory |
+| `GET` | `/tools/ai-context` | JSONL or Markdown inventory context |
+| `POST` | `/recon/plan` | JSON or Markdown multi-tool follow-up plan |
 
-Run Nmap and create an artifact bundle:
+## Security model
 
-```bash
-python kali_ai_scan.py deps
-python kali_ai_scan.py run 127.0.0.1 \
-  --profile tcp \
-  --scan-timeout 1800 \
-  --out ai_reports
-```
+The default deployment is intentionally local and single-operator:
 
-Or safely import existing Nmap XML:
+- authentication is required by default;
+- the server and Compose port bind to loopback;
+- scan types are allow-listed and targets are bounded;
+- subprocesses use argv rather than a shell;
+- Nmap XML uses an XXE-safe parser;
+- result files are encrypted with Fernet and written atomically;
+- recon recommendations are never auto-executed;
+- the default container runs non-root with a read-only root filesystem and
+  `no-new-privileges`.
 
-```bash
-python kali_ai_scan.py parse nmap.xml --out ai_reports/imported-scan
-```
+This is not a multi-tenant authorization system. See [SECURITY.md](SECURITY.md).
 
-Each bundle contains:
+## Configuration
 
-- `nmap.xml` — canonical raw Nmap output.
-- `hosts.json` — structured hosts, ports, and services.
-- `observations.jsonl` — one compact host or service observation per line.
-- `summary.md` — human-readable summary.
-- `manifest.json` — provenance, toolchain state, paths, and statistics.
-
-Imported XML is parsed with `defusedxml` and capped at 64 MiB.
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `FERNET_KEY` | required | Key used to encrypt stored results |
+| `API_AUTH_TOKEN` | required | Token expected in the API authentication header |
+| `API_AUTH_REQUIRED` | `true` | Disable only for isolated local development |
+| `API_AUTH_HEADER` | `X-API-KEY` | Header carrying the API token |
+| `APP_HOST` | `127.0.0.1` | Bind address |
+| `APP_PORT` | `5000` | Listen port |
+| `MAX_CONCURRENT_SCANS` | `2` | Maximum concurrent scans |
+| `MAX_SCHEDULED_TASKS` | `100` | Maximum retained recurring scans |
+| `MAX_SCAN_JOBS` | `200` | Maximum retained scan jobs in memory |
+| `SCAN_TIMEOUT_SECONDS` | `1800` | Total Nmap process timeout |
+| `NMAP_HOST_TIMEOUT_SEC` | `300` | Nmap per-host timeout |
+| `NMAP_MAX_RETRIES` | `2` | Nmap probe retries |
+| `MAX_TARGET_ADDRESSES` | `4096` | Largest accepted CIDR range |
+| `MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum JSON request body size |
+| `MAX_IMPORT_XML_BYTES` | `67108864` | Maximum imported Nmap XML size |
+| `MAX_REQUESTS_PER_WINDOW` | `10` | Per-client costly-request limit |
+| `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window |
+| `MIN_SCHEDULE_INTERVAL_MINUTES` | `1` | Smallest recurring-scan interval |
+| `MAX_SCHEDULE_INTERVAL_MINUTES` | `10080` | Largest interval, in minutes |
+| `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
+| `RESULTS_MAX_FILES` | `500` | Max encrypted result files retained |
+| `RESULTS_MAX_AGE_DAYS` | `0` | Delete results older than N days (`0` = off) |
+| `STATE_DB_PATH` | `data/recon_operator.db` | SQLite for jobs + scheduled tasks |
+| `SCAN_LOG_PATH` | `logs/scan_log.txt` | Rotating application log |
+| `TOOL_INVENTORY_CACHE_SECONDS` | `300` | Kali inventory cache lifetime |
+| `INITIAL_TASKS` | `[]` | JSON array of startup recurring scans |
+| `TELEGRAM_BOT_TOKEN` | empty | Optional Telegram bot token |
+| `TELEGRAM_CHAT_ID` | empty | Optional Telegram destination |
 
 ## Encrypted results
 
-API scan results are stored only in encrypted form. Files are atomically replaced and created
-with mode `0600` on POSIX systems.
-
 ```bash
-# Print plaintext
 python decrypt.py encrypted_results/<result>.json
-
-# Write plaintext to a file
 python decrypt.py encrypted_results/<result>.json -o result.json
 ```
 
-Back up `FERNET_KEY` securely. Existing result files cannot be recovered if the key is lost.
-
-## Docker
-
-Create `.env` with `FERNET_KEY` and `API_AUTH_TOKEN`, then run:
+## Docker notes
 
 ```bash
-docker compose up --build -d
-docker compose ps
 docker compose logs -f
-```
 
-The Compose configuration binds the service to host loopback, runs as a non-root user, uses a
-read-only root filesystem, enables `no-new-privileges`, and persists only logs and encrypted
-results. Privileged scan types are intentionally not enabled by the default container profile.
-
-To build directly:
-
-```bash
-docker build -f dockerfile -t nmap-automator .
+docker build -f dockerfile -t recon-operator .
 docker run --rm \
   -p 127.0.0.1:5000:5000 \
   -e API_AUTH_TOKEN \
   -e FERNET_KEY \
-  nmap-automator
+  recon-operator
 ```
 
 ## Development
 
 ```bash
 python -m pip install -r requirements-dev.txt
-
 ruff format --check .
 ruff check .
 python -m coverage run -m unittest discover -v
 python -m coverage report
-bandit -q -ll -r . -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_tool_inventory.py
+bandit -q -ll -r . \
+  -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_scan_engine.py,./test_tool_inventory.py
 pip-audit -r requirements.txt
 ```
-
-CI runs the test suite on Python 3.10, 3.12, and 3.14, enforces coverage, checks formatting and
-linting, scans dependencies for known vulnerabilities, and runs Bandit. Dependabot tracks pip,
-GitHub Actions, and Docker updates.
 
 ## Project layout
 
 | Path | Responsibility |
 | --- | --- |
-| `autonmap.py` | Quart API, validation, scheduling, scanning, encryption, and shutdown. |
-| `ui.py` | Self-contained operator dashboard. |
-| `kali_ai_scan.py` | Safe Nmap runner, XML parser, and artifact generator. |
-| `tool_inventory.py` | Kali package and command inventory. |
-| `recon_planner.py` | Service-aware, AI-readable follow-up plans. |
-| `decrypt.py` | Fernet result decryption utility. |
+| `autonmap.py` | Quart API entrypoint (legacy filename), jobs, scheduling, encryption |
+| `scan_engine.py` | Nmap runner, hybrid Naabu/RustScan discovery, import, diff |
+| `state_store.py` | SQLite persistence for jobs and schedules |
+| `ui.py` | Self-contained operator dashboard |
+| `kali_ai_scan.py` | CLI Nmap runner, safe XML parser, AI artifact generator |
+| `tool_inventory.py` | Kali package and command inventory |
+| `recon_planner.py` | Service-aware multi-tool follow-up plans (review-only) |
+| `decrypt.py` | Fernet result decryption utility |
+| `test_*.py` | Unit and async API regression tests |
 
-| `test_*.py` | Unit and async API regression tests. |
+## Contributing
+
+Bug reports, focused improvements, and platform-specific validation are welcome. Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) and use private reporting for security vulnerabilities.
+
+Repository path may still be `nmap-automator` on GitHub for continuity; the product name is
+**Recon Operator**.
 
 ## License
 
