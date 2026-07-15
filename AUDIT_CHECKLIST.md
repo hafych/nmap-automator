@@ -176,11 +176,12 @@ Missing tools не устанавливались автоматически: э
 ### P2 — security и maintainability
 
 - [ ] Убрать CSP `'unsafe-inline'`: вынести CSS/JS в static assets или использовать per-response nonce/hash.
-- [ ] Разделить liveness/readiness: readiness non-2xx без Nmap, liveness — event loop only.
+- [x] ~~Разделить liveness/readiness: `/live`, `/ready`, detailed `/health`.~~
 - [ ] Pin Docker base image и GitHub Actions по immutable digest/SHA; Dependabot должен обновлять их автоматически.
-- [ ] Добавить OpenAPI 3 schema, request/response examples, error model и generated API contract tests вместо hand-written `/api/docs` JSON.
+- [x] ~~OpenAPI 3 schema at `/openapi.json` (plus human `/api/docs`).~~
 - [ ] Retention для CLI `ai_reports` volumes (API encrypted retention уже есть).
 - [ ] Повторить GitNexus taint/PDG анализ после обновления index session.
+- [ ] Generated contract tests from OpenAPI (optional next step).
 
 ### Release B — выполнено (2026-07-15)
 
@@ -195,15 +196,20 @@ Missing tools не устанавливались автоматически: э
 - [x] ~~Hybrid discovery: `Hybrid` / `HybridNaabu` / `HybridRustScan` + `discovery` field.~~
 - [x] ~~SQLite persistence for jobs + scheduled tasks (`state_store.py`).~~
 
+### Operator UX partial — выполнено
+
+- [x] ~~Standalone CLI export for tool inventory (`python tool_inventory.py`).~~
+- [x] ~~Timestamp of last refresh/scan and elapsed duration in dashboard.~~
+
 ### P3 — дальше
 
 - [ ] Multi-user / scoped API keys.
 - [ ] Redis for multi-worker rate limits (SQLite covers single-node durable state).
-- [ ] Standalone CLI export for tool inventory (`json`, `jsonl`, `markdown`).
-- [ ] Timestamp of last refresh/scan and elapsed duration in dashboard.
 - [ ] Favicon/static asset caching after extracting inline UI assets.
 - [ ] Optional locale switch.
 - [ ] Rename GitHub repository path from `nmap-automator` → `recon-operator` (when ready).
+- [ ] CI browser E2E + axe-core.
+- [ ] Raise `autonmap.py` coverage toward ≥75%.
 
 ## 7. Журнал найденных проблем и решений
 

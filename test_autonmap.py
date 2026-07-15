@@ -626,6 +626,33 @@ class ReadinessRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(payload["status"], "unhealthy")
         self.assertFalse(payload["nmap_available"])
+        self.assertFalse(payload["ready"])
+
+    async def test_liveness_stays_up_without_nmap(self):
+        original_check = autonmap._check_nmap_available
+        autonmap._check_nmap_available = lambda: False
+        client = autonmap.app.test_client()
+        try:
+            live = await client.get("/live")
+            ready = await client.get("/ready")
+            live_payload = await live.get_json()
+            ready_payload = await ready.get_json()
+        finally:
+            autonmap._check_nmap_available = original_check
+
+        self.assertEqual(live.status_code, 200)
+        self.assertEqual(live_payload["status"], "live")
+        self.assertEqual(ready.status_code, 503)
+        self.assertEqual(ready_payload["status"], "not_ready")
+
+    async def test_openapi_document_is_valid_shape(self):
+        response = await autonmap.app.test_client().get("/openapi.json")
+        payload = await response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["openapi"], "3.0.3")
+        self.assertIn("/scan", payload["paths"])
+        self.assertIn("/live", payload["paths"])
+        self.assertIn("ApiKeyAuth", payload["components"]["securitySchemes"])
 
 
 if __name__ == "__main__":

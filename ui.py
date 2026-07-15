@@ -329,6 +329,8 @@ UI_HTML = r"""<!doctype html>
         <span class="pill">Nmap <strong id="nmapStatus">unknown</strong></span>
         <span class="pill">Tasks <strong id="taskCount">0</strong></span>
         <span class="pill">Jobs <strong id="jobCount">0</strong></span>
+        <span class="pill">Refresh <strong id="lastRefresh">never</strong></span>
+        <span class="pill">Last scan <strong id="lastScanMeta">none</strong></span>
       </div>
     </div>
 
@@ -489,7 +491,43 @@ UI_HTML = r"""<!doctype html>
       apiHeader: "X-API-KEY",
       activeJobId: null,
       historyIds: [],
+      lastRefreshAt: null,
+      lastScanStartedAt: null,
+      lastScanFinishedAt: null,
+      lastScanDurationMs: null,
     };
+
+    function formatClock(value) {
+      if (!value) return "never";
+      try {
+        return new Date(value).toLocaleTimeString();
+      } catch {
+        return String(value);
+      }
+    }
+
+    function formatDuration(ms) {
+      if (ms == null || Number.isNaN(ms)) return "";
+      const seconds = Math.max(0, Math.round(ms / 1000));
+      if (seconds < 60) return `${seconds}s`;
+      const minutes = Math.floor(seconds / 60);
+      const rem = seconds % 60;
+      return `${minutes}m ${rem}s`;
+    }
+
+    function updateTimingPills() {
+      $("lastRefresh").textContent = formatClock(state.lastRefreshAt);
+      if (state.lastScanFinishedAt) {
+        const duration = formatDuration(state.lastScanDurationMs);
+        $("lastScanMeta").textContent = duration
+          ? `${formatClock(state.lastScanFinishedAt)} (${duration})`
+          : formatClock(state.lastScanFinishedAt);
+      } else if (state.lastScanStartedAt) {
+        $("lastScanMeta").textContent = `started ${formatClock(state.lastScanStartedAt)}`;
+      } else {
+        $("lastScanMeta").textContent = "none";
+      }
+    }
     const $ = (id) => document.getElementById(id);
 
     const tokenInput = $("apiToken");
@@ -705,6 +743,8 @@ UI_HTML = r"""<!doctype html>
         $("runningCount").textContent = tasks.filter((task) => task.running).length;
         renderTasks(tasks);
         await refreshHistory({ announce: false });
+        state.lastRefreshAt = Date.now();
+        updateTimingPills();
         if (announce) say("Dashboard refreshed.");
       } catch (error) {
         $("apiStatus").textContent = "auth needed";
@@ -835,20 +875,34 @@ UI_HTML = r"""<!doctype html>
     async function runScan() {
       setBusy(true);
       say("Queueing scan...");
+      state.lastScanStartedAt = Date.now();
+      state.lastScanFinishedAt = null;
+      state.lastScanDurationMs = null;
+      updateTimingPills();
       try {
         const job = await api("/scan", {
           method: "POST",
           body: JSON.stringify(scanPayload())
         });
         const finished = await waitForJob(job.job_id);
+        state.lastScanFinishedAt = Date.now();
+        state.lastScanDurationMs = state.lastScanFinishedAt - state.lastScanStartedAt;
+        updateTimingPills();
         if (finished.status !== "completed") {
           throw new Error(finished.error || `Scan ${finished.status}`);
         }
         rememberResult(finished.result);
         renderResult();
-        say(finished.result_file ? `Scan complete. Saved ${finished.result_file}` : "Scan complete.");
+        const duration = formatDuration(state.lastScanDurationMs);
+        const saved = finished.result_file ? ` Saved ${finished.result_file}.` : "";
+        say(`Scan complete in ${duration || "0s"}.${saved}`);
         await refresh({ announce: false });
       } catch (error) {
+        state.lastScanFinishedAt = Date.now();
+        if (state.lastScanStartedAt) {
+          state.lastScanDurationMs = state.lastScanFinishedAt - state.lastScanStartedAt;
+        }
+        updateTimingPills();
         say(error.message, true);
       } finally {
         setBusy(false);
@@ -993,6 +1047,7 @@ UI_HTML = r"""<!doctype html>
       });
     });
 
+    updateTimingPills();
     refresh();
   </script>
 </body>

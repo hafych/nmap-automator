@@ -62,7 +62,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -1416,44 +1416,394 @@ def _check_nmap_available() -> bool:
         return False
 
 
+def _health_payload(*, nmap_available: bool) -> dict:
+    return {
+        "status": "healthy" if nmap_available else "unhealthy",
+        "product": PRODUCT_NAME,
+        "version": VERSION,
+        "ready": nmap_available,
+        "live": True,
+        "tasks_count": len(scan_tasks),
+        "telegram_configured": bot is not None,
+        "uptime": str(_utc_now() - start_time),
+        "fernet_key_configured": bool(FERNET_KEY),
+        "nmap_available": nmap_available,
+        "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
+        "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+        "max_concurrent_scans": MAX_CONCURRENT_SCANS,
+        "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
+        "max_scan_jobs": MAX_SCAN_JOBS,
+        "max_target_addresses": MAX_TARGET_ADDRESSES,
+        "results_max_files": RESULTS_MAX_FILES,
+        "results_max_age_days": RESULTS_MAX_AGE_DAYS,
+        "state_db": STATE_DB_PATH,
+        "discovery_engines": {
+            name: bool(path) for name, path in available_discovery_engines().items()
+        },
+    }
+
+
+@app.route("/live", methods=["GET"])
+async def liveness():
+    """Process liveness: event loop is responsive."""
+    return jsonify(
+        {
+            "status": "live",
+            "product": PRODUCT_NAME,
+            "version": VERSION,
+            "uptime": str(_utc_now() - start_time),
+        }
+    ), 200
+
+
+@app.route("/ready", methods=["GET"])
+async def readiness():
+    """Readiness: dependencies required to accept scan work."""
+    nmap_available = _check_nmap_available()
+    payload = {
+        "status": "ready" if nmap_available else "not_ready",
+        "product": PRODUCT_NAME,
+        "version": VERSION,
+        "nmap_available": nmap_available,
+        "fernet_key_configured": bool(FERNET_KEY),
+        "state_db": STATE_DB_PATH,
+    }
+    return jsonify(payload), 200 if nmap_available else 503
+
+
 @app.route("/health", methods=["GET"])
 async def health_check():
+    """Detailed health snapshot (readiness semantics for HTTP status)."""
     _cleanup_finished_tasks()
     nmap_available = _check_nmap_available()
-    status = "healthy" if nmap_available else "unhealthy"
     async with _jobs_lock:
         jobs_count = len(scan_jobs)
         active_jobs = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
 
-    return (
-        jsonify(
-            {
-                "status": status,
-                "product": PRODUCT_NAME,
-                "version": VERSION,
-                "tasks_count": len(scan_tasks),
-                "jobs_count": jobs_count,
-                "active_jobs": active_jobs,
-                "telegram_configured": bot is not None,
-                "uptime": str(_utc_now() - start_time),
-                "fernet_key_configured": bool(FERNET_KEY),
-                "nmap_available": nmap_available,
-                "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
-                "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
-                "max_concurrent_scans": MAX_CONCURRENT_SCANS,
-                "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
-                "max_scan_jobs": MAX_SCAN_JOBS,
-                "max_target_addresses": MAX_TARGET_ADDRESSES,
-                "results_max_files": RESULTS_MAX_FILES,
-                "results_max_age_days": RESULTS_MAX_AGE_DAYS,
-                "state_db": STATE_DB_PATH,
-                "discovery_engines": {
-                    name: bool(path) for name, path in available_discovery_engines().items()
+    payload = _health_payload(nmap_available=nmap_available)
+    payload["jobs_count"] = jobs_count
+    payload["active_jobs"] = active_jobs
+    return jsonify(payload), 200 if nmap_available else 503
+
+
+def build_openapi_spec() -> dict:
+    scan_types = list(SUPPORTED_SCAN_TYPES.keys())
+    error_schema = {
+        "type": "object",
+        "properties": {"error": {"type": "string"}},
+        "required": ["error"],
+    }
+    scan_request = {
+        "type": "object",
+        "required": ["target"],
+        "properties": {
+            "target": {"type": "string", "example": "127.0.0.1"},
+            "scan_type": {"type": "string", "enum": scan_types, "example": "TCP"},
+            "interval": {"type": "number", "example": 30},
+            "ports": {"type": "string", "example": "22,80,443"},
+            "scripts": {"type": "string", "example": "banner"},
+            "discovery": {
+                "type": "string",
+                "enum": ["auto", "naabu", "rustscan", "none"],
+            },
+        },
+    }
+    security = [{"ApiKeyAuth": []}] if API_AUTH_REQUIRED else []
+    return {
+        "openapi": "3.0.3",
+        "info": {
+            "title": f"{PRODUCT_NAME} API",
+            "version": VERSION,
+            "description": (
+                "Multi-tool recon control plane: Nmap engine, hybrid discovery, "
+                "Kali inventory, review-only recon plans, encrypted results."
+            ),
+        },
+        "servers": [{"url": f"http://{APP_HOST}:{APP_PORT}", "description": "Configured bind"}],
+        "components": {
+            "securitySchemes": {
+                "ApiKeyAuth": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": API_AUTH_HEADER,
+                }
+            },
+            "schemas": {
+                "Error": error_schema,
+                "ScanRequest": scan_request,
+                "Job": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "queued",
+                                "running",
+                                "completed",
+                                "failed",
+                                "cancelled",
+                                "timeout",
+                            ],
+                        },
+                        "target": {"type": "string"},
+                        "scan_type": {"type": "string"},
+                        "result": {"type": "object"},
+                        "result_file": {"type": "string", "nullable": True},
+                        "error": {"type": "string", "nullable": True},
+                    },
                 },
-            }
-        ),
-        200 if nmap_available else 503,
-    )
+            },
+        },
+        "security": security,
+        "paths": {
+            "/live": {
+                "get": {
+                    "summary": "Liveness probe",
+                    "security": [],
+                    "responses": {"200": {"description": "Process is live"}},
+                }
+            },
+            "/ready": {
+                "get": {
+                    "summary": "Readiness probe",
+                    "security": [],
+                    "responses": {
+                        "200": {"description": "Ready to accept scans"},
+                        "503": {"description": "Not ready (for example Nmap missing)"},
+                    },
+                }
+            },
+            "/health": {
+                "get": {
+                    "summary": "Detailed health",
+                    "security": [],
+                    "responses": {
+                        "200": {"description": "Healthy / ready"},
+                        "503": {"description": "Unhealthy / not ready"},
+                    },
+                }
+            },
+            "/api/docs": {
+                "get": {
+                    "summary": "Human-readable runtime API docs",
+                    "security": [],
+                    "responses": {"200": {"description": "JSON docs"}},
+                }
+            },
+            "/openapi.json": {
+                "get": {
+                    "summary": "OpenAPI 3 document",
+                    "security": [],
+                    "responses": {"200": {"description": "OpenAPI schema"}},
+                }
+            },
+            "/scan": {
+                "post": {
+                    "summary": "Queue or run a scan",
+                    "parameters": [
+                        {
+                            "name": "wait",
+                            "in": "query",
+                            "schema": {"type": "boolean"},
+                            "description": "Block until the scan finishes",
+                        }
+                    ],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ScanRequest"}
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Completed result when wait=1"},
+                        "202": {
+                            "description": "Job accepted",
+                            "content": {
+                                "application/json": {"schema": {"$ref": "#/components/schemas/Job"}}
+                            },
+                        },
+                        "400": {
+                            "description": "Validation error",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Error"}
+                                }
+                            },
+                        },
+                        "401": {"description": "Missing API token"},
+                        "403": {"description": "Invalid API token"},
+                        "429": {"description": "Rate limited"},
+                        "504": {"description": "Scan timeout"},
+                    },
+                }
+            },
+            "/jobs": {
+                "get": {
+                    "summary": "List scan jobs",
+                    "responses": {"200": {"description": "Job list"}},
+                }
+            },
+            "/jobs/{job_id}": {
+                "get": {
+                    "summary": "Get job status/result",
+                    "parameters": [
+                        {
+                            "name": "job_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Job"},
+                        "404": {"description": "Not found"},
+                    },
+                },
+                "delete": {
+                    "summary": "Cancel a job",
+                    "parameters": [
+                        {
+                            "name": "job_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Cancelled"},
+                        "404": {"description": "Not found"},
+                    },
+                },
+            },
+            "/schedule": {
+                "post": {
+                    "summary": "Schedule a recurring scan",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ScanRequest"}
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Scheduled"},
+                        "400": {"description": "Validation error"},
+                        "429": {"description": "Limit reached"},
+                    },
+                }
+            },
+            "/tasks": {
+                "get": {
+                    "summary": "List scheduled tasks",
+                    "responses": {"200": {"description": "Tasks"}},
+                }
+            },
+            "/tasks/{task_id}": {
+                "delete": {
+                    "summary": "Cancel scheduled task",
+                    "parameters": [
+                        {
+                            "name": "task_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Cancelled"},
+                        "404": {"description": "Not found"},
+                    },
+                }
+            },
+            "/results": {
+                "get": {
+                    "summary": "List encrypted results",
+                    "responses": {"200": {"description": "Result index"}},
+                }
+            },
+            "/results/{result_id}": {
+                "get": {
+                    "summary": "Decrypt and return a stored result",
+                    "parameters": [
+                        {
+                            "name": "result_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Decrypted result"},
+                        "404": {"description": "Not found"},
+                    },
+                }
+            },
+            "/results/import": {
+                "post": {
+                    "summary": "Import Nmap XML",
+                    "responses": {
+                        "201": {"description": "Imported"},
+                        "400": {"description": "Parse error"},
+                        "413": {"description": "Payload too large"},
+                    },
+                }
+            },
+            "/results/diff": {
+                "post": {
+                    "summary": "Diff two scan results",
+                    "responses": {"200": {"description": "Diff summary"}},
+                }
+            },
+            "/tools": {
+                "get": {
+                    "summary": "Kali/pentest tool inventory",
+                    "responses": {"200": {"description": "Inventory JSON"}},
+                }
+            },
+            "/tools/ai-context": {
+                "get": {
+                    "summary": "AI-readable inventory context",
+                    "parameters": [
+                        {
+                            "name": "format",
+                            "in": "query",
+                            "schema": {"type": "string", "enum": ["jsonl", "markdown", "md"]},
+                        }
+                    ],
+                    "responses": {"200": {"description": "JSONL or Markdown"}},
+                }
+            },
+            "/recon/plan": {
+                "post": {
+                    "summary": "Build review-only multi-tool recon plan",
+                    "responses": {"200": {"description": "Plan JSON/Markdown/JSONL"}},
+                }
+            },
+            "/": {
+                "get": {
+                    "summary": "Operator dashboard",
+                    "security": [],
+                    "responses": {"200": {"description": "HTML dashboard"}},
+                }
+            },
+            "/ui": {
+                "get": {
+                    "summary": "Operator dashboard (alias)",
+                    "security": [],
+                    "responses": {"200": {"description": "HTML dashboard"}},
+                }
+            },
+        },
+    }
+
+
+@app.route("/openapi.json", methods=["GET"])
+async def openapi_json():
+    return jsonify(build_openapi_spec()), 200
 
 
 @app.route("/api/docs", methods=["GET"])
@@ -1463,6 +1813,8 @@ async def api_docs():
             "name": f"{PRODUCT_NAME} API",
             "product": PRODUCT_NAME,
             "version": VERSION,
+            "openapi": "/openapi.json",
+            "probes": {"live": "/live", "ready": "/ready", "health": "/health"},
             "security": {
                 "api_auth_required": API_AUTH_REQUIRED,
                 "api_auth_header": API_AUTH_HEADER,
@@ -1517,7 +1869,10 @@ async def api_docs():
                     "description": "Diff two scan results (objects or stored result ids)",
                     "request": {"baseline": "result or {id}", "current": "result or {id}"},
                 },
-                "GET /health": {"description": "Service health check"},
+                "GET /live": {"description": "Liveness probe (always 200 when process is up)"},
+                "GET /ready": {"description": "Readiness probe (503 when Nmap missing)"},
+                "GET /health": {"description": "Detailed health snapshot"},
+                "GET /openapi.json": {"description": "OpenAPI 3 schema"},
                 "GET /tools": {
                     "description": "Inventory of Kali/pentest tools across recon categories"
                 },

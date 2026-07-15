@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import unittest
 
 os.environ.setdefault("API_AUTH_TOKEN", "test-token")
@@ -191,3 +192,47 @@ class ToolInventoryApiTests(unittest.IsolatedAsyncioTestCase):
         body = await response.get_data(as_text=True)
 
         self.assertIn("Tool Inventory", body)
+        self.assertIn("lastRefresh", body)
+        self.assertIn("lastScanMeta", body)
+
+    def test_cli_exports_json_and_markdown(self):
+        original = tool_inventory.build_tool_inventory
+
+        def fake_inventory(profiles=None, expand=False):
+            return {
+                "schema": "pentest-tool-inventory/v1",
+                "generated_at": "2026-07-09T00:00:00Z",
+                "source": "test",
+                "profiles": [{"profile": "core", "install": "kali-linux-core"}],
+                "summary": {
+                    "packages_checked": 1,
+                    "available": 1,
+                    "missing": 0,
+                    "missing_packages": [],
+                },
+                "packages": [
+                    {
+                        "package": "nmap",
+                        "category": "recon",
+                        "installed": True,
+                        "command_available": True,
+                        "commands": {"nmap": "/usr/bin/nmap"},
+                    }
+                ],
+                "ai_handoff": {"prompt_hint": "test", "recommended_files": []},
+            }
+
+        tool_inventory.build_tool_inventory = fake_inventory
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "inv.json")
+                code = tool_inventory.main(["--format", "json", "-o", out])
+                self.assertEqual(code, 0)
+                with open(out, encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                self.assertEqual(payload["schema"], "pentest-tool-inventory/v1")
+
+                md_code = tool_inventory.main(["--format", "markdown"])
+                self.assertEqual(md_code, 0)
+        finally:
+            tool_inventory.build_tool_inventory = original
