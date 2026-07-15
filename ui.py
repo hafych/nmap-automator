@@ -4,7 +4,7 @@ UI_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Recon Operator</title>
-  <style>
+  <style nonce="__CSP_NONCE__">
     :root {
       --bg: #eef2ee;
       --ink: #1e2520;
@@ -480,7 +480,7 @@ UI_HTML = r"""<!doctype html>
     </section>
   </main>
 
-  <script>
+  <script nonce="__CSP_NONCE__">
     const state = {
       lastResult: null,
       previousResult: null,
