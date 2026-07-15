@@ -168,14 +168,16 @@ Missing tools не устанавливались автоматически: э
 
 ### P1 — выполнить перед multi-user/public deployment
 
-- [ ] Вынести scheduled tasks, jobs и rate-limit buckets из памяти в Redis/DB; lease/locking для нескольких workers и восстановление после restart.
-- [ ] Добавить tenant/user model, scoped API keys и ownership tasks/results, если сервис перестаёт быть single-operator.
-- [ ] Поднять `autonmap.py` coverage до ≥75%: concurrent scans, job cancel races, Telegram failures, malformed/oversized JSON и shutdown races.
+- [x] ~~SQLite persistence for jobs/schedules (single-node).~~ Redis multi-worker still open.
+- [x] ~~Multi API tokens (`API_AUTH_TOKENS`) — shared operators, not full tenant isolation.~~
+- [ ] Full tenant/user model + ownership of tasks/results.
+- [ ] Redis multi-worker rate limits / leases.
+- [ ] Поднять `autonmap.py` coverage до ≥75% (improved, still below target).
 - [ ] Добавить CI browser E2E + axe-core для keyboard/ARIA/responsive regressions.
 
 ### P2 — security и maintainability
 
-- [ ] Убрать CSP `'unsafe-inline'`: вынести CSS/JS в static assets или использовать per-response nonce/hash.
+- [x] ~~CSP without `'unsafe-inline'` via per-response nonces for dashboard HTML.~~
 - [x] ~~Разделить liveness/readiness: `/live`, `/ready`, detailed `/health`.~~
 - [ ] Pin Docker base image и GitHub Actions по immutable digest/SHA; Dependabot должен обновлять их автоматически.
 - [x] ~~OpenAPI 3 schema at `/openapi.json` (plus human `/api/docs`).~~

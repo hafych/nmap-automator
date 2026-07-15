@@ -207,7 +207,8 @@ curl http://127.0.0.1:5000/openapi.json
 
 The default deployment is intentionally local and single-operator:
 
-- authentication is required by default;
+- authentication is required by default (one or more API tokens);
+- dashboard CSP uses per-response nonces (no `unsafe-inline`);
 - the server and Compose port bind to loopback;
 - scan types are allow-listed and targets are bounded;
 - subprocesses use argv rather than a shell;
@@ -224,9 +225,13 @@ This is not a multi-tenant authorization system. See [SECURITY.md](SECURITY.md).
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `FERNET_KEY` | required | Key used to encrypt stored results |
-| `API_AUTH_TOKEN` | required | Token expected in the API authentication header |
+| `API_AUTH_TOKEN` | required* | Primary token expected in the API authentication header |
+| `API_AUTH_TOKENS` | empty | Optional extra tokens (comma list or JSON array) |
 | `API_AUTH_REQUIRED` | `true` | Disable only for isolated local development |
 | `API_AUTH_HEADER` | `X-API-KEY` | Header carrying the API token |
+
+\* At least one of `API_AUTH_TOKEN` / `API_AUTH_TOKENS` is required when auth is enabled.
+Multiple tokens allow shared single-operator deployments without full multi-tenant isolation.
 | `APP_HOST` | `127.0.0.1` | Bind address |
 | `APP_PORT` | `5000` | Listen port |
 | `MAX_CONCURRENT_SCANS` | `2` | Maximum concurrent scans |

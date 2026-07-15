@@ -62,7 +62,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -126,10 +126,54 @@ bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN and CHAT_ID else None
 
 API_AUTH_REQUIRED = _parse_bool_env("API_AUTH_REQUIRED", True)
 API_AUTH_HEADER = os.getenv("API_AUTH_HEADER", "X-API-KEY").strip() or "X-API-KEY"
-API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
-if API_AUTH_REQUIRED and not API_AUTH_TOKEN:
+
+
+def _load_api_auth_tokens() -> list:
+    """Load one or more operator API tokens from the environment.
+
+    Supports:
+    - API_AUTH_TOKEN=single-token (legacy)
+    - API_AUTH_TOKENS=token-a,token-b
+    - API_AUTH_TOKENS='["token-a","token-b"]' (JSON array)
+    """
+    tokens: list = []
+    multi_raw = os.getenv("API_AUTH_TOKENS", "").strip()
+    if multi_raw:
+        if multi_raw.startswith("["):
+            try:
+                parsed = json.loads(multi_raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "API_AUTH_TOKENS must be a JSON array or comma-separated list"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise RuntimeError("API_AUTH_TOKENS JSON value must be an array of strings")
+            tokens.extend(str(item).strip() for item in parsed if str(item).strip())
+        else:
+            tokens.extend(part.strip() for part in multi_raw.split(",") if part.strip())
+
+    single = os.getenv("API_AUTH_TOKEN", "").strip()
+    if single:
+        tokens.append(single)
+
+    # Preserve order, drop duplicates.
+    unique: list = []
+    seen = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        unique.append(token)
+    return unique
+
+
+API_AUTH_TOKENS = _load_api_auth_tokens()
+# Backward-compatible alias used by docs and older code paths.
+API_AUTH_TOKEN = API_AUTH_TOKENS[0] if API_AUTH_TOKENS else ""
+if API_AUTH_REQUIRED and not API_AUTH_TOKENS:
     raise RuntimeError(
-        "API_AUTH_REQUIRED=true, but API_AUTH_TOKEN is empty. Set API_AUTH_TOKEN for security."
+        "API_AUTH_REQUIRED=true, but no API tokens are configured. "
+        "Set API_AUTH_TOKEN and/or API_AUTH_TOKENS."
     )
 
 RATE_LIMIT_WINDOW_SECONDS = _parse_int_env(
@@ -377,6 +421,19 @@ def _validate_scan_payload(
     )
 
 
+def _token_is_authorized(candidate: str) -> bool:
+    """Multi-token check with compare_digest when lengths match."""
+    if not candidate or not API_AUTH_TOKENS:
+        return False
+    matched = False
+    for allowed in API_AUTH_TOKENS:
+        # secrets.compare_digest requires equal-length inputs.
+        if len(candidate) != len(allowed):
+            continue
+        matched = secrets.compare_digest(candidate, allowed) or matched
+    return matched
+
+
 def require_api_auth():
     if not API_AUTH_REQUIRED:
         return None
@@ -384,7 +441,7 @@ def require_api_auth():
     token = request.headers.get(API_AUTH_HEADER)
     if not token:
         return jsonify({"error": f"API token missing ({API_AUTH_HEADER})"}), 401
-    if not secrets.compare_digest(token, API_AUTH_TOKEN):
+    if not _token_is_authorized(token):
         return jsonify({"error": "Invalid API token"}), 403
     return None
 
@@ -1380,10 +1437,28 @@ async def recon_plan():
     return jsonify(plan), 200
 
 
+def _render_dashboard_html() -> tuple:
+    nonce = secrets.token_urlsafe(18)
+    html = UI_HTML.replace("__CSP_NONCE__", nonce)
+    csp = (
+        f"default-src 'self'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
+        f"connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; "
+        f"form-action 'self'"
+    )
+    return (
+        html,
+        200,
+        {
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Security-Policy": csp,
+        },
+    )
+
+
 @app.route("/", methods=["GET"])
 @app.route("/ui", methods=["GET"])
 async def dashboard():
-    return UI_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+    return _render_dashboard_html()
 
 
 @app.after_request
@@ -1392,11 +1467,18 @@ async def add_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-        "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
-    )
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    # HTML dashboard sets a nonce-based CSP; API responses get a tight default.
+    if "Content-Security-Policy" not in response.headers:
+        content_type = (response.content_type or "").lower()
+        if "text/html" in content_type:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+            )
+        else:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+            )
     return response
 
 
@@ -1818,6 +1900,7 @@ async def api_docs():
             "security": {
                 "api_auth_required": API_AUTH_REQUIRED,
                 "api_auth_header": API_AUTH_HEADER,
+                "api_token_count": len(API_AUTH_TOKENS),
                 "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} requests per {RATE_LIMIT_WINDOW_SECONDS} seconds",
                 "max_concurrent_scans": MAX_CONCURRENT_SCANS,
             },

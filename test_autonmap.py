@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# Path is used by retention and result tests.
+
 os.environ["API_AUTH_REQUIRED"] = "true"
 os.environ["API_AUTH_TOKEN"] = "test-token"
 os.environ["FERNET_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -261,6 +263,11 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("waitForJob", body)
         self.assertIn("Import XML", body)
         self.assertIn("Diff last two", body)
+        self.assertNotIn("__CSP_NONCE__", body)
+        self.assertIn('nonce="', body)
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("nonce-", csp)
+        self.assertNotIn("unsafe-inline", csp)
 
     async def test_responses_include_security_headers(self):
         response = await self.client.get("/health")
@@ -268,6 +275,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
 
     async def test_scan_queues_job_by_default(self):
         async def fake_create(
@@ -611,6 +619,149 @@ class CacheSingleFlightRegressionTests(unittest.TestCase):
 
         self.assertEqual(calls, 1)
         self.assertEqual(results, [{"expand": False}] * 8)
+
+
+class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        autonmap.scan_tasks.clear()
+        autonmap.scan_jobs.clear()
+        autonmap.rate_limits.clear()
+        self.client = autonmap.app.test_client()
+
+    def test_multi_token_authorization(self):
+        original = list(autonmap.API_AUTH_TOKENS)
+        autonmap.API_AUTH_TOKENS = ["alpha-token-111", "beta-token-2222"]
+        try:
+            self.assertTrue(autonmap._token_is_authorized("alpha-token-111"))
+            self.assertTrue(autonmap._token_is_authorized("beta-token-2222"))
+            self.assertFalse(autonmap._token_is_authorized("nope"))
+            self.assertFalse(autonmap._token_is_authorized("alpha-token-11"))
+        finally:
+            autonmap.API_AUTH_TOKENS = original
+
+    async def test_invalid_token_is_rejected(self):
+        response = await self.client.get("/tasks", headers={"X-API-KEY": "wrong-token"})
+        payload = await response.get_json()
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Invalid", payload["error"])
+
+    async def test_schedule_create_list_and_cancel(self):
+        async def noop_periodic(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        original = autonmap.periodic_scan
+        autonmap.periodic_scan = noop_periodic
+        try:
+            create = await self.client.post(
+                "/schedule",
+                headers={"X-API-KEY": "test-token"},
+                json={"target": "127.0.0.1", "scan_type": "Ping", "interval": 30},
+            )
+            created = await create.get_json()
+            self.assertEqual(create.status_code, 200)
+            task_id = created["task_id"]
+
+            listed = await self.client.get("/tasks", headers={"X-API-KEY": "test-token"})
+            listed_payload = await listed.get_json()
+            self.assertTrue(any(item["id"] == task_id for item in listed_payload))
+
+            cancelled = await self.client.delete(
+                f"/tasks/{task_id}", headers={"X-API-KEY": "test-token"}
+            )
+            self.assertEqual(cancelled.status_code, 200)
+        finally:
+            autonmap.periodic_scan = original
+            for task in list(autonmap.scan_tasks.values()):
+                task.cancel()
+            autonmap.scan_tasks.clear()
+
+    async def test_rate_limit_blocks_excess_requests(self):
+        original_max = autonmap.MAX_REQUESTS_PER_WINDOW
+        original_key = autonmap._client_key
+        autonmap.MAX_REQUESTS_PER_WINDOW = 1
+        autonmap._client_key = lambda: "rate-test-client"
+        autonmap.rate_limits.clear()
+        try:
+            first = await self.client.get("/tools", headers={"X-API-KEY": "test-token"})
+            second = await self.client.get("/tools", headers={"X-API-KEY": "test-token"})
+        finally:
+            autonmap.MAX_REQUESTS_PER_WINDOW = original_max
+            autonmap._client_key = original_key
+            autonmap.rate_limits.clear()
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+
+    async def test_result_path_traversal_is_rejected(self):
+        response = await self.client.get(
+            "/results/../secrets.json",
+            headers={"X-API-KEY": "test-token"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    async def test_load_persisted_state_marks_inflight_failed(self):
+        original_results = list(autonmap.scan_jobs.items())
+        autonmap.scan_jobs.clear()
+
+        def fake_list_jobs(limit=200):
+            return [
+                {
+                    "job_id": "inflight-1",
+                    "target": "127.0.0.1",
+                    "scan_type": "Ping",
+                    "status": "running",
+                    "kind": "immediate",
+                    "created_at": "t0",
+                    "task": None,
+                }
+            ]
+
+        def fake_list_tasks():
+            return []
+
+        def fake_upsert(job):
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("restart", job["error"].lower())
+
+        original_jobs = autonmap.state_store.list_jobs
+        original_tasks = autonmap.state_store.list_scheduled_tasks
+        original_upsert = autonmap.state_store.upsert_job
+        autonmap.state_store.list_jobs = fake_list_jobs
+        autonmap.state_store.list_scheduled_tasks = fake_list_tasks
+        autonmap.state_store.upsert_job = fake_upsert
+        try:
+            await autonmap.load_persisted_state()
+            self.assertEqual(autonmap.scan_jobs["inflight-1"]["status"], "failed")
+        finally:
+            autonmap.state_store.list_jobs = original_jobs
+            autonmap.state_store.list_scheduled_tasks = original_tasks
+            autonmap.state_store.upsert_job = original_upsert
+            autonmap.scan_jobs.clear()
+            for key, value in original_results:
+                autonmap.scan_jobs[key] = value
+
+    def test_retention_by_age(self):
+        original_age = autonmap.RESULTS_MAX_AGE_DAYS
+        original_max = autonmap.RESULTS_MAX_FILES
+        autonmap.RESULTS_MAX_AGE_DAYS = 1
+        autonmap.RESULTS_MAX_FILES = 100
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                old = Path(tmp) / "old_Ping_20260101_000000_1.json"
+                new = Path(tmp) / "new_Ping_20260102_000000_1.json"
+                old.write_bytes(b"old")
+                new.write_bytes(b"new")
+                now = time.time()
+                os.utime(old, (now - 3 * 86400, now - 3 * 86400))
+                os.utime(new, (now, now))
+                summary = autonmap.apply_results_retention(tmp)
+                names = {path.name for path in Path(tmp).glob("*.json")}
+        finally:
+            autonmap.RESULTS_MAX_AGE_DAYS = original_age
+            autonmap.RESULTS_MAX_FILES = original_max
+
+        self.assertEqual(summary["deleted"], 1)
+        self.assertEqual(names, {"new_Ping_20260102_000000_1.json"})
 
 
 class ReadinessRegressionTests(unittest.IsolatedAsyncioTestCase):
