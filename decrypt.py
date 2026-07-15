@@ -1,8 +1,9 @@
 import argparse
 import os
+import sys
 import tempfile
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -67,5 +68,17 @@ def main():
         print(text)
 
 
+def cli() -> int:
+    try:
+        main()
+    except InvalidToken:
+        print("Decryption failed: wrong FERNET_KEY or corrupted input file.", file=sys.stderr)
+        return 1
+    except (RuntimeError, OSError, UnicodeDecodeError) as exc:
+        print(f"Decryption failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli())
