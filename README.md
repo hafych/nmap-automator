@@ -158,14 +158,24 @@ python kali_ai_scan.py parse nmap.xml --out ai_reports/imported-scan
 ### Inventory Kali tools and build a recon plan
 
 ```bash
+# API
 curl -H "X-API-KEY: $API_TOKEN" 'http://127.0.0.1:5000/tools?expand=0'
 curl -H "X-API-KEY: $API_TOKEN" 'http://127.0.0.1:5000/tools/ai-context?format=jsonl'
+
+# Standalone CLI (no API server required)
+python tool_inventory.py --format json
+python tool_inventory.py --format jsonl -o inventory.jsonl
+python tool_inventory.py --format markdown --profiles recon web
 
 curl -X POST \
   -H "X-API-KEY: $API_TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary @scan-result.json \
   'http://127.0.0.1:5000/recon/plan?format=markdown'
+
+curl http://127.0.0.1:5000/live
+curl http://127.0.0.1:5000/ready
+curl http://127.0.0.1:5000/openapi.json
 ```
 
 ## API surface
@@ -173,7 +183,10 @@ curl -X POST \
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/` and `/ui` | Browser dashboard |
-| `GET` | `/health` | Service and Nmap health |
+| `GET` | `/live` | Liveness probe (process up) |
+| `GET` | `/ready` | Readiness probe (Nmap available) |
+| `GET` | `/health` | Detailed health snapshot |
+| `GET` | `/openapi.json` | OpenAPI 3 schema |
 | `GET` | `/api/docs` | Runtime API description |
 | `POST` | `/scan` | Queue immediate scan (`202`); `?wait=1` blocks |
 | `GET` | `/jobs` | List scan jobs |
