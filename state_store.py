@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     ports TEXT,
     scripts TEXT,
     discovery TEXT,
+    owner_id TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     discovery TEXT,
     status TEXT NOT NULL,
     kind TEXT NOT NULL,
+    owner_id TEXT,
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
@@ -51,6 +53,8 @@ class StateStore:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+            conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
@@ -58,6 +62,26 @@ class StateStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [row["name"] for row in rows]
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        job_cols = self._table_columns(conn, "scan_jobs")
+        if "owner_id" not in job_cols:
+            conn.execute("ALTER TABLE scan_jobs ADD COLUMN owner_id TEXT")
+        task_cols = self._table_columns(conn, "scheduled_tasks")
+        if "owner_id" not in task_cols:
+            conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN owner_id TEXT")
+        # Owner indexes after column migration so older DBs upgrade cleanly.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_jobs_owner ON scan_jobs(owner_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_owner ON scheduled_tasks(owner_id)"
+        )
 
     def upsert_scheduled_task(
         self,
@@ -69,6 +93,7 @@ class StateStore:
         ports: Optional[str] = None,
         scripts: Optional[str] = None,
         discovery: Optional[str] = None,
+        owner_id: Optional[str] = None,
         created_at: str,
     ) -> None:
         with self._lock, self._connect() as conn:
@@ -76,15 +101,16 @@ class StateStore:
                 """
                 INSERT INTO scheduled_tasks(
                     task_id, target, scan_type, interval_minutes, ports, scripts,
-                    discovery, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    discovery, owner_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     target=excluded.target,
                     scan_type=excluded.scan_type,
                     interval_minutes=excluded.interval_minutes,
                     ports=excluded.ports,
                     scripts=excluded.scripts,
-                    discovery=excluded.discovery
+                    discovery=excluded.discovery,
+                    owner_id=excluded.owner_id
                 """,
                 (
                     task_id,
@@ -94,6 +120,7 @@ class StateStore:
                     ports,
                     scripts,
                     discovery,
+                    owner_id,
                     created_at,
                 ),
             )
@@ -104,9 +131,21 @@ class StateStore:
             conn.execute("DELETE FROM scheduled_tasks WHERE task_id = ?", (task_id,))
             conn.commit()
 
-    def list_scheduled_tasks(self) -> List[Dict[str, Any]]:
+    def list_scheduled_tasks(self, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
-            rows = conn.execute("SELECT * FROM scheduled_tasks ORDER BY created_at ASC").fetchall()
+            if owner_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM scheduled_tasks
+                    WHERE owner_id IS NULL OR owner_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (owner_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM scheduled_tasks ORDER BY created_at ASC"
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def upsert_job(self, job: Dict[str, Any]) -> None:
@@ -119,8 +158,8 @@ class StateStore:
                 """
                 INSERT INTO scan_jobs(
                     job_id, target, scan_type, ports, scripts, discovery, status, kind,
-                    created_at, started_at, finished_at, error, result_file, result_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    owner_id, created_at, started_at, finished_at, error, result_file, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     target=excluded.target,
                     scan_type=excluded.scan_type,
@@ -129,6 +168,7 @@ class StateStore:
                     discovery=excluded.discovery,
                     status=excluded.status,
                     kind=excluded.kind,
+                    owner_id=excluded.owner_id,
                     started_at=excluded.started_at,
                     finished_at=excluded.finished_at,
                     error=excluded.error,
@@ -144,6 +184,7 @@ class StateStore:
                     job.get("discovery"),
                     job.get("status") or "queued",
                     job.get("kind") or "immediate",
+                    job.get("owner_id"),
                     job.get("created_at") or "",
                     job.get("started_at"),
                     job.get("finished_at"),
@@ -161,12 +202,23 @@ class StateStore:
             return None
         return self._row_to_job(dict(row))
 
-    def list_jobs(self, limit: int = 200) -> List[Dict[str, Any]]:
+    def list_jobs(self, limit: int = 200, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM scan_jobs ORDER BY created_at DESC LIMIT ?",
-                (max(1, int(limit)),),
-            ).fetchall()
+            if owner_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM scan_jobs
+                    WHERE owner_id IS NULL OR owner_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (owner_id, max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM scan_jobs ORDER BY created_at DESC LIMIT ?",
+                    (max(1, int(limit)),),
+                ).fetchall()
         return [self._row_to_job(dict(row)) for row in rows]
 
     def prune_jobs(self, max_jobs: int) -> int:
@@ -213,6 +265,7 @@ class StateStore:
             "discovery": row.get("discovery"),
             "status": row["status"],
             "kind": row.get("kind") or "immediate",
+            "owner_id": row.get("owner_id"),
             "created_at": row.get("created_at"),
             "started_at": row.get("started_at"),
             "finished_at": row.get("finished_at"),

@@ -279,7 +279,13 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scan_queues_job_by_default(self):
         async def fake_create(
-            target, scan_type, kind="immediate", ports=None, scripts=None, discovery=None
+            target,
+            scan_type,
+            kind="immediate",
+            ports=None,
+            scripts=None,
+            discovery=None,
+            owner_id=None,
         ):
             return {
                 "job_id": "job-1",
@@ -291,6 +297,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 "ports": ports,
                 "scripts": scripts,
                 "discovery": discovery,
+                "owner_id": owner_id,
             }
 
         original = autonmap.create_scan_job
@@ -312,7 +319,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_scan_wait_mode_returns_result(self):
         original_scan = autonmap.async_scan
 
-        async def fake_scan(target, scan_type, ports=None, scripts=None, discovery=None):
+        async def fake_scan(
+            target, scan_type, ports=None, scripts=None, discovery=None, owner_id=None
+        ):
             return {"hosts": [], "target": target, "scan_type": scan_type}
 
         autonmap.async_scan = fake_scan
@@ -332,7 +341,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_scan_timeout_returns_gateway_timeout(self):
         original_scan = autonmap.async_scan
 
-        async def timeout_scan(target, scan_type, ports=None, scripts=None, discovery=None):
+        async def timeout_scan(
+            target, scan_type, ports=None, scripts=None, discovery=None, owner_id=None
+        ):
             raise TimeoutError("scan took too long")
 
         autonmap.async_scan = timeout_scan
@@ -427,7 +438,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         async def ignore_message(_message):
             return None
 
-        def fake_scan(target, scan_type, ports=None, scripts=None, discovery=None):
+        def fake_scan(target, scan_type, ports=None, scripts=None, discovery=None, owner_id=None):
             return {
                 "hosts": [{"host": target, "hostname": "N/A", "state": "up", "protocols": {}}],
                 "scan_count": 1,
@@ -660,6 +671,7 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
             created = await create.get_json()
             self.assertEqual(create.status_code, 200)
             task_id = created["task_id"]
+            self.assertTrue(task_id.startswith("o"))
 
             listed = await self.client.get("/tasks", headers={"X-API-KEY": "test-token"})
             listed_payload = await listed.get_json()
@@ -674,6 +686,16 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
             for task in list(autonmap.scan_tasks.values()):
                 task.cancel()
             autonmap.scan_tasks.clear()
+
+    def test_result_visibility_by_owner_prefix(self):
+        owner_a = autonmap.owner_id_from_token("token-a-aaaaaaaa")
+        owner_b = autonmap.owner_id_from_token("token-b-bbbbbbbb")
+        file_a = f"{autonmap.owner_result_prefix(owner_a)}host_Ping_20260101_000000_1.json"
+        file_b = f"{autonmap.owner_result_prefix(owner_b)}host_Ping_20260101_000000_2.json"
+        legacy = "legacy_Ping_20260101_000000_3.json"
+        self.assertTrue(autonmap.result_visible_to_owner(file_a, owner_a))
+        self.assertFalse(autonmap.result_visible_to_owner(file_b, owner_a))
+        self.assertTrue(autonmap.result_visible_to_owner(legacy, owner_a))
 
     async def test_rate_limit_blocks_excess_requests(self):
         original_max = autonmap.MAX_REQUESTS_PER_WINDOW

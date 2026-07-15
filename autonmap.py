@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -21,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from quart import Quart, jsonify, request
+from quart import Quart, g, jsonify, request
 from telegram import Bot
 from telegram.error import TelegramError
 
@@ -62,7 +63,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -253,7 +254,10 @@ _jobs_lock = asyncio.Lock()
 state_store = StateStore(STATE_DB_PATH)
 
 SUPPORTED_SCAN_TYPES = {name: name for name in supported_scan_types()}
-RESULT_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}_\w+_\d{8}_\d{6}_\d+\.json$")
+RESULT_FILENAME_RE = re.compile(
+    r"^(?:o[a-f0-9]{12}_)?[A-Za-z0-9._-]{1,200}_\w+_\d{8}_\d{6}_\d+\.json$"
+)
+OWNER_RESULT_PREFIX_RE = re.compile(r"^o([a-f0-9]{12})_")
 
 
 def _utc_now() -> datetime:
@@ -434,8 +438,46 @@ def _token_is_authorized(candidate: str) -> bool:
     return matched
 
 
+def owner_id_from_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def current_owner_id() -> str:
+    try:
+        return getattr(g, "owner_id", "local")
+    except RuntimeError:
+        # Outside a request context (startup tasks, unit helpers).
+        return "local"
+
+
+def owner_result_prefix(owner_id: Optional[str] = None) -> str:
+    value = owner_id or current_owner_id()
+    return f"o{value[:12]}_"
+
+
+def result_visible_to_owner(filename: str, owner_id: Optional[str] = None) -> bool:
+    """Legacy files (no owner prefix) remain visible to any authenticated operator."""
+    owner = owner_id or current_owner_id()
+    match = OWNER_RESULT_PREFIX_RE.match(filename)
+    if not match:
+        return True
+    return match.group(1) == owner[:12]
+
+
+def job_visible_to_owner(job: Dict[str, Any], owner_id: Optional[str] = None) -> bool:
+    owner = owner_id or current_owner_id()
+    job_owner = job.get("owner_id")
+    return job_owner is None or job_owner == owner
+
+
+def make_task_id(target: str, scan_type: str, owner_id: Optional[str] = None) -> str:
+    owner = owner_id or current_owner_id()
+    return f"o{owner[:12]}-{target}-{scan_type}"
+
+
 def require_api_auth():
     if not API_AUTH_REQUIRED:
+        g.owner_id = "local"
         return None
 
     token = request.headers.get(API_AUTH_HEADER)
@@ -443,6 +485,7 @@ def require_api_auth():
         return jsonify({"error": f"API token missing ({API_AUTH_HEADER})"}), 401
     if not _token_is_authorized(token):
         return jsonify({"error": "Invalid API token"}), 403
+    g.owner_id = owner_id_from_token(token)
     return None
 
 
@@ -686,13 +729,19 @@ def _write_encrypted_result(path: str, encrypted_data: bytes) -> None:
             os.unlink(temporary_path)
 
 
-async def save_scan_results_async(results: dict, target: str, scan_type: str) -> Optional[str]:
+async def save_scan_results_async(
+    results: dict,
+    target: str,
+    scan_type: str,
+    owner_id: Optional[str] = None,
+) -> Optional[str]:
     if not results:
         return None
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_target = "".join(c if c.isalnum() or c in [".", "_", "-"] else "_" for c in target)[:120]
-    filename = f"{safe_target}_{scan_type}_{timestamp}.json"
+    owner = owner_id or "local"
+    filename = f"{owner_result_prefix(owner)}{safe_target}_{scan_type}_{timestamp}.json"
     path = os.path.join(RESULTS_DIR, filename)
 
     try:
@@ -779,6 +828,7 @@ async def _run_scan_job(job_id: str) -> None:
         ports = job.get("ports")
         scripts = job.get("scripts")
         discovery = job.get("discovery")
+        owner_id = job.get("owner_id") or "local"
         _persist_job(job)
 
     loop = asyncio.get_running_loop()
@@ -797,7 +847,7 @@ async def _run_scan_job(job_id: str) -> None:
                 ),
                 timeout=SCAN_TIMEOUT_SECONDS + 5,
             )
-        result_file = await save_scan_results_async(results, target, scan_type)
+        result_file = await save_scan_results_async(results, target, scan_type, owner_id=owner_id)
         await _set_job_fields(
             job_id,
             status="completed",
@@ -860,7 +910,9 @@ async def create_scan_job(
     ports: Optional[str] = None,
     scripts: Optional[str] = None,
     discovery: Optional[str] = None,
+    owner_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    owner = owner_id or current_owner_id()
     async with _jobs_lock:
         await _prune_jobs_locked()
         active = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
@@ -875,6 +927,7 @@ async def create_scan_job(
             "ports": ports,
             "scripts": scripts,
             "discovery": discovery,
+            "owner_id": owner,
             "status": "queued",
             "created_at": _utc_now_iso(),
             "started_at": None,
@@ -898,6 +951,7 @@ async def async_scan(
     ports: Optional[str] = None,
     scripts: Optional[str] = None,
     discovery: Optional[str] = None,
+    owner_id: Optional[str] = None,
 ) -> dict:
     """Run a scan and wait for completion (used by scheduled scans)."""
     job = await create_scan_job(
@@ -907,6 +961,7 @@ async def async_scan(
         ports=ports,
         scripts=scripts,
         discovery=discovery,
+        owner_id=owner_id,
     )
     job_id = job["job_id"]
     while True:
@@ -964,6 +1019,7 @@ async def start_scan():
                     ports=ports,
                     scripts=scripts,
                     discovery=discovery,
+                    owner_id=current_owner_id(),
                 )
             except TimeoutError as e:
                 return jsonify({"error": str(e)}), 504
@@ -979,6 +1035,7 @@ async def start_scan():
             ports=ports,
             scripts=scripts,
             discovery=discovery,
+            owner_id=current_owner_id(),
         )
         return jsonify(job), 202
     except Exception as e:
@@ -994,6 +1051,7 @@ async def list_jobs():
     if auth_error:
         return auth_error
 
+    owner = current_owner_id()
     async with _jobs_lock:
         jobs = [
             _job_public_view(job, include_result=False)
@@ -1002,6 +1060,7 @@ async def list_jobs():
                 key=lambda item: item.get("created_at") or "",
                 reverse=True,
             )
+            if job_visible_to_owner(job, owner)
         ]
     return jsonify(jobs), 200
 
@@ -1018,6 +1077,8 @@ async def get_job(job_id: str):
         job = await asyncio.to_thread(state_store.get_job, job_id)
         if not job:
             return jsonify({"error": "Job not found"}), 404
+    if not job_visible_to_owner(job):
+        return jsonify({"error": "Job not found"}), 404
     return jsonify(_job_public_view(job, include_result=True)), 200
 
 
@@ -1029,7 +1090,7 @@ async def cancel_job(job_id: str):
 
     async with _jobs_lock:
         job = scan_jobs.get(job_id)
-        if not job:
+        if not job or not job_visible_to_owner(job):
             return jsonify({"error": "Job not found"}), 404
         if job["status"] in {"completed", "failed", "cancelled", "timeout"}:
             return jsonify({"message": f"Job already {job['status']}", "job_id": job_id}), 200
@@ -1039,6 +1100,7 @@ async def cancel_job(job_id: str):
         job["error"] = "Scan cancelled"
         if task is not None and not task.done():
             task.cancel()
+        _persist_job(job)
     log_event(f"Job {job_id} cancelled")
     return jsonify({"message": f"Job {job_id} cancelled", "job_id": job_id}), 200
 
@@ -1050,6 +1112,7 @@ async def periodic_scan(
     ports: Optional[str] = None,
     scripts: Optional[str] = None,
     discovery: Optional[str] = None,
+    owner_id: Optional[str] = None,
 ):
     """Async recurring scan loop."""
     try:
@@ -1060,6 +1123,7 @@ async def periodic_scan(
     if interval <= 0:
         raise ValueError("interval must be a positive number")
 
+    owner = owner_id or "local"
     log_event(f"Started periodic scan {target} every {interval} minutes")
     await send_telegram_message(
         f"{PRODUCT_NAME}: started periodic scan {target} every {interval} minutes"
@@ -1069,7 +1133,14 @@ async def periodic_scan(
         _cleanup_finished_tasks()
         try:
             log_event(f"Running periodic scan: {target}")
-            await async_scan(target, scan_type, ports=ports, scripts=scripts, discovery=discovery)
+            await async_scan(
+                target,
+                scan_type,
+                ports=ports,
+                scripts=scripts,
+                discovery=discovery,
+                owner_id=owner,
+            )
         except asyncio.CancelledError:
             log_event(f"Periodic scan {target} cancelled")
             break
@@ -1102,7 +1173,8 @@ async def add_scheduled_scan():
         if interval is None:
             interval = 30.0
 
-        task_id = f"{target}-{scan_type}"
+        owner = current_owner_id()
+        task_id = make_task_id(target, scan_type, owner)
         _cleanup_finished_tasks()
         if task_id in scan_tasks:
             return jsonify({"error": "Scan already scheduled"}), 400
@@ -1117,6 +1189,7 @@ async def add_scheduled_scan():
                 ports=ports,
                 scripts=scripts,
                 discovery=discovery,
+                owner_id=owner,
             )
         )
         scan_tasks[task_id] = task
@@ -1129,6 +1202,7 @@ async def add_scheduled_scan():
                 ports=ports,
                 scripts=scripts,
                 discovery=discovery,
+                owner_id=owner,
                 created_at=_utc_now_iso(),
             )
         except Exception as exc:
@@ -1153,9 +1227,14 @@ async def list_tasks():
     if auth_error:
         return auth_error
 
+    owner = current_owner_id()
+    owner_prefix = f"o{owner[:12]}-"
     _cleanup_finished_tasks()
     tasks_info = []
     for task_id, task in scan_tasks.items():
+        # Legacy tasks without owner prefix remain visible for compatibility.
+        if task_id.startswith("o") and not task_id.startswith(owner_prefix):
+            continue
         tasks_info.append(
             {
                 "id": task_id,
@@ -1171,6 +1250,11 @@ async def cancel_task(task_id):
     auth_error = require_api_auth()
     if auth_error:
         return auth_error
+
+    owner = current_owner_id()
+    owner_prefix = f"o{owner[:12]}-"
+    if task_id.startswith("o") and not task_id.startswith(owner_prefix):
+        return jsonify({"error": "Task not found"}), 404
 
     _cleanup_finished_tasks()
     if task_id in scan_tasks:
@@ -1209,9 +1293,12 @@ async def list_results():
         return auth_error
 
     limit = _parse_optional_limit(request.args.get("limit"), default=50, max_value=500)
+    owner = current_owner_id()
     files = await asyncio.to_thread(_result_files)
     items = []
-    for path in files[:limit]:
+    for path in files:
+        if not result_visible_to_owner(path.name, owner):
+            continue
         try:
             stat = path.stat()
             items.append(
@@ -1226,6 +1313,8 @@ async def list_results():
             )
         except OSError:
             continue
+        if len(items) >= limit:
+            break
     return jsonify({"count": len(items), "results": items}), 200
 
 
@@ -1248,7 +1337,7 @@ async def get_result(result_id: str):
         return auth_error
 
     path = _safe_result_path(result_id)
-    if path is None:
+    if path is None or not result_visible_to_owner(path.name):
         return jsonify({"error": "Result not found"}), 404
 
     try:
@@ -1278,7 +1367,7 @@ async def _load_result_reference(ref: Any) -> Tuple[Optional[dict], Optional[str
     if not result_id or not isinstance(result_id, str):
         return None, "Expected a scan result object or result id"
     path = _safe_result_path(result_id)
-    if path is None:
+    if path is None or not result_visible_to_owner(path.name):
         return None, f"Result not found: {result_id}"
     try:
         encrypted = await asyncio.to_thread(path.read_bytes)
@@ -1336,7 +1425,10 @@ async def import_result_xml():
         return jsonify({"error": f"XML import failed: {exc}"}), 400
 
     filename = await save_scan_results_async(
-        result, result.get("target") or "xml-import", scan_type
+        result,
+        result.get("target") or "xml-import",
+        scan_type,
+        owner_id=current_owner_id(),
     )
     return jsonify({"id": filename, "filename": filename, "result": result}), 201
 
@@ -2004,7 +2096,8 @@ async def load_initial_tasks():
             if interval is None:
                 interval = 30.0
 
-            task_id = f"{target}-{scan_type}"
+            owner = "local"
+            task_id = make_task_id(target, scan_type, owner)
             if task_id in scan_tasks:
                 continue
 
@@ -2016,6 +2109,7 @@ async def load_initial_tasks():
                     ports=ports,
                     scripts=scripts,
                     discovery=discovery,
+                    owner_id=owner,
                 )
             )
             scan_tasks[task_id] = task
@@ -2028,6 +2122,7 @@ async def load_initial_tasks():
                     ports=ports,
                     scripts=scripts,
                     discovery=discovery,
+                    owner_id=owner,
                     created_at=_utc_now_iso(),
                 )
             except Exception as exc:
@@ -2084,6 +2179,7 @@ async def load_persisted_state():
                 ports=row.get("ports"),
                 scripts=row.get("scripts"),
                 discovery=row.get("discovery"),
+                owner_id=row.get("owner_id") or "local",
             )
         )
         scan_tasks[task_id] = task
