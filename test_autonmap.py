@@ -1,7 +1,11 @@
 import asyncio
+import concurrent.futures
+import math
 import os
 import stat
 import tempfile
+import threading
+import time
 import unittest
 
 os.environ["API_AUTH_REQUIRED"] = "true"
@@ -233,6 +237,94 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 429)
         self.assertIn("лимит", payload["error"])
+
+    async def test_dashboard_exposes_accessible_controls_and_feedback(self):
+        response = await self.client.get("/")
+        body = await response.get_data(as_text=True)
+
+        self.assertIn('role="status" aria-live="polite"', body)
+        self.assertIn('role="tablist"', body)
+        self.assertIn('aria-selected="true"', body)
+        self.assertIn('for="toolsBox"', body)
+        self.assertIn('for="resultBox"', body)
+        self.assertIn(":focus-visible", body)
+        self.assertIn("refresh({ announce: false })", body)
+
+
+class PayloadHardeningRegressionTests(unittest.TestCase):
+    def test_non_finite_intervals_are_rejected(self):
+        for interval in (math.nan, math.inf, -math.inf):
+            with self.subTest(interval=interval):
+                *_, error = autonmap._validate_scan_payload(
+                    {"target": "127.0.0.1", "scan_type": "Ping", "interval": interval}
+                )
+
+                self.assertEqual(error, "Интервал должен быть конечным числом")
+
+    def test_targets_are_canonicalized_before_task_ids_are_built(self):
+        cases = {
+            "LOCALHOST": "localhost",
+            "Example.COM": "example.com",
+            "192.0.2.7/24": "192.0.2.0/24",
+            "2001:0db8::1": "2001:db8::1",
+        }
+
+        for supplied, expected in cases.items():
+            with self.subTest(target=supplied):
+                target, _, _, error = autonmap._validate_scan_payload(
+                    {"target": supplied, "scan_type": "Ping", "interval": 5}
+                )
+
+                self.assertIsNone(error)
+                self.assertEqual(target, expected)
+
+
+class CacheSingleFlightRegressionTests(unittest.TestCase):
+    def test_concurrent_cache_misses_build_inventory_once(self):
+        original_builder = autonmap.build_tool_inventory
+        original_cache = dict(autonmap.tool_inventory_cache)
+        calls = 0
+        calls_lock = threading.Lock()
+        start = threading.Barrier(8)
+
+        def fake_builder(expand=False):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.05)
+            return {"expand": expand}
+
+        def load_inventory(_index):
+            start.wait(timeout=2)
+            return autonmap.get_cached_tool_inventory(False)
+
+        autonmap.tool_inventory_cache.clear()
+        autonmap.build_tool_inventory = fake_builder
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(load_inventory, range(8)))
+        finally:
+            autonmap.build_tool_inventory = original_builder
+            autonmap.tool_inventory_cache.clear()
+            autonmap.tool_inventory_cache.update(original_cache)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(results, [{"expand": False}] * 8)
+
+
+class ReadinessRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_health_returns_service_unavailable_without_nmap(self):
+        original_check = autonmap._check_nmap_available
+        autonmap._check_nmap_available = lambda: False
+        try:
+            response = await autonmap.app.test_client().get("/health")
+            payload = await response.get_json()
+        finally:
+            autonmap._check_nmap_available = original_check
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["status"], "unhealthy")
+        self.assertFalse(payload["nmap_available"])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -9,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -187,6 +189,7 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BODY_BYTES
 scan_tasks = {}
 rate_limits = defaultdict(list)
 tool_inventory_cache = {}
+tool_inventory_locks = defaultdict(threading.Lock)
 _scan_semaphore: Optional[asyncio.Semaphore] = None
 
 SUPPORTED_SCAN_TYPES = {
@@ -266,28 +269,33 @@ def _validate_scan_payload(
     if interval is not None:
         if isinstance(interval, bool) or not isinstance(interval, (int, float)):
             return target, scan_type, None, "Интервал должен быть числом"
-        if interval <= 0:
+        try:
+            interval_value = float(interval)
+        except (OverflowError, ValueError):
+            return target, scan_type, None, "Интервал должен быть конечным числом"
+        if not math.isfinite(interval_value):
+            return target, scan_type, None, "Интервал должен быть конечным числом"
+        if interval_value <= 0:
             return target, scan_type, None, "Интервал должен быть положительным числом"
-        if interval < MIN_SCHEDULE_INTERVAL_MINUTES:
+        if interval_value < MIN_SCHEDULE_INTERVAL_MINUTES:
             return (
                 target,
                 scan_type,
                 None,
                 f"Интервал должен быть не меньше {MIN_SCHEDULE_INTERVAL_MINUTES} мин.",
             )
-        if interval > MAX_SCHEDULE_INTERVAL_MINUTES:
+        if interval_value > MAX_SCHEDULE_INTERVAL_MINUTES:
             return (
                 target,
                 scan_type,
                 None,
                 f"Интервал должен быть не больше {MAX_SCHEDULE_INTERVAL_MINUTES} мин.",
             )
-        interval_value = float(interval)
 
     if not validate_ip_or_host(target):
         return target, scan_type, interval_value, "Неверный IP, CIDR или домен"
 
-    return target, scan_type, interval_value, None
+    return _canonicalize_valid_target(target), scan_type, interval_value, None
 
 
 def require_api_auth():
@@ -368,18 +376,22 @@ def _bool_query_param(name: str, default: bool = False) -> bool:
 
 def get_cached_tool_inventory(expand: bool = False) -> Dict:
     cache_key = "expanded" if expand else "summary"
-    cached = tool_inventory_cache.get(cache_key)
-    now = time.time()
-    if (
-        cached
-        and TOOL_INVENTORY_CACHE_SECONDS > 0
-        and now - cached["created_at"] < TOOL_INVENTORY_CACHE_SECONDS
-    ):
-        return cached["inventory"]
+    with tool_inventory_locks[cache_key]:
+        cached = tool_inventory_cache.get(cache_key)
+        now = time.time()
+        if (
+            cached
+            and TOOL_INVENTORY_CACHE_SECONDS > 0
+            and now - cached["created_at"] < TOOL_INVENTORY_CACHE_SECONDS
+        ):
+            return cached["inventory"]
 
-    inventory = build_tool_inventory(expand=expand)
-    tool_inventory_cache[cache_key] = {"created_at": now, "inventory": inventory}
-    return inventory
+        inventory = build_tool_inventory(expand=expand)
+        tool_inventory_cache[cache_key] = {
+            "created_at": time.time(),
+            "inventory": inventory,
+        }
+        return inventory
 
 
 async def send_telegram_message(message: str):
@@ -419,6 +431,17 @@ def validate_ip_or_host(target: str) -> bool:
         return True
     except ValueError:
         return auth_domain_re.fullmatch(target) is not None
+
+
+def _canonicalize_valid_target(target: str) -> str:
+    """Return a stable task/scan target after validation has succeeded."""
+    try:
+        return str(ipaddress.ip_address(target))
+    except ValueError:
+        try:
+            return str(ipaddress.ip_network(target, strict=False))
+        except ValueError:
+            return target.lower()
 
 
 def build_scan_args(scan_type: str) -> str:
@@ -794,22 +817,25 @@ async def health_check():
     nmap_available = _check_nmap_available()
     status = "healthy" if nmap_available else "unhealthy"
 
-    return jsonify(
-        {
-            "status": status,
-            "version": VERSION,
-            "tasks_count": len(scan_tasks),
-            "telegram_configured": bot is not None,
-            "uptime": str(datetime.now() - start_time),
-            "fernet_key_configured": bool(FERNET_KEY),
-            "nmap_available": nmap_available,
-            "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
-            "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
-            "max_concurrent_scans": MAX_CONCURRENT_SCANS,
-            "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
-            "max_target_addresses": MAX_TARGET_ADDRESSES,
-        }
-    ), 200
+    return (
+        jsonify(
+            {
+                "status": status,
+                "version": VERSION,
+                "tasks_count": len(scan_tasks),
+                "telegram_configured": bot is not None,
+                "uptime": str(datetime.now() - start_time),
+                "fernet_key_configured": bool(FERNET_KEY),
+                "nmap_available": nmap_available,
+                "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
+                "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+                "max_concurrent_scans": MAX_CONCURRENT_SCANS,
+                "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
+                "max_target_addresses": MAX_TARGET_ADDRESSES,
+            }
+        ),
+        200 if nmap_available else 503,
+    )
 
 
 @app.route("/api/docs", methods=["GET"])

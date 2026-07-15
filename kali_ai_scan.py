@@ -9,10 +9,12 @@ authorized assessment. XML parsing uses defusedxml for untrusted input safety.
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from defusedxml import ElementTree as ET
@@ -27,6 +29,9 @@ SCAN_PROFILES = {
     "safe": ["-sV", "--script", "safe"],
 }
 TARGET_RE = re.compile(r"^[A-Za-z0-9_.:/,*?\[\]-]+$")
+NMAP_DURATION_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?:ms|s|m|h)?$")
+PRIVATE_DIRECTORY_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
 
 
 def utc_now() -> str:
@@ -182,45 +187,84 @@ def parse_nmap_xml(xml_path: Path) -> dict:
     }
 
 
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIRECTORY_MODE)
+    path.chmod(PRIVATE_DIRECTORY_MODE)
+
+
+def _write_private_bytes(path: Path, data: bytes) -> None:
+    _ensure_private_directory(path.parent)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(file_descriptor, PRIVATE_FILE_MODE)
+        with os.fdopen(file_descriptor, "wb") as handle:
+            handle.write(data)
+        os.replace(temporary_path, path)
+        path.chmod(PRIVATE_FILE_MODE)
+    except Exception:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    _write_private_bytes(path, content.encode("utf-8"))
+
+
+def _prepare_private_output(path: Path) -> None:
+    _ensure_private_directory(path.parent)
+    file_descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    try:
+        os.fchmod(file_descriptor, PRIVATE_FILE_MODE)
+    finally:
+        os.close(file_descriptor)
+
+
 def write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_private_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def write_observations(path: Path, report: dict) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for host in report["hosts"]:
-            handle.write(
+    lines = []
+    for host in report["hosts"]:
+        lines.append(
+            json.dumps(
+                {
+                    "schema": SCHEMA_VERSION,
+                    "type": "host",
+                    "host": host["id"],
+                    "status": host["status"],
+                    "addresses": host["addresses"],
+                    "hostnames": host["hostnames"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        for port in host["ports"]:
+            service_name = port["service"].get("name") or "unknown"
+            lines.append(
                 json.dumps(
                     {
                         "schema": SCHEMA_VERSION,
-                        "type": "host",
+                        "type": "service",
                         "host": host["id"],
-                        "status": host["status"],
-                        "addresses": host["addresses"],
-                        "hostnames": host["hostnames"],
+                        "port": port["port"],
+                        "protocol": port["protocol"],
+                        "state": port["state"],
+                        "service": port["service"],
+                        "llm_hint": f"{host['id']} has {port['protocol']}/{port['port']} {port['state']} ({service_name})",
                     },
                     ensure_ascii=False,
                 )
-                + "\n"
             )
-            for port in host["ports"]:
-                service_name = port["service"].get("name") or "unknown"
-                handle.write(
-                    json.dumps(
-                        {
-                            "schema": SCHEMA_VERSION,
-                            "type": "service",
-                            "host": host["id"],
-                            "port": port["port"],
-                            "protocol": port["protocol"],
-                            "state": port["state"],
-                            "service": port["service"],
-                            "llm_hint": f"{host['id']} has {port['protocol']}/{port['port']} {port['state']} ({service_name})",
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+    _write_private_text(path, "\n".join(lines) + ("\n" if lines else ""))
 
 
 def write_markdown(path: Path, report: dict) -> None:
@@ -256,16 +300,18 @@ def write_markdown(path: Path, report: dict) -> None:
             lines.append(f"- `{port['protocol']}/{port['port']}` {label}{suffix}")
         lines.append("")
 
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    _write_private_text(path, "\n".join(lines).rstrip() + "\n")
 
 
 def create_artifacts(xml_path: Path, out_dir: Path, manifest_extra: dict = None) -> dict:
     report = parse_nmap_xml(xml_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(out_dir)
 
     xml_copy = out_dir / "nmap.xml"
     if xml_path.resolve() != xml_copy.resolve():
-        xml_copy.write_bytes(xml_path.read_bytes())
+        _write_private_bytes(xml_copy, xml_path.read_bytes())
+    else:
+        xml_copy.chmod(PRIVATE_FILE_MODE)
 
     hosts_path = out_dir / "hosts.json"
     observations_path = out_dir / "observations.jsonl"
@@ -314,10 +360,12 @@ def run_scan(args: argparse.Namespace) -> int:
     reject_suspicious_target(args.target)
     scan_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out) / f"{scan_id}_{re.sub(r'[^A-Za-z0-9_.-]+', '_', args.target)[:80]}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(out_dir)
 
     xml_path = out_dir / "nmap.xml"
     normal_path = out_dir / "nmap.txt"
+    _prepare_private_output(xml_path)
+    _prepare_private_output(normal_path)
     command = [
         nmap_executable,
         *SCAN_PROFILES[args.profile],
@@ -387,6 +435,29 @@ def check_deps(_: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _positive_nmap_duration(value: str) -> str:
+    match = NMAP_DURATION_RE.fullmatch(value.strip().lower())
+    if match is None or float(match.group("value")) <= 0:
+        raise argparse.ArgumentTypeError(
+            "must be a positive Nmap duration such as 500ms, 30s, 5m, or 1h"
+        )
+    return value.strip().lower()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run or parse Nmap into AI-readable artifacts.")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -397,11 +468,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--ports", help="Optional Nmap port expression, e.g. 22,80,443 or 1-1000"
     )
-    run_parser.add_argument("--host-timeout", default="300s")
-    run_parser.add_argument("--max-retries", type=int, default=2)
+    run_parser.add_argument("--host-timeout", type=_positive_nmap_duration, default="300s")
+    run_parser.add_argument("--max-retries", type=_non_negative_int, default=2)
     run_parser.add_argument(
         "--scan-timeout",
-        type=int,
+        type=_positive_int,
         default=1800,
         help="Maximum total Nmap runtime in seconds (default: 1800)",
     )

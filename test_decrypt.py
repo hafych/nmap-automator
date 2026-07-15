@@ -50,3 +50,30 @@ class DecryptTests(unittest.TestCase):
             sys.argv = original_argv
             if original_key is not None:
                 os.environ["FERNET_KEY"] = original_key
+
+    def test_cli_reports_wrong_key_without_traceback(self):
+        correct_key = Fernet.generate_key()
+        wrong_key = Fernet.generate_key()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            encrypted_path = Path(tmp) / "scan.enc"
+            encrypted_path.write_bytes(Fernet(correct_key).encrypt(b"{}"))
+
+            original_argv = sys.argv
+            original_key = os.environ.get("FERNET_KEY")
+            sys.argv = ["decrypt.py", str(encrypted_path)]
+            os.environ["FERNET_KEY"] = wrong_key.decode()
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    exit_code = decrypt.cli()
+            finally:
+                sys.argv = original_argv
+                if original_key is None:
+                    os.environ.pop("FERNET_KEY", None)
+                else:
+                    os.environ["FERNET_KEY"] = original_key
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("wrong FERNET_KEY", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
