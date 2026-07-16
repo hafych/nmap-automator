@@ -229,13 +229,16 @@ This is not a multi-tenant authorization system. See [SECURITY.md](SECURITY.md).
 | --- | ---: | --- |
 | `FERNET_KEY` | required | Key used to encrypt stored results |
 | `API_AUTH_TOKEN` | required* | Primary token expected in the API authentication header |
-| `API_AUTH_TOKENS` | empty | Optional extra tokens (comma list or JSON array) |
+| `API_AUTH_TOKENS` | empty | Optional extra tokens (comma list or JSON array); full admin access |
+| `API_AUTH_KEYS` | empty | Optional named keys JSON: `id`, `label`, `token`, `scopes`, `created_at`, `revoked` |
 | `API_AUTH_REQUIRED` | `true` | Disable only for isolated local development |
 | `API_AUTH_HEADER` | `X-API-KEY` | Header carrying the API token |
 
-\* At least one of `API_AUTH_TOKEN` / `API_AUTH_TOKENS` is required when auth is enabled.
+\* At least one of `API_AUTH_TOKEN` / `API_AUTH_TOKENS` / `API_AUTH_KEYS` is required when auth is enabled.
 Multiple tokens are isolated by ownership: jobs, scheduled tasks, and new encrypted
-results are tagged with a hash of the presenting token.
+results are tagged with a hash of the presenting token. Named keys support least-privilege
+scopes: `read` (history/tools/plan), `scan` (create/cancel; includes read), `admin` (all).
+Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing the secret.
 
 | `APP_HOST` | `127.0.0.1` | Bind address |
 | `APP_PORT` | `5000` | Listen port |

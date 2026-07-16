@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.7.2  
+**Текущая версия кода:** 1.8.0  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -149,9 +149,9 @@
 
 | ID | Задача | Детали | Effort |
 | --- | --- | --- | ---: |
-| P1-05 | Named API keys (id, label, created_at, revoked) | не только raw token list | M |
-| P1-06 | Key scopes: `scan`, `read`, `admin` | least privilege | M |
-| P1-07 | UI: выбор/ротация ключа, label | operator UX | S |
+| P1-05 | ~~Named API keys (id, label, created_at, revoked)~~ | `API_AUTH_KEYS` + `/auth/whoami` | M |
+| P1-06 | ~~Key scopes: `scan`, `read`, `admin`~~ | hierarchy admin > scan > read | M |
+| P1-07 | ~~UI: выбор/ротация ключа, label~~ | dashboard shows key label + scopes via whoami | S |
 | P1-08 | ~~Hide legacy unowned results from multi-token deploys~~ | `LEGACY_RESULTS_SHARED` (default true; set false multi-token) | S |
 | P1-09 | Optional user accounts (later) | password/OIDC — только если нужен team UI | XL |
 
@@ -405,6 +405,7 @@
 | 2026-07-16 | — | Этот план зафиксирован в `IMPROVEMENT_PLAN.md` |
 | 2026-07-16 | 1.7.1 | Release D code: `LEGACY_RESULTS_SHARED`, coverage ≥75%, fail_under 75, migration notes |
 | 2026-07-16 | 1.7.2 | P1-04 target allowlist (`TARGET_ALLOWLIST` / file), health flags |
+| 2026-07-16 | 1.8.0 | P1-05/06/07 named API keys, scopes, whoami + dashboard key meta |
 
 ---
 

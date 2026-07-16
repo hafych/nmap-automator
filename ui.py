@@ -344,6 +344,7 @@ UI_HTML = r"""<!doctype html>
           <label>API token
             <input id="apiToken" type="password" autocomplete="off" placeholder="X-API-KEY">
           </label>
+          <p class="hint" id="keyMeta" aria-live="polite">Key: not identified</p>
           <label>Target
             <input id="target" value="127.0.0.1" spellcheck="false">
           </label>
@@ -729,6 +730,25 @@ UI_HTML = r"""<!doctype html>
       }
     }
 
+    async function refreshKeyMeta() {
+      const meta = $("keyMeta");
+      if (!meta) return;
+      if (!tokenInput.value.trim()) {
+        meta.textContent = "Key: not identified";
+        return;
+      }
+      try {
+        const me = await api("/auth/whoami");
+        const label = me.label || me.key_id || "key";
+        const scopes = Array.isArray(me.scopes) ? me.scopes.join(", ") : "";
+        meta.textContent = scopes
+          ? `Key: ${label} (${scopes})`
+          : `Key: ${label}`;
+      } catch (_error) {
+        meta.textContent = "Key: invalid or insufficient";
+      }
+    }
+
     async function refresh({ announce = true } = {}) {
       try {
         const docs = await api("/api/docs");
@@ -738,6 +758,7 @@ UI_HTML = r"""<!doctype html>
         $("apiStatus").textContent = health.status || "online";
         $("nmapStatus").textContent = health.nmap_available ? "ready" : "missing";
         $("jobCount").textContent = health.jobs_count || 0;
+        await refreshKeyMeta();
         const tasks = await api("/tasks");
         $("taskCount").textContent = tasks.length;
         $("runningCount").textContent = tasks.filter((task) => task.running).length;
@@ -748,6 +769,8 @@ UI_HTML = r"""<!doctype html>
         if (announce) say("Dashboard refreshed.");
       } catch (error) {
         $("apiStatus").textContent = "auth needed";
+        const meta = $("keyMeta");
+        if (meta) meta.textContent = "Key: not identified";
         say(error.message, true);
       }
     }
