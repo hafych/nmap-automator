@@ -5,6 +5,27 @@
 Security fixes are applied to the current `main` branch. Use the latest release or commit and
 keep Python, Nmap, the container base image, and Python dependencies updated.
 
+## Threat model (essentials)
+
+Recon Operator is a **self-hosted authorized recon control plane**, not a multi-tenant SaaS
+scanner and not an exploit framework.
+
+| Asset | Threat | Control |
+| --- | --- | --- |
+| API keys | theft, over-scope use | `API_AUTH_*`, scopes (`read`/`scan`/`admin`), audit events, revoke flags |
+| Scan capability | scanning beyond engagement | `TARGET_ALLOWLIST`, target size bounds, auth + rate limits, job leases |
+| Encrypted results | key loss / unauthorized read | Fernet primary + `FERNET_PREVIOUS_KEYS`, owner-prefixed files, `LEGACY_RESULTS_SHARED` |
+| AI packs | exfil of secrets into LLM chat | packs never include tokens/keys; default `budget=s` hard size caps; prefer `/ai/pack` over full `/results` |
+| Metrics (`/metrics`) | internal state recon if exposed | **loopback-first deploy**; optional `METRICS_AUTH_REQUIRED=true` (read scope) |
+| Planner commands | blind execution | review-only suggestions (`ready`/`missing`); no auto-exec |
+
+### Metrics exposure policy
+
+- **Default:** `GET /metrics` is unauthenticated Prometheus text for local scrapers.
+- **Deploy rule:** bind `APP_HOST=127.0.0.1` (default) or firewall the port so scrapers are local only.
+- **Hardening:** set `METRICS_AUTH_REQUIRED=true` when the metrics port may be reachable beyond loopback.
+- Health still reports `metrics_path` and `metrics_auth_required` without secrets.
+
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately through the repository's GitHub Security Advisories

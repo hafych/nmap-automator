@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "1.9.6"
+VERSION = "1.10.0"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -29,6 +29,10 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+# When true, GET /metrics requires a valid API key with read scope (safer non-loopback).
+METRICS_AUTH_REQUIRED = _parse_bool_env("METRICS_AUTH_REQUIRED", False)
 
 
 def _parse_int_env(

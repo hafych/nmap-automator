@@ -207,7 +207,8 @@ curl http://127.0.0.1:5000/openapi.json
 | `GET` | `/tasks` | List scheduled tasks |
 | `DELETE` | `/tasks/<id>` | Cancel a scheduled task |
 | `GET` | `/metrics` | Prometheus text metrics (jobs, scans, durations; no auth) |
-| `GET`/`POST` | `/ai/pack` | Budgeted AI recon pack (default `budget=s` NDJSON; see AI_HANDOFF) |
+| `GET`/`POST` | `/ai/pack` | Budgeted AI recon pack (default `budget=s` NDJSON; retest via `mode=retest`) |
+| `GET` | `/presets` | Named recon engagement presets / phases |
 | `GET` | `/audit` | Recent audit events (admin; no secrets) |
 | `GET` | `/results` | List encrypted result files |
 | `GET` | `/results/<id>` | Decrypt and return a stored result |
