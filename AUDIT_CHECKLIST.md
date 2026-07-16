@@ -173,6 +173,7 @@ Missing tools не устанавливались автоматически: э
 - [x] ~~SQLite persistence for jobs/schedules (single-node).~~ Redis multi-worker still open.
 - [x] ~~Multi API tokens (`API_AUTH_TOKENS`) + per-token ownership of jobs/tasks/new results.~~
 - [x] ~~`LEGACY_RESULTS_SHARED` flag to hide pre-ownership result files (default true).~~
+- [x] ~~Target allowlist / engagement scopes (`TARGET_ALLOWLIST`, `TARGET_ALLOWLIST_FILE`).~~
 - [ ] Full multi-tenant RBAC / UI accounts (token isolation only today).
 - [ ] Redis multi-worker rate limits / leases.
 - [x] ~~Поднять `autonmap.py` coverage до ≥75% (~82%; overall ~78%; fail_under 75).~~

@@ -243,6 +243,8 @@ results are tagged with a hash of the presenting token.
 | `NMAP_HOST_TIMEOUT_SEC` | `300` | Nmap per-host timeout |
 | `NMAP_MAX_RETRIES` | `2` | Nmap probe retries |
 | `MAX_TARGET_ADDRESSES` | `4096` | Largest accepted CIDR range |
+| `TARGET_ALLOWLIST` | empty | Optional engagement scope: IPs, CIDRs, hostnames, `*.domain` (comma or JSON) |
+| `TARGET_ALLOWLIST_FILE` | empty | Optional file of allowlist entries (`#` comments allowed); empty = unrestricted |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum JSON request body size |
 | `MAX_IMPORT_XML_BYTES` | `67108864` | Maximum imported Nmap XML size |
 | `MAX_REQUESTS_PER_WINDOW` | `10` | Per-client costly-request limit |

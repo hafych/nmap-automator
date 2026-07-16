@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.7.1  
+**Текущая версия кода:** 1.7.2  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -143,7 +143,7 @@
 | P1-01 | Redis (или shared store) для rate limits | process-local buckets → shared | M |
 | P1-02 | Job queue multi-worker | lease/lock: только один worker крутит job | L |
 | P1-03 | Schedule durability under multi-instance | leader election или external cron + claim | L |
-| P1-04 | Explicit target allowlist / engagement scopes | env/file: permitted CIDRs/hosts | M |
+| P1-04 | ~~Explicit target allowlist / engagement scopes~~ | `TARGET_ALLOWLIST` + `TARGET_ALLOWLIST_FILE` | M |
 
 #### B. Identity & tenancy
 
@@ -403,6 +403,7 @@
 | 2026-07-15 | 1.7.0 | ownership, docker digest, ai_reports retention |
 | 2026-07-16 | — | Этот план зафиксирован в `IMPROVEMENT_PLAN.md` |
 | 2026-07-16 | 1.7.1 | Release D code: `LEGACY_RESULTS_SHARED`, coverage ≥75%, fail_under 75, migration notes |
+| 2026-07-16 | 1.7.2 | P1-04 target allowlist (`TARGET_ALLOWLIST` / file), health flags |
 
 ---
 
