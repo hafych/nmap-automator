@@ -434,15 +434,17 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("scan took too long", payload["error"])
 
     async def test_schedule_rejects_tasks_above_configured_limit(self):
-        class PendingTask:
-            @staticmethod
-            def done():
-                return False
-
         original_limit = autonmap.MAX_SCHEDULED_TASKS
         autonmap.MAX_SCHEDULED_TASKS = 1
-        autonmap.scan_tasks["existing-TCP"] = PendingTask()
         try:
+            autonmap.state_store.upsert_scheduled_task(
+                "oexisting00001-127.0.0.1-Ping",
+                "127.0.0.1",
+                "Ping",
+                30,
+                owner_id="local",
+                created_at="t0",
+            )
             response = await self.client.post(
                 "/schedule",
                 headers={"X-API-KEY": "test-token"},
@@ -451,6 +453,10 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             payload = await response.get_json()
         finally:
             autonmap.MAX_SCHEDULED_TASKS = original_limit
+            try:
+                autonmap.state_store.delete_scheduled_task("oexisting00001-127.0.0.1-Ping")
+            except Exception:
+                pass
             autonmap.scan_tasks.clear()
 
         self.assertEqual(response.status_code, 429)
@@ -648,6 +654,7 @@ class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         autonmap.scan_jobs.clear()
         autonmap.rate_limits.clear()
+        self._leader = autonmap._is_scheduler_leader
 
     async def asyncTearDown(self):
         for job in list(autonmap.scan_jobs.values()):
@@ -656,6 +663,39 @@ class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
         autonmap.scan_jobs.clear()
         autonmap.rate_limits.clear()
+        autonmap._is_scheduler_leader = self._leader
+
+    async def test_scheduler_leader_sync_and_stop(self):
+        async def noop_periodic(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        original_periodic = autonmap.periodic_scan
+        original_list = autonmap.state_store.list_scheduled_tasks
+        autonmap.periodic_scan = noop_periodic
+        autonmap.state_store.list_scheduled_tasks = lambda owner_id=None: [
+            {
+                "task_id": "oleaderlocal-127.0.0.1-Ping",
+                "target": "127.0.0.1",
+                "scan_type": "Ping",
+                "interval_minutes": 15,
+                "ports": None,
+                "scripts": None,
+                "discovery": None,
+                "owner_id": "local",
+            }
+        ]
+        try:
+            autonmap._is_scheduler_leader = True
+            await autonmap.sync_scheduled_tasks_from_store()
+            self.assertIn("oleaderlocal-127.0.0.1-Ping", autonmap.scan_tasks)
+            await autonmap.stop_all_local_schedules()
+            self.assertEqual(autonmap.scan_tasks, {})
+        finally:
+            autonmap.periodic_scan = original_periodic
+            autonmap.state_store.list_scheduled_tasks = original_list
+            for task in list(autonmap.scan_tasks.values()):
+                task.cancel()
+            autonmap.scan_tasks.clear()
 
     async def test_run_scan_job_skips_when_claim_fails(self):
         autonmap.scan_jobs["j-skip"] = {
@@ -1082,6 +1122,12 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         original = autonmap.periodic_scan
         autonmap.periodic_scan = noop_periodic
+        # Shared test DB may retain schedules from earlier cases.
+        for row in list(autonmap.state_store.list_scheduled_tasks()):
+            try:
+                autonmap.state_store.delete_scheduled_task(row["task_id"])
+            except Exception:
+                pass
         try:
             create = await self.client.post(
                 "/schedule",
@@ -1089,7 +1135,7 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
                 json={"target": "127.0.0.1", "scan_type": "Ping", "interval": 30},
             )
             created = await create.get_json()
-            self.assertEqual(create.status_code, 200)
+            self.assertEqual(create.status_code, 200, created)
             task_id = created["task_id"]
             self.assertTrue(task_id.startswith("o"))
 
@@ -1106,6 +1152,11 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
             for task in list(autonmap.scan_tasks.values()):
                 task.cancel()
             autonmap.scan_tasks.clear()
+            for row in list(autonmap.state_store.list_scheduled_tasks()):
+                try:
+                    autonmap.state_store.delete_scheduled_task(row["task_id"])
+                except Exception:
+                    pass
 
     def test_result_visibility_by_owner_prefix(self):
         owner_a = autonmap.owner_id_from_token("token-a-aaaaaaaa")
@@ -1425,9 +1476,9 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "job_id": "fail-job",
                 "target": "127.0.0.1",
                 "scan_type": "Ping",
-                "status": "queued",
+                "status": "running",
                 "created_at": "t0",
-                "started_at": None,
+                "started_at": "t1",
                 "finished_at": None,
                 "error": None,
                 "result": None,
@@ -1441,7 +1492,8 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("engine failed")
 
             autonmap.scan_network = boom
-            await autonmap._run_scan_job("fail-job")
+            # already_claimed bypasses SQLite claim (unit path without prior persist).
+            await autonmap._run_scan_job("fail-job", already_claimed=True)
             self.assertEqual(autonmap.scan_jobs["fail-job"]["status"], "failed")
             self.assertIn("engine failed", autonmap.scan_jobs["fail-job"]["error"])
 
@@ -1449,9 +1501,9 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "job_id": "timeout-job",
                 "target": "127.0.0.1",
                 "scan_type": "Ping",
-                "status": "queued",
+                "status": "running",
                 "created_at": "t0",
-                "started_at": None,
+                "started_at": "t1",
                 "finished_at": None,
                 "error": None,
                 "result": None,
@@ -1465,7 +1517,7 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 raise TimeoutError("took too long")
 
             autonmap.scan_network = timeout
-            await autonmap._run_scan_job("timeout-job")
+            await autonmap._run_scan_job("timeout-job", already_claimed=True)
             self.assertEqual(autonmap.scan_jobs["timeout-job"]["status"], "timeout")
         finally:
             autonmap.scan_network = original_scan
@@ -1598,13 +1650,19 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         original = autonmap.periodic_scan
         autonmap.periodic_scan = noop_periodic
+        for row in list(autonmap.state_store.list_scheduled_tasks()):
+            try:
+                autonmap.state_store.delete_scheduled_task(row["task_id"])
+            except Exception:
+                pass
         try:
             first = await self.client.post(
                 "/schedule",
                 headers=self.headers,
                 json={"target": "127.0.0.1", "scan_type": "Ping", "interval": 30},
             )
-            self.assertEqual(first.status_code, 200)
+            first_payload = await first.get_json()
+            self.assertEqual(first.status_code, 200, first_payload)
             second = await self.client.post(
                 "/schedule",
                 headers=self.headers,
@@ -1627,6 +1685,14 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(unauth.status_code, 401)
         finally:
             autonmap.periodic_scan = original
+            for row in list(autonmap.state_store.list_scheduled_tasks()):
+                try:
+                    autonmap.state_store.delete_scheduled_task(row["task_id"])
+                except Exception:
+                    pass
+            for task in list(autonmap.scan_tasks.values()):
+                task.cancel()
+            autonmap.scan_tasks.clear()
 
     async def test_tasks_hide_other_owner_and_cancel_missing(self):
         class Pending:
@@ -1929,7 +1995,10 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             await autonmap.load_initial_tasks()
-            self.assertTrue(any("Ping" in task_id for task_id in autonmap.scan_tasks))
+            registered = {row["task_id"] for row in autonmap.state_store.list_scheduled_tasks()}
+            self.assertTrue(any("Ping" in task_id for task_id in registered))
+            # Schedules are durable-only until a leader syncs them into memory.
+            self.assertFalse(any("Ping" in task_id for task_id in autonmap.scan_tasks))
 
             def fake_list_tasks():
                 return [
@@ -1947,14 +2016,19 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
 
             original_list = autonmap.state_store.list_scheduled_tasks
             original_jobs = autonmap.state_store.list_jobs
+            original_leader = autonmap._is_scheduler_leader
             autonmap.state_store.list_scheduled_tasks = fake_list_tasks
             autonmap.state_store.list_jobs = lambda limit=200: []
             try:
                 await autonmap.load_persisted_state()
+                self.assertNotIn("orestoredlocal-127.0.0.1-TCP", autonmap.scan_tasks)
+                autonmap._is_scheduler_leader = True
+                await autonmap.sync_scheduled_tasks_from_store()
                 self.assertIn("orestoredlocal-127.0.0.1-TCP", autonmap.scan_tasks)
             finally:
                 autonmap.state_store.list_scheduled_tasks = original_list
                 autonmap.state_store.list_jobs = original_jobs
+                autonmap._is_scheduler_leader = original_leader
         finally:
             autonmap.periodic_scan = original_periodic
             if original_env is None:
@@ -2044,13 +2118,16 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("first fail")
             raise asyncio.CancelledError()
 
+        original_leader = autonmap._is_scheduler_leader
         autonmap.async_scan = flaky
         autonmap.send_telegram_message = ignore_message
+        autonmap._is_scheduler_leader = True
         try:
             await autonmap.periodic_scan("127.0.0.1", "Ping", 0.0001, owner_id="local")
         finally:
             autonmap.async_scan = original_async
             autonmap.send_telegram_message = original_sender
+            autonmap._is_scheduler_leader = original_leader
         self.assertGreaterEqual(calls["n"], 1)
 
         with self.assertRaises(ValueError):

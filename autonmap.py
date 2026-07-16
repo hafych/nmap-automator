@@ -63,7 +63,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -341,7 +341,19 @@ REDIS_JOB_LEASE_PREFIX = (
     os.getenv("REDIS_JOB_LEASE_PREFIX", "recon_operator:job_lease:").strip()
     or "recon_operator:job_lease:"
 )
+SCHEDULER_LOCK_NAME = "scheduler"
+SCHEDULER_LEADER_SECONDS = _parse_int_env(
+    "SCHEDULER_LEADER_SECONDS", default=30, min_value=10, max_value=600
+)
+SCHEDULER_LEADER_POLL_SECONDS = _parse_int_env(
+    "SCHEDULER_LEADER_POLL_SECONDS", default=5, min_value=1, max_value=60
+)
+REDIS_LEADER_PREFIX = (
+    os.getenv("REDIS_LEADER_PREFIX", "recon_operator:leader:").strip() or "recon_operator:leader:"
+)
 _job_worker_task: Optional[asyncio.Task] = None
+_scheduler_leader_task: Optional[asyncio.Task] = None
+_is_scheduler_leader = False
 MAX_CONCURRENT_SCANS = _parse_int_env("MAX_CONCURRENT_SCANS", default=2, min_value=1, max_value=20)
 MAX_SCHEDULED_TASKS = _parse_int_env(
     "MAX_SCHEDULED_TASKS", default=100, min_value=1, max_value=10_000
@@ -1794,6 +1806,142 @@ async def cancel_job(job_id: str):
     return jsonify({"message": f"Job {job_id} cancelled", "job_id": job_id}), 200
 
 
+def _try_redis_leadership(lock_name: str, *, renew: bool = False) -> bool:
+    client = _get_redis_client()
+    if client is None:
+        return True
+    key = f"{REDIS_LEADER_PREFIX}{lock_name}"
+    try:
+        if renew:
+            current = client.get(key)
+            if current not in (None, WORKER_ID):
+                return False
+            client.set(key, WORKER_ID, ex=SCHEDULER_LEADER_SECONDS)
+            return True
+        ok = client.set(key, WORKER_ID, nx=True, ex=SCHEDULER_LEADER_SECONDS)
+        if ok:
+            return True
+        return client.get(key) == WORKER_ID
+    except Exception as exc:
+        log_event(f"Redis leadership error for {lock_name}: {exc}")
+        return True
+
+
+def _release_redis_leadership(lock_name: str) -> None:
+    client = _get_redis_client()
+    if client is None:
+        return
+    key = f"{REDIS_LEADER_PREFIX}{lock_name}"
+    try:
+        if client.get(key) == WORKER_ID:
+            client.delete(key)
+    except Exception as exc:
+        log_event(f"Redis leadership release error for {lock_name}: {exc}")
+
+
+def try_become_scheduler_leader() -> bool:
+    """Acquire or renew the scheduler leadership lease."""
+    if not _try_redis_leadership(SCHEDULER_LOCK_NAME, renew=_is_scheduler_leader):
+        return False
+    acquired = state_store.try_acquire_leadership(
+        SCHEDULER_LOCK_NAME,
+        WORKER_ID,
+        now=time.time(),
+        lease_seconds=SCHEDULER_LEADER_SECONDS,
+    )
+    if not acquired:
+        _release_redis_leadership(SCHEDULER_LOCK_NAME)
+    return acquired
+
+
+def is_scheduler_leader() -> bool:
+    return _is_scheduler_leader
+
+
+def _start_local_scheduled_task(row: Dict[str, Any]) -> bool:
+    """Start a local periodic_scan for a DB row if not already running."""
+    task_id = row["task_id"]
+    if task_id in scan_tasks and not scan_tasks[task_id].done():
+        return False
+    if len(scan_tasks) >= MAX_SCHEDULED_TASKS:
+        return False
+    task = asyncio.create_task(
+        periodic_scan(
+            row["target"],
+            row["scan_type"],
+            float(row["interval_minutes"]),
+            ports=row.get("ports"),
+            scripts=row.get("scripts"),
+            discovery=row.get("discovery"),
+            owner_id=row.get("owner_id") or "local",
+        )
+    )
+    scan_tasks[task_id] = task
+    return True
+
+
+async def stop_all_local_schedules() -> None:
+    """Cancel every local periodic task (used when leadership is lost)."""
+    tasks = list(scan_tasks.items())
+    for _task_id, task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+    scan_tasks.clear()
+    log_event("Stopped local scheduled tasks after leadership loss")
+
+
+async def sync_scheduled_tasks_from_store() -> None:
+    """Ensure leader local loops match durable schedule rows."""
+    if not _is_scheduler_leader:
+        return
+    try:
+        rows = await asyncio.to_thread(state_store.list_scheduled_tasks)
+    except Exception as exc:
+        log_event(f"Failed to list scheduled tasks for sync: {exc}")
+        return
+    desired = {row["task_id"] for row in rows}
+    # Stop local tasks removed from DB.
+    for task_id in list(scan_tasks.keys()):
+        if task_id not in desired:
+            scan_tasks[task_id].cancel()
+            del scan_tasks[task_id]
+    for row in rows:
+        if _start_local_scheduled_task(row):
+            log_event(
+                f"Scheduler leader started task {row['task_id']} "
+                f"every {row['interval_minutes']} minutes"
+            )
+
+
+async def scheduler_leader_loop(stop_event: Optional[asyncio.Event] = None) -> None:
+    """Elect a single scheduler leader so recurring scans do not duplicate."""
+    global _is_scheduler_leader
+    log_event(
+        f"Scheduler leader loop started (worker={WORKER_ID}, lease={SCHEDULER_LEADER_SECONDS}s)"
+    )
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            acquired = await asyncio.to_thread(try_become_scheduler_leader)
+            if acquired:
+                if not _is_scheduler_leader:
+                    _is_scheduler_leader = True
+                    log_event(f"Became scheduler leader ({WORKER_ID})")
+                await sync_scheduled_tasks_from_store()
+            else:
+                if _is_scheduler_leader:
+                    _is_scheduler_leader = False
+                    log_event(f"Lost scheduler leadership ({WORKER_ID})")
+                    await stop_all_local_schedules()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(f"Scheduler leader loop error: {exc}")
+        await asyncio.sleep(SCHEDULER_LEADER_POLL_SECONDS)
+
+
 async def periodic_scan(
     target: str,
     scan_type: str,
@@ -1803,7 +1951,7 @@ async def periodic_scan(
     discovery: Optional[str] = None,
     owner_id: Optional[str] = None,
 ):
-    """Async recurring scan loop."""
+    """Async recurring scan loop (leader only)."""
     try:
         interval = float(interval_minutes)
     except (TypeError, ValueError):
@@ -1819,6 +1967,9 @@ async def periodic_scan(
     )
 
     while True:
+        if not _is_scheduler_leader:
+            log_event(f"Periodic scan {target} stopping (not scheduler leader)")
+            break
         _cleanup_finished_tasks()
         try:
             log_event(f"Running periodic scan: {target}")
@@ -1865,23 +2016,17 @@ async def add_scheduled_scan():
         owner = current_owner_id()
         task_id = make_task_id(target, scan_type, owner)
         _cleanup_finished_tasks()
-        if task_id in scan_tasks:
+
+        try:
+            existing = await asyncio.to_thread(state_store.list_scheduled_tasks)
+        except Exception as exc:
+            log_event(f"Failed to list schedules: {exc}")
+            existing = []
+        if any(row.get("task_id") == task_id for row in existing):
             return jsonify({"error": "Scan already scheduled"}), 400
-        if len(scan_tasks) >= MAX_SCHEDULED_TASKS:
+        if len(existing) >= MAX_SCHEDULED_TASKS:
             return jsonify({"error": "Scheduled task limit reached"}), 429
 
-        task = asyncio.create_task(
-            periodic_scan(
-                target,
-                scan_type,
-                interval,
-                ports=ports,
-                scripts=scripts,
-                discovery=discovery,
-                owner_id=owner,
-            )
-        )
-        scan_tasks[task_id] = task
         try:
             state_store.upsert_scheduled_task(
                 task_id,
@@ -1896,12 +2041,29 @@ async def add_scheduled_scan():
             )
         except Exception as exc:
             log_event(f"Failed to persist scheduled task {task_id}: {exc}")
+            return jsonify({"error": "Failed to persist scheduled task"}), 500
+
+        # Leader starts the loop immediately; non-leaders rely on leader sync.
+        if _is_scheduler_leader:
+            _start_local_scheduled_task(
+                {
+                    "task_id": task_id,
+                    "target": target,
+                    "scan_type": scan_type,
+                    "interval_minutes": interval,
+                    "ports": ports,
+                    "scripts": scripts,
+                    "discovery": discovery,
+                    "owner_id": owner,
+                }
+            )
         log_event(f"Scan {target} scheduled every {interval} minutes")
 
         return jsonify(
             {
                 "message": f"Scan {target} scheduled every {interval} minutes",
                 "task_id": task_id,
+                "scheduler_leader": _is_scheduler_leader,
             }
         ), 200
     except Exception as e:
@@ -1919,9 +2081,36 @@ async def list_tasks():
     owner = current_owner_id()
     owner_prefix = f"o{owner[:12]}-"
     _cleanup_finished_tasks()
+    try:
+        rows = await asyncio.to_thread(state_store.list_scheduled_tasks)
+    except Exception as exc:
+        log_event(f"Failed to list scheduled tasks: {exc}")
+        rows = []
+
     tasks_info = []
+    for row in rows:
+        task_id = row["task_id"]
+        row_owner = row.get("owner_id")
+        if row_owner and row_owner != owner:
+            continue
+        if not row_owner and task_id.startswith("o") and not task_id.startswith(owner_prefix):
+            continue
+        local = scan_tasks.get(task_id)
+        tasks_info.append(
+            {
+                "id": task_id,
+                "target": row.get("target"),
+                "scan_type": row.get("scan_type"),
+                "interval_minutes": row.get("interval_minutes"),
+                "running": bool(local is not None and not local.done()),
+                "cancelled": bool(local is not None and local.cancelled()),
+                "scheduler_leader": _is_scheduler_leader,
+            }
+        )
+    # Include any local-only legacy tasks not yet in DB.
     for task_id, task in scan_tasks.items():
-        # Legacy tasks without owner prefix remain visible for compatibility.
+        if any(item["id"] == task_id for item in tasks_info):
+            continue
         if task_id.startswith("o") and not task_id.startswith(owner_prefix):
             continue
         tasks_info.append(
@@ -1929,6 +2118,7 @@ async def list_tasks():
                 "id": task_id,
                 "running": not task.done(),
                 "cancelled": task.cancelled(),
+                "scheduler_leader": _is_scheduler_leader,
             }
         )
     return jsonify(tasks_info), 200
@@ -1946,13 +2136,20 @@ async def cancel_task(task_id):
         return jsonify({"error": "Task not found"}), 404
 
     _cleanup_finished_tasks()
+    deleted = False
     if task_id in scan_tasks:
         scan_tasks[task_id].cancel()
         del scan_tasks[task_id]
-        try:
+        deleted = True
+    try:
+        # Durable delete so the leader stops after sync even if this worker is not leader.
+        existing = await asyncio.to_thread(state_store.list_scheduled_tasks)
+        if any(row.get("task_id") == task_id for row in existing):
             state_store.delete_scheduled_task(task_id)
-        except Exception as exc:
-            log_event(f"Failed to delete persisted task {task_id}: {exc}")
+            deleted = True
+    except Exception as exc:
+        log_event(f"Failed to delete persisted task {task_id}: {exc}")
+    if deleted:
         log_event(f"Task {task_id} cancelled")
         await send_telegram_message(f"Task {task_id} cancelled")
         return jsonify({"message": f"Task {task_id} cancelled"}), 200
@@ -2308,6 +2505,8 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "named_api_keys": len(API_AUTH_KEYS) > 0,
         "worker_id": WORKER_ID,
         "job_lease_seconds": JOB_LEASE_SECONDS,
+        "scheduler_leader": _is_scheduler_leader,
+        "scheduler_leader_seconds": SCHEDULER_LEADER_SECONDS,
         "state_db": STATE_DB_PATH,
         "discovery_engines": {
             name: bool(path) for name, path in available_discovery_engines().items()
@@ -2821,7 +3020,7 @@ async def api_docs():
 
 
 async def load_initial_tasks():
-    """Load startup scheduled tasks from the environment."""
+    """Persist startup schedules from INITIAL_TASKS (leader loop starts them)."""
     initial_tasks_raw = os.getenv("INITIAL_TASKS", "[]")
     if not initial_tasks_raw.strip():
         return
@@ -2832,8 +3031,13 @@ async def load_initial_tasks():
             log_event("INITIAL_TASKS must be an array")
             return
 
+        try:
+            existing = {row["task_id"] for row in state_store.list_scheduled_tasks()}
+        except Exception:
+            existing = set()
+
         for task_config in initial_tasks:
-            if len(scan_tasks) >= MAX_SCHEDULED_TASKS:
+            if len(existing) >= MAX_SCHEDULED_TASKS:
                 log_event(
                     f"INITIAL_TASKS: reached limit {MAX_SCHEDULED_TASKS}; remaining tasks skipped"
                 )
@@ -2854,21 +3058,8 @@ async def load_initial_tasks():
 
             owner = "local"
             task_id = make_task_id(target, scan_type, owner)
-            if task_id in scan_tasks:
+            if task_id in existing:
                 continue
-
-            task = asyncio.create_task(
-                periodic_scan(
-                    target,
-                    scan_type,
-                    interval,
-                    ports=ports,
-                    scripts=scripts,
-                    discovery=discovery,
-                    owner_id=owner,
-                )
-            )
-            scan_tasks[task_id] = task
             try:
                 state_store.upsert_scheduled_task(
                     task_id,
@@ -2881,9 +3072,14 @@ async def load_initial_tasks():
                     owner_id=owner,
                     created_at=_utc_now_iso(),
                 )
+                existing.add(task_id)
             except Exception as exc:
                 log_event(f"Failed to persist INITIAL_TASKS entry {task_id}: {exc}")
-            log_event(f"Loaded initial task: {target} ({scan_type}) every {interval} minutes")
+                continue
+            log_event(
+                f"Registered initial task: {target} ({scan_type}) every {interval} minutes "
+                "(awaiting scheduler leader)"
+            )
     except json.JSONDecodeError as e:
         log_event(f"INITIAL_TASKS JSON parse error: {e}")
     except (KeyError, TypeError) as e:
@@ -2893,7 +3089,7 @@ async def load_initial_tasks():
 
 
 async def load_persisted_state():
-    """Restore job history and scheduled tasks from SQLite after restart."""
+    """Restore job history from SQLite after restart (schedules start via leader loop)."""
     try:
         jobs = await asyncio.to_thread(state_store.list_jobs, MAX_SCAN_JOBS)
     except Exception as exc:
@@ -2927,35 +3123,17 @@ async def load_persisted_state():
         log_event(f"Loaded {len(scan_jobs)} persisted scan jobs from {STATE_DB_PATH}")
 
     try:
-        tasks = await asyncio.to_thread(state_store.list_scheduled_tasks)
+        schedules = await asyncio.to_thread(state_store.list_scheduled_tasks)
+        log_event(
+            f"Found {len(schedules)} durable schedules "
+            f"(leader loop will start them on this or another worker)"
+        )
     except Exception as exc:
         log_event(f"Failed to load persisted scheduled tasks: {exc}")
-        return
-
-    for row in tasks:
-        if len(scan_tasks) >= MAX_SCHEDULED_TASKS:
-            log_event("Persisted scheduled tasks: limit reached; remaining skipped")
-            break
-        task_id = row["task_id"]
-        if task_id in scan_tasks:
-            continue
-        task = asyncio.create_task(
-            periodic_scan(
-                row["target"],
-                row["scan_type"],
-                float(row["interval_minutes"]),
-                ports=row.get("ports"),
-                scripts=row.get("scripts"),
-                discovery=row.get("discovery"),
-                owner_id=row.get("owner_id") or "local",
-            )
-        )
-        scan_tasks[task_id] = task
-        log_event(f"Restored scheduled task {task_id} every {row['interval_minutes']} minutes")
 
 
 async def main():
-    global _job_worker_task
+    global _job_worker_task, _scheduler_leader_task
     log_event(f"{PRODUCT_NAME} started (version {VERSION}, worker={WORKER_ID})")
     await send_telegram_message(f"{PRODUCT_NAME} v{VERSION} started")
 
@@ -2974,6 +3152,7 @@ async def main():
             pass
 
     _job_worker_task = asyncio.create_task(job_claim_loop(stop_event))
+    _scheduler_leader_task = asyncio.create_task(scheduler_leader_loop(stop_event))
     shutdown_trigger = stop_event.wait if registered_signals else None
     server_task = asyncio.create_task(
         app.run_task(
@@ -3006,6 +3185,13 @@ async def main():
 
         if _job_worker_task is not None:
             _job_worker_task.cancel()
+        if _scheduler_leader_task is not None:
+            _scheduler_leader_task.cancel()
+        try:
+            state_store.release_leadership(SCHEDULER_LOCK_NAME, WORKER_ID)
+        except Exception:
+            pass
+        _release_redis_leadership(SCHEDULER_LOCK_NAME)
 
         _cleanup_finished_tasks()
         scheduled_tasks = list(scan_tasks.values())
@@ -3021,8 +3207,8 @@ async def main():
             for task in job_tasks:
                 task.cancel()
 
-        claim_tasks = [_job_worker_task] if _job_worker_task is not None else []
-        shutdown_tasks = [*scheduled_tasks, *job_tasks, *claim_tasks, server_task]
+        bg_tasks = [task for task in (_job_worker_task, _scheduler_leader_task) if task is not None]
+        shutdown_tasks = [*scheduled_tasks, *job_tasks, *bg_tasks, server_task]
         try:
             await asyncio.wait_for(
                 asyncio.gather(*shutdown_tasks, return_exceptions=True),

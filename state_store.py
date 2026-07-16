@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_scan_jobs_created ON scan_jobs(created_at);
 CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status);
+
+CREATE TABLE IF NOT EXISTS leadership (
+    lock_name TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    lease_until REAL NOT NULL
+);
 """
 
 
@@ -362,6 +368,54 @@ class StateStore:
                 WHERE job_id = ? AND lease_owner = ?
                 """,
                 (job_id, worker_id),
+            )
+            conn.commit()
+
+    def try_acquire_leadership(
+        self,
+        lock_name: str,
+        worker_id: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        """Acquire or renew a named leadership lease (e.g. scheduler)."""
+        lease_until = float(now) + float(lease_seconds)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO leadership(lock_name, owner_id, lease_until)
+                VALUES (?, ?, ?)
+                ON CONFLICT(lock_name) DO UPDATE SET
+                    owner_id = excluded.owner_id,
+                    lease_until = excluded.lease_until
+                WHERE leadership.lease_until < ?
+                   OR leadership.owner_id = ?
+                """,
+                (lock_name, worker_id, lease_until, float(now), worker_id),
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                return True
+            row = conn.execute(
+                "SELECT owner_id FROM leadership WHERE lock_name = ?",
+                (lock_name,),
+            ).fetchone()
+            return bool(row and row["owner_id"] == worker_id)
+
+    def get_leader(self, lock_name: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT lock_name, owner_id, lease_until FROM leadership WHERE lock_name = ?",
+                (lock_name,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def release_leadership(self, lock_name: str, worker_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM leadership WHERE lock_name = ? AND owner_id = ?",
+                (lock_name, worker_id),
             )
             conn.commit()
 
