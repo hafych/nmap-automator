@@ -572,6 +572,167 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("refresh({ announce: false })", body)
 
 
+class NamedApiKeyScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        autonmap.scan_tasks.clear()
+        autonmap.scan_jobs.clear()
+        autonmap.rate_limits.clear()
+        self.client = autonmap.app.test_client()
+        self.original_keys = list(autonmap.API_AUTH_KEYS)
+        self.original_tokens = list(autonmap.API_AUTH_TOKENS)
+        autonmap.API_AUTH_KEYS = [
+            {
+                "id": "reader",
+                "label": "Read only",
+                "token": "read-token-aaaaaaaa",
+                "scopes": ["read"],
+                "effective_scopes": ["read"],
+                "created_at": "2026-07-16T00:00:00+00:00",
+                "revoked": False,
+            },
+            {
+                "id": "scanner",
+                "label": "Scanner",
+                "token": "scan-token-bbbbbbbb",
+                "scopes": ["scan"],
+                "effective_scopes": ["read", "scan"],
+                "created_at": None,
+                "revoked": False,
+            },
+            {
+                "id": "admin",
+                "label": "Admin",
+                "token": "admin-token-cccccccc",
+                "scopes": ["admin"],
+                "effective_scopes": ["admin", "read", "scan"],
+                "created_at": None,
+                "revoked": False,
+            },
+            {
+                "id": "revoked-key",
+                "label": "Revoked",
+                "token": "revoked-token-dddddd",
+                "scopes": ["admin"],
+                "effective_scopes": ["admin", "read", "scan"],
+                "created_at": None,
+                "revoked": True,
+            },
+        ]
+        autonmap.API_AUTH_TOKENS = [
+            key["token"] for key in autonmap.API_AUTH_KEYS if not key["revoked"]
+        ]
+
+    async def asyncTearDown(self):
+        autonmap.API_AUTH_KEYS = self.original_keys
+        autonmap.API_AUTH_TOKENS = self.original_tokens
+        autonmap.scan_tasks.clear()
+        autonmap.scan_jobs.clear()
+        autonmap.rate_limits.clear()
+
+    def test_scope_hierarchy_helpers(self):
+        self.assertTrue(autonmap.scopes_allow(["admin"], ["scan", "read"]))
+        self.assertTrue(autonmap.scopes_allow(["scan"], ["read"]))
+        self.assertFalse(autonmap.scopes_allow(["read"], ["scan"]))
+        self.assertEqual(
+            sorted(autonmap._expand_scopes(["scan"])),
+            ["read", "scan"],
+        )
+        self.assertEqual(
+            sorted(autonmap._expand_scopes(["admin"])),
+            ["admin", "read", "scan"],
+        )
+
+    def test_load_named_keys_from_env(self):
+        raw = json.dumps(
+            [
+                {
+                    "id": "ops",
+                    "label": "Ops",
+                    "token": "named-ops-token-1",
+                    "scopes": ["scan", "read"],
+                    "created_at": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "id": "viewer",
+                    "token": "named-view-token-2",
+                    "scopes": "read",
+                    "revoked": True,
+                },
+            ]
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "API_AUTH_KEYS": raw,
+                "API_AUTH_TOKEN": "",
+                "API_AUTH_TOKENS": "",
+            },
+            clear=False,
+        ):
+            keys = autonmap._load_api_auth_keys()
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0]["id"], "ops")
+        self.assertEqual(keys[0]["label"], "Ops")
+        self.assertIn("scan", keys[0]["scopes"])
+        self.assertTrue(keys[1]["revoked"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"API_AUTH_KEYS": '{"not":"list"}', "API_AUTH_TOKEN": "x", "API_AUTH_TOKENS": ""},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                autonmap._load_api_auth_keys()
+
+    async def test_whoami_and_scope_enforcement(self):
+        who = await self.client.get("/auth/whoami", headers={"X-API-KEY": "read-token-aaaaaaaa"})
+        who_payload = await who.get_json()
+        self.assertEqual(who.status_code, 200)
+        self.assertEqual(who_payload["key_id"], "reader")
+        self.assertEqual(who_payload["label"], "Read only")
+        self.assertIn("read", who_payload["scopes"])
+        self.assertNotIn("scan", who_payload["scopes"])
+
+        read_ok = await self.client.get("/results", headers={"X-API-KEY": "read-token-aaaaaaaa"})
+        self.assertEqual(read_ok.status_code, 200)
+
+        scan_denied = await self.client.post(
+            "/scan",
+            headers={"X-API-KEY": "read-token-aaaaaaaa"},
+            json={"target": "127.0.0.1", "scan_type": "Ping"},
+        )
+        denied_payload = await scan_denied.get_json()
+        self.assertEqual(scan_denied.status_code, 403)
+        self.assertIn("scope", denied_payload["error"].lower())
+
+        async def fake_create(*_a, **_k):
+            return {
+                "job_id": "job-scoped",
+                "target": "127.0.0.1",
+                "scan_type": "Ping",
+                "status": "queued",
+                "created_at": "now",
+                "kind": "immediate",
+            }
+
+        original = autonmap.create_scan_job
+        autonmap.create_scan_job = fake_create
+        try:
+            scan_ok = await self.client.post(
+                "/scan",
+                headers={"X-API-KEY": "scan-token-bbbbbbbb"},
+                json={"target": "127.0.0.1", "scan_type": "Ping"},
+            )
+        finally:
+            autonmap.create_scan_job = original
+        self.assertEqual(scan_ok.status_code, 202)
+
+        revoked = await self.client.get(
+            "/auth/whoami", headers={"X-API-KEY": "revoked-token-dddddd"}
+        )
+        self.assertEqual(revoked.status_code, 403)
+
+
 class TargetAllowlistTests(unittest.TestCase):
     def test_empty_allowlist_permits_any_valid_target(self):
         self.assertTrue(autonmap.target_in_allowlist("8.8.8.8", allowlist=[]))

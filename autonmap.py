@@ -63,7 +63,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -129,16 +129,138 @@ API_AUTH_REQUIRED = _parse_bool_env("API_AUTH_REQUIRED", True)
 API_AUTH_HEADER = os.getenv("API_AUTH_HEADER", "X-API-KEY").strip() or "X-API-KEY"
 
 
-def _load_api_auth_tokens() -> list:
-    """Load one or more operator API tokens from the environment.
+API_KEY_SCOPES = frozenset({"read", "scan", "admin"})
+API_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _normalize_key_scopes(raw: Any) -> List[str]:
+    if raw is None:
+        return ["admin"]
+    if isinstance(raw, str):
+        values = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(part).strip().lower() for part in raw if str(part).strip()]
+    else:
+        raise RuntimeError("API key scopes must be a list or comma-separated string")
+    if not values:
+        raise RuntimeError("API key scopes must not be empty")
+    unknown = sorted(set(values) - API_KEY_SCOPES)
+    if unknown:
+        raise RuntimeError(
+            f"Unknown API key scopes: {', '.join(unknown)}. "
+            f"Allowed: {', '.join(sorted(API_KEY_SCOPES))}"
+        )
+    # Preserve declared order without duplicates.
+    ordered: List[str] = []
+    seen = set()
+    for scope in values:
+        if scope in seen:
+            continue
+        seen.add(scope)
+        ordered.append(scope)
+    return ordered
+
+
+def _expand_scopes(scopes: List[str]) -> frozenset:
+    """admin ⊃ scan ⊃ read."""
+    have = set(scopes)
+    if "admin" in have:
+        return frozenset(API_KEY_SCOPES)
+    if "scan" in have:
+        have.add("read")
+    return frozenset(have)
+
+
+def _public_api_key_view(key: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": key["id"],
+        "label": key.get("label") or key["id"],
+        "scopes": list(key.get("scopes") or []),
+        "created_at": key.get("created_at"),
+        "revoked": bool(key.get("revoked")),
+    }
+
+
+def _load_api_auth_keys() -> List[Dict[str, Any]]:
+    """Load named API keys and legacy raw tokens.
 
     Supports:
-    - API_AUTH_TOKEN=single-token (legacy)
-    - API_AUTH_TOKENS=token-a,token-b
-    - API_AUTH_TOKENS='["token-a","token-b"]' (JSON array)
+    - API_AUTH_KEYS JSON array of objects:
+      ``{"id","label","token","scopes","created_at","revoked"}``
+    - API_AUTH_TOKEN / API_AUTH_TOKENS (legacy full-access tokens)
     """
-    tokens: list = []
+    keys: List[Dict[str, Any]] = []
+    seen_tokens: set = set()
+    seen_ids: set = set()
+
+    def add_key(
+        *,
+        key_id: str,
+        label: str,
+        token: str,
+        scopes: Any,
+        created_at: Optional[str] = None,
+        revoked: bool = False,
+    ) -> None:
+        token = (token or "").strip()
+        key_id = (key_id or "").strip()
+        if not token:
+            raise RuntimeError("API key token must not be empty")
+        if token in seen_tokens:
+            return
+        if not key_id or not API_KEY_ID_RE.fullmatch(key_id):
+            raise RuntimeError(
+                f"Invalid API key id {key_id!r}. Use 1-64 chars: letters, digits, ._- "
+                "(must start alphanumeric)."
+            )
+        if key_id in seen_ids:
+            raise RuntimeError(f"Duplicate API key id: {key_id}")
+        normalized_scopes = _normalize_key_scopes(scopes)
+        seen_tokens.add(token)
+        seen_ids.add(key_id)
+        keys.append(
+            {
+                "id": key_id,
+                "label": (label or key_id).strip()[:120] or key_id,
+                "token": token,
+                "scopes": normalized_scopes,
+                "effective_scopes": sorted(_expand_scopes(normalized_scopes)),
+                "created_at": created_at,
+                "revoked": bool(revoked),
+            }
+        )
+
+    structured = os.getenv("API_AUTH_KEYS", "").strip()
+    if structured:
+        try:
+            parsed = json.loads(structured)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("API_AUTH_KEYS must be a JSON array of key objects") from exc
+        if not isinstance(parsed, list):
+            raise RuntimeError("API_AUTH_KEYS must be a JSON array of key objects")
+        for index, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                raise RuntimeError(f"API_AUTH_KEYS[{index}] must be an object")
+            token = item.get("token") or item.get("secret") or item.get("key")
+            if not isinstance(token, str) or not token.strip():
+                raise RuntimeError(f"API_AUTH_KEYS[{index}] requires a non-empty token")
+            key_id = item.get("id") or item.get("key_id") or f"key-{index + 1}"
+            label = item.get("label") or item.get("name") or str(key_id)
+            created_at = item.get("created_at")
+            if created_at is not None:
+                created_at = str(created_at)
+            add_key(
+                key_id=str(key_id),
+                label=str(label),
+                token=token,
+                scopes=item.get("scopes", ["admin"]),
+                created_at=created_at,
+                revoked=bool(item.get("revoked", False)),
+            )
+
+    # Legacy multi-token list (full admin access).
     multi_raw = os.getenv("API_AUTH_TOKENS", "").strip()
+    legacy_tokens: List[str] = []
     if multi_raw:
         if multi_raw.startswith("["):
             try:
@@ -149,32 +271,45 @@ def _load_api_auth_tokens() -> list:
                 ) from exc
             if not isinstance(parsed, list):
                 raise RuntimeError("API_AUTH_TOKENS JSON value must be an array of strings")
-            tokens.extend(str(item).strip() for item in parsed if str(item).strip())
+            legacy_tokens.extend(str(item).strip() for item in parsed if str(item).strip())
         else:
-            tokens.extend(part.strip() for part in multi_raw.split(",") if part.strip())
+            legacy_tokens.extend(part.strip() for part in multi_raw.split(",") if part.strip())
 
     single = os.getenv("API_AUTH_TOKEN", "").strip()
     if single:
-        tokens.append(single)
+        legacy_tokens.append(single)
 
-    # Preserve order, drop duplicates.
-    unique: list = []
-    seen = set()
-    for token in tokens:
-        if token in seen:
+    for index, token in enumerate(legacy_tokens):
+        if token in seen_tokens:
             continue
-        seen.add(token)
-        unique.append(token)
-    return unique
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+        add_key(
+            key_id=f"legacy-{digest}" if index or len(legacy_tokens) > 1 else "primary",
+            label="Primary token"
+            if index == 0 and len(legacy_tokens) == 1
+            else f"Legacy token {index + 1}",
+            token=token,
+            scopes=["admin"],
+            created_at=None,
+            revoked=False,
+        )
+
+    return keys
 
 
-API_AUTH_TOKENS = _load_api_auth_tokens()
+def _load_api_auth_tokens() -> list:
+    """Backward-compatible raw token list (active keys only)."""
+    return [key["token"] for key in _load_api_auth_keys() if not key.get("revoked")]
+
+
+API_AUTH_KEYS = _load_api_auth_keys()
+API_AUTH_TOKENS = [key["token"] for key in API_AUTH_KEYS if not key.get("revoked")]
 # Backward-compatible alias used by docs and older code paths.
 API_AUTH_TOKEN = API_AUTH_TOKENS[0] if API_AUTH_TOKENS else ""
 if API_AUTH_REQUIRED and not API_AUTH_TOKENS:
     raise RuntimeError(
         "API_AUTH_REQUIRED=true, but no API tokens are configured. "
-        "Set API_AUTH_TOKEN and/or API_AUTH_TOKENS."
+        "Set API_AUTH_TOKEN, API_AUTH_TOKENS, and/or API_AUTH_KEYS."
     )
 
 RATE_LIMIT_WINDOW_SECONDS = _parse_int_env(
@@ -494,17 +629,55 @@ def _validate_scan_payload(
     )
 
 
+def _resolve_api_key(candidate: str) -> Optional[Dict[str, Any]]:
+    """Return the matching non-revoked key record for a presented token."""
+    if not candidate:
+        return None
+
+    # Prefer structured key registry.
+    for key in API_AUTH_KEYS:
+        if key.get("revoked"):
+            continue
+        allowed = str(key.get("token") or "")
+        if not allowed or len(candidate) != len(allowed):
+            continue
+        if secrets.compare_digest(candidate, allowed):
+            return key
+
+    # Fallback for tests that patch API_AUTH_TOKENS only.
+    for allowed in API_AUTH_TOKENS:
+        if not allowed or len(candidate) != len(allowed):
+            continue
+        if secrets.compare_digest(candidate, allowed):
+            digest = hashlib.sha256(allowed.encode("utf-8")).hexdigest()[:8]
+            return {
+                "id": f"legacy-{digest}",
+                "label": "Legacy token",
+                "token": allowed,
+                "scopes": ["admin"],
+                "effective_scopes": sorted(API_KEY_SCOPES),
+                "created_at": None,
+                "revoked": False,
+            }
+    return None
+
+
 def _token_is_authorized(candidate: str) -> bool:
     """Multi-token check with compare_digest when lengths match."""
-    if not candidate or not API_AUTH_TOKENS:
-        return False
-    matched = False
-    for allowed in API_AUTH_TOKENS:
-        # secrets.compare_digest requires equal-length inputs.
-        if len(candidate) != len(allowed):
-            continue
-        matched = secrets.compare_digest(candidate, allowed) or matched
-    return matched
+    return _resolve_api_key(candidate) is not None
+
+
+def scopes_allow(have: Any, required: Any) -> bool:
+    """Return True when effective scopes satisfy the required set."""
+    have_set = set(have or [])
+    need_set = set(required or [])
+    if not need_set:
+        return True
+    if "admin" in have_set:
+        return True
+    if "scan" in have_set:
+        have_set.add("read")
+    return need_set.issubset(have_set)
 
 
 def owner_id_from_token(token: str) -> str:
@@ -517,6 +690,23 @@ def current_owner_id() -> str:
     except RuntimeError:
         # Outside a request context (startup tasks, unit helpers).
         return "local"
+
+
+def current_api_key_id() -> str:
+    try:
+        return getattr(g, "api_key_id", "local")
+    except RuntimeError:
+        return "local"
+
+
+def current_scopes() -> frozenset:
+    try:
+        scopes = getattr(g, "scopes", None)
+        if scopes is not None:
+            return frozenset(scopes)
+    except RuntimeError:
+        pass
+    return frozenset(API_KEY_SCOPES) if not API_AUTH_REQUIRED else frozenset()
 
 
 def owner_result_prefix(owner_id: Optional[str] = None) -> str:
@@ -549,17 +739,43 @@ def make_task_id(target: str, scan_type: str, owner_id: Optional[str] = None) ->
     return f"o{owner[:12]}-{target}-{scan_type}"
 
 
-def require_api_auth():
+def require_api_auth(*required_scopes: str):
+    """Authenticate the request and optionally enforce least-privilege scopes.
+
+    Scope hierarchy: ``admin`` includes all; ``scan`` includes ``read``.
+    """
     if not API_AUTH_REQUIRED:
         g.owner_id = "local"
+        g.api_key_id = "local"
+        g.api_key_label = "local"
+        g.scopes = frozenset(API_KEY_SCOPES)
         return None
 
     token = request.headers.get(API_AUTH_HEADER)
     if not token:
         return jsonify({"error": f"API token missing ({API_AUTH_HEADER})"}), 401
-    if not _token_is_authorized(token):
+    key = _resolve_api_key(token)
+    if key is None:
         return jsonify({"error": "Invalid API token"}), 403
+    if key.get("revoked"):
+        return jsonify({"error": "API key has been revoked"}), 403
+
     g.owner_id = owner_id_from_token(token)
+    g.api_key_id = key["id"]
+    g.api_key_label = key.get("label") or key["id"]
+    g.scopes = _expand_scopes(list(key.get("scopes") or []))
+
+    if required_scopes and not scopes_allow(g.scopes, required_scopes):
+        return (
+            jsonify(
+                {
+                    "error": "Insufficient API key scope",
+                    "required": sorted(set(required_scopes)),
+                    "scopes": sorted(g.scopes),
+                }
+            ),
+            403,
+        )
     return None
 
 
@@ -1147,7 +1363,7 @@ async def async_scan(
 @app.route("/scan", methods=["POST"])
 async def start_scan():
     try:
-        auth_error = require_api_auth()
+        auth_error = require_api_auth("scan")
         if auth_error:
             return auth_error
 
@@ -1198,7 +1414,7 @@ async def start_scan():
 
 @app.route("/jobs", methods=["GET"])
 async def list_jobs():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
 
@@ -1218,7 +1434,7 @@ async def list_jobs():
 
 @app.route("/jobs/<job_id>", methods=["GET"])
 async def get_job(job_id: str):
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
 
@@ -1235,7 +1451,7 @@ async def get_job(job_id: str):
 
 @app.route("/jobs/<job_id>", methods=["DELETE"])
 async def cancel_job(job_id: str):
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("scan")
     if auth_error:
         return auth_error
 
@@ -1309,7 +1525,7 @@ async def periodic_scan(
 @app.route("/schedule", methods=["POST"])
 async def add_scheduled_scan():
     try:
-        auth_error = require_api_auth()
+        auth_error = require_api_auth("scan")
         if auth_error:
             return auth_error
 
@@ -1374,7 +1590,7 @@ async def add_scheduled_scan():
 
 @app.route("/tasks", methods=["GET"])
 async def list_tasks():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
 
@@ -1398,7 +1614,7 @@ async def list_tasks():
 
 @app.route("/tasks/<path:task_id>", methods=["DELETE"])
 async def cancel_task(task_id):
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("scan")
     if auth_error:
         return auth_error
 
@@ -1439,7 +1655,7 @@ def _safe_result_path(result_id: str) -> Optional[Path]:
 
 @app.route("/results", methods=["GET"])
 async def list_results():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
 
@@ -1483,7 +1699,7 @@ def _parse_optional_limit(raw: Optional[str], default: int, max_value: int) -> i
 
 @app.route("/results/<path:result_id>", methods=["GET"])
 async def get_result(result_id: str):
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
 
@@ -1533,7 +1749,7 @@ async def _load_result_reference(ref: Any) -> Tuple[Optional[dict], Optional[str
 
 @app.route("/results/import", methods=["POST"])
 async def import_result_xml():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("scan")
     if auth_error:
         return auth_error
     if not check_rate_limit():
@@ -1586,7 +1802,7 @@ async def import_result_xml():
 
 @app.route("/results/diff", methods=["POST"])
 async def diff_results():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
     if not check_rate_limit():
@@ -1613,7 +1829,7 @@ async def diff_results():
 
 @app.route("/tools", methods=["GET"])
 async def tools_inventory():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
     if not check_rate_limit():
@@ -1626,7 +1842,7 @@ async def tools_inventory():
 
 @app.route("/tools/ai-context", methods=["GET"])
 async def tools_ai_context():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
     if not check_rate_limit():
@@ -1650,7 +1866,7 @@ async def tools_ai_context():
 
 @app.route("/recon/plan", methods=["POST"])
 async def recon_plan():
-    auth_error = require_api_auth()
+    auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
     if not check_rate_limit():
@@ -1764,6 +1980,8 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "results_max_files": RESULTS_MAX_FILES,
         "results_max_age_days": RESULTS_MAX_AGE_DAYS,
         "legacy_results_shared": LEGACY_RESULTS_SHARED,
+        "api_key_count": len([key for key in API_AUTH_KEYS if not key.get("revoked")]),
+        "named_api_keys": len(API_AUTH_KEYS) > 0,
         "state_db": STATE_DB_PATH,
         "discovery_engines": {
             name: bool(path) for name, path in available_discovery_engines().items()
@@ -1885,6 +2103,16 @@ def build_openapi_spec() -> dict:
         },
         "security": security,
         "paths": {
+            "/auth/whoami": {
+                "get": {
+                    "summary": "Authenticated API key metadata",
+                    "responses": {
+                        "200": {"description": "Key id, label, scopes, owner prefix"},
+                        "401": {"description": "Missing API token"},
+                        "403": {"description": "Invalid or revoked key"},
+                    },
+                }
+            },
             "/live": {
                 "get": {
                     "summary": "Liveness probe",
@@ -2134,6 +2362,28 @@ async def openapi_json():
     return jsonify(build_openapi_spec()), 200
 
 
+@app.route("/auth/whoami", methods=["GET"])
+async def auth_whoami():
+    """Return the authenticated key metadata (never the secret token)."""
+    auth_error = require_api_auth()
+    if auth_error:
+        # Auth-only: any valid non-revoked key may call whoami.
+        return auth_error
+    return (
+        jsonify(
+            {
+                "key_id": current_api_key_id(),
+                "label": getattr(g, "api_key_label", current_api_key_id()),
+                "scopes": sorted(current_scopes()),
+                "owner_id_prefix": current_owner_id()[:12],
+                "product": PRODUCT_NAME,
+                "version": VERSION,
+            }
+        ),
+        200,
+    )
+
+
 @app.route("/api/docs", methods=["GET"])
 async def api_docs():
     return jsonify(
@@ -2147,13 +2397,21 @@ async def api_docs():
                 "api_auth_required": API_AUTH_REQUIRED,
                 "api_auth_header": API_AUTH_HEADER,
                 "api_token_count": len(API_AUTH_TOKENS),
+                "api_key_count": len([key for key in API_AUTH_KEYS if not key.get("revoked")]),
+                "scopes": sorted(API_KEY_SCOPES),
+                "scope_hierarchy": "admin > scan > read (scan includes read)",
                 "rate_limit": f"{MAX_REQUESTS_PER_WINDOW} requests per {RATE_LIMIT_WINDOW_SECONDS} seconds",
                 "max_concurrent_scans": MAX_CONCURRENT_SCANS,
             },
             "scan_types": list(SUPPORTED_SCAN_TYPES.keys()),
             "endpoints": {
+                "GET /auth/whoami": {
+                    "description": "Authenticated key id, label, scopes, owner prefix (no secret)",
+                    "scope": "any valid key",
+                },
                 "POST /scan": {
                     "description": "Queue an immediate scan (202 job) or wait with ?wait=1",
+                    "scope": "scan",
                     "request": {
                         "target": "IP address, CIDR, or hostname",
                         "scan_type": "TCP|SYN|UDP|OS|Aggressive|Ping|Version|Safe|Vuln|Full|Hybrid|HybridNaabu|HybridRustScan",
@@ -2168,11 +2426,18 @@ async def api_docs():
                         "ports": "22,80,443",
                     },
                 },
-                "GET /jobs": {"description": "List recent scan jobs"},
-                "GET /jobs/<job_id>": {"description": "Get scan job status and result"},
-                "DELETE /jobs/<job_id>": {"description": "Cancel a queued or running job"},
+                "GET /jobs": {"description": "List recent scan jobs", "scope": "read"},
+                "GET /jobs/<job_id>": {
+                    "description": "Get scan job status and result",
+                    "scope": "read",
+                },
+                "DELETE /jobs/<job_id>": {
+                    "description": "Cancel a queued or running job",
+                    "scope": "scan",
+                },
                 "POST /schedule": {
                     "description": "Schedule a recurring scan",
+                    "scope": "scan",
                     "request": {
                         "target": "IP address, range, or hostname",
                         "scan_type": "Scan type",
@@ -2186,16 +2451,24 @@ async def api_docs():
                         "interval": 30,
                     },
                 },
-                "GET /tasks": {"description": "List scheduled tasks"},
-                "DELETE /tasks/<task_id>": {"description": "Cancel a scheduled task"},
-                "GET /results": {"description": "List encrypted result files"},
-                "GET /results/<id>": {"description": "Decrypt and return a stored result"},
+                "GET /tasks": {"description": "List scheduled tasks", "scope": "read"},
+                "DELETE /tasks/<task_id>": {
+                    "description": "Cancel a scheduled task",
+                    "scope": "scan",
+                },
+                "GET /results": {"description": "List encrypted result files", "scope": "read"},
+                "GET /results/<id>": {
+                    "description": "Decrypt and return a stored result",
+                    "scope": "read",
+                },
                 "POST /results/import": {
                     "description": "Import Nmap XML, encrypt, and return parsed result",
+                    "scope": "scan",
                     "request": {"xml": "Nmap XML string", "target": "optional label"},
                 },
                 "POST /results/diff": {
                     "description": "Diff two scan results (objects or stored result ids)",
+                    "scope": "read",
                     "request": {"baseline": "result or {id}", "current": "result or {id}"},
                 },
                 "GET /live": {"description": "Liveness probe (always 200 when process is up)"},
@@ -2203,13 +2476,16 @@ async def api_docs():
                 "GET /health": {"description": "Detailed health snapshot"},
                 "GET /openapi.json": {"description": "OpenAPI 3 schema"},
                 "GET /tools": {
-                    "description": "Inventory of Kali/pentest tools across recon categories"
+                    "description": "Inventory of Kali/pentest tools across recon categories",
+                    "scope": "read",
                 },
                 "GET /tools/ai-context": {
-                    "description": "JSONL/Markdown tool context for GPT/Claude"
+                    "description": "JSONL/Markdown tool context for GPT/Claude",
+                    "scope": "read",
                 },
                 "POST /recon/plan": {
                     "description": "Review-only multi-tool recon plan from parsed scan results",
+                    "scope": "read",
                     "request": {"scan": "Parsed scan response or object with hosts[]"},
                     "formats": "json|jsonl|markdown",
                 },
