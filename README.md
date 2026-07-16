@@ -232,8 +232,8 @@ This is not a multi-tenant authorization system. See [SECURITY.md](SECURITY.md).
 
 \* At least one of `API_AUTH_TOKEN` / `API_AUTH_TOKENS` is required when auth is enabled.
 Multiple tokens are isolated by ownership: jobs, scheduled tasks, and new encrypted
-results are tagged with a hash of the presenting token. Legacy untagged result files
-remain visible to any authenticated operator.
+results are tagged with a hash of the presenting token.
+
 | `APP_HOST` | `127.0.0.1` | Bind address |
 | `APP_PORT` | `5000` | Listen port |
 | `MAX_CONCURRENT_SCANS` | `2` | Maximum concurrent scans |
@@ -253,6 +253,7 @@ remain visible to any authenticated operator.
 | `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
 | `RESULTS_MAX_FILES` | `500` | Max encrypted result files retained |
 | `RESULTS_MAX_AGE_DAYS` | `0` | Delete results older than N days (`0` = off) |
+| `LEGACY_RESULTS_SHARED` | `true` | Show pre-ownership result files to any auth operator; set `false` for multi-token isolation |
 | `STATE_DB_PATH` | `data/recon_operator.db` | SQLite for jobs + scheduled tasks |
 | `AI_REPORTS_MAX_DIRS` | `100` | Max CLI `ai_reports` run directories retained |
 | `AI_REPORTS_MAX_AGE_DAYS` | `0` | Delete CLI report dirs older than N days (`0` = off) |
@@ -268,6 +269,23 @@ remain visible to any authenticated operator.
 python decrypt.py encrypted_results/<result>.json
 python decrypt.py encrypted_results/<result>.json -o result.json
 ```
+
+### Ownership and migration (1.7+)
+
+New encrypted result filenames look like `o{12hex}_{target}_{type}_{timestamp}.json`,
+where `{12hex}` is the first 12 hex characters of `sha256(api_token)`. Jobs and scheduled
+task ids use the same owner hash prefix.
+
+| Situation | Behavior |
+| --- | --- |
+| Single token (default) | Same as before; new files get an owner prefix, all APIs work |
+| Multiple tokens | Each operator only sees their jobs, schedules, and owned result files |
+| Pre-1.7 result files (no `o…_` prefix) | Visible to any authenticated operator while `LEGACY_RESULTS_SHARED=true` |
+| Multi-token harden | Set `LEGACY_RESULTS_SHARED=false` to hide unowned legacy files |
+
+Clients that previously assumed `POST /scan` always returned the scan body should use
+`?wait=1` or poll `GET /jobs/<job_id>`. Cancel scripts should use the `task_id` returned
+from `POST /schedule` (now `o{owner}-target-type`).
 
 ## Docker notes
 

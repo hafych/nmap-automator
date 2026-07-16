@@ -26,4 +26,4 @@ source = [
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-fail_under = 58
+fail_under = 75
