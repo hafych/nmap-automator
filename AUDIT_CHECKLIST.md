@@ -218,7 +218,7 @@ Missing tools не устанавливались автоматически: э
 
 - [ ] Multi-user / scoped API keys.
 - [x] ~~Redis for multi-worker rate limits.~~ (job leases still open; SQLite covers single-node durable state)
-- [ ] Favicon/static asset caching after extracting inline UI assets.
+- [x] ~~Favicon/static asset caching after extracting inline UI assets.~~
 - [ ] Optional locale switch.
 - [ ] Rename GitHub repository path from `nmap-automator` → `recon-operator` (when ready).
 - [ ] CI browser E2E + axe-core.
@@ -238,7 +238,7 @@ Missing tools не устанавливались автоматически: э
 | DEP-001 | P2 | Tooling | Исправлено | coverage `7.13.5 → 7.15.0`; остальные Python pins актуальны |
 | CI-001 | P1 | CI runtime | Исправлено | checkout/setup-python обновлены до Node 24-compatible major v6 |
 | ENV-002 | P2 | Docker | Ограничение среды | Docker daemon требует owner-approved privileged network setup; config/static audit pass |
-| SEC-002 | P2 | CSP | Backlog | Self-contained UI требует `'unsafe-inline'`; рекомендован nonce/static split |
+| SEC-002 | P2 | CSP | Done | Static UI split + nonces/`'self'`; no `'unsafe-inline'` |
 | ARC-001 | P1 | Scaling | Backlog | Tasks и limiter находятся в process memory; подходит только single worker/operator |
 
 ## 8. Команды финальной перепроверки

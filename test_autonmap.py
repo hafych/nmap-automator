@@ -331,16 +331,34 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Recon Operator", body)
-        self.assertIn("observations", body)
         self.assertIn("Scan History", body)
-        self.assertIn("waitForJob", body)
         self.assertIn("Import XML", body)
         self.assertIn("Diff last two", body)
+        self.assertIn("/static/dashboard.css", body)
+        self.assertIn("/static/dashboard.js", body)
+        self.assertIn("/static/favicon.svg", body)
         self.assertNotIn("__CSP_NONCE__", body)
         self.assertIn('nonce="', body)
         csp = response.headers["Content-Security-Policy"]
         self.assertIn("nonce-", csp)
+        self.assertIn("'self'", csp)
         self.assertNotIn("unsafe-inline", csp)
+
+        js_response = await self.client.get("/static/dashboard.js")
+        js_body = await js_response.get_data(as_text=True)
+        self.assertEqual(js_response.status_code, 200)
+        self.assertIn("waitForJob", js_body)
+        self.assertIn("observations", js_body)
+        self.assertIn("public", js_response.headers.get("Cache-Control", ""))
+
+        css_response = await self.client.get("/static/dashboard.css")
+        css_body = await css_response.get_data(as_text=True)
+        self.assertEqual(css_response.status_code, 200)
+        self.assertIn(":focus-visible", css_body)
+
+        favicon = await self.client.get("/favicon.ico")
+        self.assertEqual(favicon.status_code, 200)
+        self.assertIn("public", favicon.headers.get("Cache-Control", ""))
 
     async def test_responses_include_security_headers(self):
         response = await self.client.get("/health")
@@ -646,8 +664,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('aria-selected="true"', body)
         self.assertIn('for="toolsBox"', body)
         self.assertIn('for="resultBox"', body)
-        self.assertIn(":focus-visible", body)
-        self.assertIn("refresh({ announce: false })", body)
+
+        css_response = await self.client.get("/static/dashboard.css")
+        css_body = await css_response.get_data(as_text=True)
+        self.assertIn(":focus-visible", css_body)
+
+        js_response = await self.client.get("/static/dashboard.js")
+        js_body = await js_response.get_data(as_text=True)
+        self.assertIn("refresh({ announce: false })", js_body)
 
 
 class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):

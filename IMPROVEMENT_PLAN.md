@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.9.1  
+**Текущая версия кода:** 1.9.2  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -174,8 +174,8 @@
 | ID | Задача | Детали | Effort |
 | --- | --- | --- | ---: |
 | P2-01 | ~~Разбить `autonmap.py` god-module~~ | `recon_operator/` package + leaf `config`/`auth`; jobs/scheduler/api still server-backed | L |
-| P2-02 | Static UI assets + cache headers | вынести CSS/JS из Python string | M |
-| P2-03 | Favicon + static asset pipeline | | S |
+| P2-02 | ~~Static UI assets + cache headers~~ | `static/dashboard.{css,js}` + public cache; HTML shell in `ui.py` | M |
+| P2-03 | ~~Favicon + static asset pipeline~~ | `static/favicon.svg` + `/favicon.ico` route | S |
 | P2-04 | Pin GitHub Actions by SHA | Dependabot updates digests | S |
 | P2-05 | Pin Compose image digests on publish | | S |
 | P2-06 | Key rotation for Fernet (multi-key) | encrypt new, decrypt old | M |
@@ -413,6 +413,7 @@
 | 2026-07-16 | 1.8.5 | P1-13 axe-core a11y + keyboard/ARIA/viewport e2e |
 | 2026-07-16 | 1.9.0 | P2-01 package boundary: `recon_operator/` + `autonmap` compatibility shim |
 | 2026-07-16 | 1.9.1 | P2-01 leaf extract: real `config` + `auth` modules; server re-exports |
+| 2026-07-16 | 1.9.2 | P2-02/03 static UI assets + favicon + cache headers |
 
 ---
 
