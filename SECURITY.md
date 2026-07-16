@@ -17,6 +17,17 @@ contact channel without disclosing the vulnerability.
 ## Deployment baseline
 
 - Keep `API_AUTH_REQUIRED=true` and use a randomly generated token.
+- Prefer named keys (`API_AUTH_KEYS`) with least-privilege scopes (`read` / `scan` / `admin`)
+  over a single shared admin token; revoke by setting `"revoked": true`.
+- For multi-token deploys, set `LEGACY_RESULTS_SHARED=false` so pre-ownership result files
+  are not visible to every operator.
+- Prefer an explicit `TARGET_ALLOWLIST` / `TARGET_ALLOWLIST_FILE` so scans cannot leave the
+  authorized engagement scope (IPs, CIDRs, hostnames, or `*.suffix` wildcards).
+- For multi-worker deploys set `REDIS_URL` so rate limits are shared; without it each process
+  enforces its own window.
+- Share `STATE_DB_PATH` (and preferably Redis) across workers so job leases prevent duplicate
+  scans and scheduler leadership avoids duplicate recurring schedules; set a distinct
+  `WORKER_ID` per process.
 - Bind to loopback unless a trusted reverse proxy or firewall restricts access.
 - Never publish `.env`, Fernet keys, API tokens, Telegram credentials, decrypted results, or
   assessment artifacts.

@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 import stat
 import tempfile
 import unittest
@@ -209,6 +210,26 @@ class CliValidationRegressionTests(unittest.TestCase):
         self.assertEqual(args.scan_timeout, 1)
         self.assertEqual(args.host_timeout, "500ms")
         self.assertEqual(args.max_retries, 0)
+
+    def test_report_retention_keeps_newest_dirs(self):
+        original_max = kali_ai_scan.AI_REPORTS_MAX_DIRS
+        kali_ai_scan.AI_REPORTS_MAX_DIRS = 2
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for index in range(4):
+                    path = root / f"report-{index}"
+                    path.mkdir()
+                    (path / "summary.md").write_text("x", encoding="utf-8")
+                    # Ensure deterministic mtime ordering.
+                    os.utime(path, (index + 1, index + 1))
+                summary = kali_ai_scan.apply_report_retention(root)
+                remaining = sorted(path.name for path in root.iterdir() if path.is_dir())
+        finally:
+            kali_ai_scan.AI_REPORTS_MAX_DIRS = original_max
+
+        self.assertEqual(summary["remaining"], 2)
+        self.assertEqual(remaining, ["report-2", "report-3"])
 
 
 if __name__ == "__main__":

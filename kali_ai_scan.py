@@ -32,6 +32,8 @@ TARGET_RE = re.compile(r"^[A-Za-z0-9_.:/,*?\[\]-]+$")
 NMAP_DURATION_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?:ms|s|m|h)?$")
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+AI_REPORTS_MAX_DIRS = int(os.getenv("AI_REPORTS_MAX_DIRS", "100"))
+AI_REPORTS_MAX_AGE_DAYS = int(os.getenv("AI_REPORTS_MAX_AGE_DAYS", "0"))
 
 
 def utc_now() -> str:
@@ -303,6 +305,35 @@ def write_markdown(path: Path, report: dict) -> None:
     _write_private_text(path, "\n".join(lines).rstrip() + "\n")
 
 
+def apply_report_retention(root: Path) -> dict:
+    """Delete old CLI report directories by count and optional age."""
+    if not root.is_dir():
+        return {"deleted": 0, "remaining": 0}
+
+    dirs = [path for path in root.iterdir() if path.is_dir()]
+    deleted = 0
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+
+    if AI_REPORTS_MAX_AGE_DAYS > 0:
+        max_age = AI_REPORTS_MAX_AGE_DAYS * 86400
+        for path in list(dirs):
+            try:
+                if now - path.stat().st_mtime > max_age:
+                    shutil.rmtree(path, ignore_errors=True)
+                    deleted += 1
+                    dirs.remove(path)
+            except OSError:
+                continue
+
+    dirs.sort(key=lambda path: path.stat().st_mtime)
+    max_dirs = max(1, AI_REPORTS_MAX_DIRS)
+    while len(dirs) > max_dirs:
+        path = dirs.pop(0)
+        shutil.rmtree(path, ignore_errors=True)
+        deleted += 1
+    return {"deleted": deleted, "remaining": len(dirs)}
+
+
 def create_artifacts(xml_path: Path, out_dir: Path, manifest_extra: dict = None) -> dict:
     report = parse_nmap_xml(xml_path)
     _ensure_private_directory(out_dir)
@@ -346,6 +377,10 @@ def create_artifacts(xml_path: Path, out_dir: Path, manifest_extra: dict = None)
         manifest.update(manifest_extra)
 
     write_json(manifest_path, manifest)
+    try:
+        apply_report_retention(out_dir.parent)
+    except OSError:
+        pass
     return manifest
 
 
