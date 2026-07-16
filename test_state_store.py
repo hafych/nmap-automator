@@ -172,6 +172,28 @@ class StateStoreTests(unittest.TestCase):
             store.release_leadership("scheduler", "worker-b")
             self.assertIsNone(store.get_leader("scheduler"))
 
+    def test_audit_events_append_list_and_prune(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "audit.db"))
+            for index in range(5):
+                store.append_audit_event(
+                    ts=f"t{index}",
+                    action="scan.create" if index % 2 == 0 else "scan.finish",
+                    actor_key_id="primary",
+                    actor_owner_prefix="abcd12345678",
+                    target="127.0.0.1",
+                    scan_type="Ping",
+                    job_id=f"job-{index}",
+                    max_events=3,
+                )
+            events = store.list_audit_events(limit=10)
+            self.assertEqual(len(events), 3)
+            self.assertEqual(events[0]["job_id"], "job-4")
+            only_create = store.list_audit_events(action="scan.create", limit=10)
+            self.assertTrue(all(row["action"] == "scan.create" for row in only_create))
+            by_actor = store.list_audit_events(actor_key_id="primary", limit=10)
+            self.assertEqual(len(by_actor), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

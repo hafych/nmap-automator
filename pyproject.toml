@@ -23,6 +23,7 @@ source = [
   "tool_inventory",
   "ui",
 ]
+# recon_operator package (config/auth/crypto/server) is included via "recon_operator"
 
 [tool.coverage.report]
 show_missing = true

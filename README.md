@@ -200,6 +200,7 @@ curl http://127.0.0.1:5000/openapi.json
 | `POST` | `/schedule` | Recurring scan |
 | `GET` | `/tasks` | List scheduled tasks |
 | `DELETE` | `/tasks/<id>` | Cancel a scheduled task |
+| `GET` | `/audit` | Recent audit events (admin; no secrets) |
 | `GET` | `/results` | List encrypted result files |
 | `GET` | `/results/<id>` | Decrypt and return a stored result |
 | `POST` | `/results/import` | Import Nmap XML into encrypted history |
@@ -232,7 +233,10 @@ This is not a multi-tenant authorization system. See [SECURITY.md](SECURITY.md).
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
-| `FERNET_KEY` | required | Key used to encrypt stored results |
+| `FERNET_KEY` | required | Primary key used to encrypt stored results |
+| `FERNET_PREVIOUS_KEYS` | empty | Optional retired Fernet keys (comma/JSON) for decrypt-only rotation |
+| `AUDIT_LOG_PATH` | empty | Optional JSONL mirror of audit events (SQLite always records) |
+| `AUDIT_LOG_MAX_EVENTS` | `10000` | Max retained SQLite audit rows |
 | `API_AUTH_TOKEN` | required* | Primary token expected in the API authentication header |
 | `API_AUTH_TOKENS` | empty | Optional extra tokens (comma list or JSON array); full admin access |
 | `API_AUTH_KEYS` | empty | Optional named keys JSON: `id`, `label`, `token`, `scopes`, `created_at`, `revoked` |

@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -237,6 +237,14 @@ HOST_TIMEOUT_SEC = _parse_int_env("NMAP_HOST_TIMEOUT_SEC", default=300, min_valu
 NMAP_MAX_RETRIES = _parse_int_env("NMAP_MAX_RETRIES", default=2, min_value=0, max_value=10)
 
 FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
+# Comma-separated or JSON array of retired Fernet keys (decrypt-only rotation).
+FERNET_PREVIOUS_KEYS_RAW = os.getenv("FERNET_PREVIOUS_KEYS", "").strip()
+
+# Optional append-only audit log path (JSON lines). Empty = SQLite-only via state store.
+AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "").strip()
+AUDIT_LOG_MAX_EVENTS = _parse_int_env(
+    "AUDIT_LOG_MAX_EVENTS", default=10_000, min_value=100, max_value=1_000_000
+)
 
 # Runtime symbols still owned by server; keep package surface stable.
 _SERVER_RUNTIME_EXPORTS = frozenset({"app", "state_store", "scan_jobs", "scan_tasks"})

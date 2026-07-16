@@ -61,6 +61,7 @@ class DecryptTests(unittest.TestCase):
 
             original_argv = sys.argv
             original_key = os.environ.get("FERNET_KEY")
+            original_prev = os.environ.pop("FERNET_PREVIOUS_KEYS", None)
             sys.argv = ["decrypt.py", str(encrypted_path)]
             os.environ["FERNET_KEY"] = wrong_key.decode()
             stderr = io.StringIO()
@@ -73,7 +74,44 @@ class DecryptTests(unittest.TestCase):
                     os.environ.pop("FERNET_KEY", None)
                 else:
                     os.environ["FERNET_KEY"] = original_key
+                if original_prev is None:
+                    os.environ.pop("FERNET_PREVIOUS_KEYS", None)
+                else:
+                    os.environ["FERNET_PREVIOUS_KEYS"] = original_prev
 
             self.assertEqual(exit_code, 1)
             self.assertIn("wrong FERNET_KEY", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_cli_decrypts_with_previous_key(self):
+        old_key = Fernet.generate_key()
+        new_key = Fernet.generate_key()
+        plaintext = '{"rotated": true}\n'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            encrypted_path = Path(tmp) / "legacy.enc"
+            encrypted_path.write_bytes(Fernet(old_key).encrypt(plaintext.encode()))
+
+            original_argv = sys.argv
+            original_key = os.environ.get("FERNET_KEY")
+            original_prev = os.environ.get("FERNET_PREVIOUS_KEYS")
+            sys.argv = ["decrypt.py", str(encrypted_path)]
+            os.environ["FERNET_KEY"] = new_key.decode()
+            os.environ["FERNET_PREVIOUS_KEYS"] = old_key.decode()
+            stdout = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout):
+                    exit_code = decrypt.cli()
+            finally:
+                sys.argv = original_argv
+                if original_key is None:
+                    os.environ.pop("FERNET_KEY", None)
+                else:
+                    os.environ["FERNET_KEY"] = original_key
+                if original_prev is None:
+                    os.environ.pop("FERNET_PREVIOUS_KEYS", None)
+                else:
+                    os.environ["FERNET_PREVIOUS_KEYS"] = original_prev
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stdout.getvalue().rstrip("\n"), plaintext.rstrip("\n"))
