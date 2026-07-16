@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from importlib import import_module
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -258,7 +259,7 @@ _SERVER_RUNTIME_EXPORTS = frozenset({"app", "state_store", "scan_jobs", "scan_ta
 
 def __getattr__(name: str) -> Any:
     if name in _SERVER_RUNTIME_EXPORTS:
-        from recon_operator import server as _server
+        _server = import_module("recon_operator.server")
 
         return getattr(_server, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

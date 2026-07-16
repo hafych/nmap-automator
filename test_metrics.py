@@ -23,10 +23,10 @@ class MetricsRegistryTests(unittest.TestCase):
         reg.inc("recon_operator_jobs_created_total", kind="immediate")
         reg.inc("recon_operator_jobs_finished_total", status="completed", scan_type="Ping")
         reg.set_gauge("recon_operator_jobs_queued", 2)
-        reg.observe("recon_operator_scan_duration_seconds", 2.5, scan_type="Ping", status="completed")
-        text = reg.render_prometheus(
-            info_labels={"version": "test", "product": "Recon Operator"}
+        reg.observe(
+            "recon_operator_scan_duration_seconds", 2.5, scan_type="Ping", status="completed"
         )
+        text = reg.render_prometheus(info_labels={"version": "test", "product": "Recon Operator"})
         self.assertIn("# TYPE recon_operator_jobs_created_total counter", text)
         self.assertIn('recon_operator_jobs_created_total{kind="immediate"} 1', text)
         self.assertIn(

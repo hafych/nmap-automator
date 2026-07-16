@@ -496,28 +496,48 @@ class StateStore:
         actor_key_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 1000))
-        clauses: List[str] = []
         params: List[Any] = []
-        if action:
-            clauses.append("action = ?")
-            params.append(action)
-        if actor_key_id:
-            clauses.append("actor_key_id = ?")
-            params.append(actor_key_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                f"""
+        if action and actor_key_id:
+            query = """
                 SELECT id, ts, action, actor_key_id, actor_owner_prefix, target, scan_type,
                        job_id, task_id, result_file, status, detail
                 FROM audit_events
-                {where}
+                WHERE action = ? AND actor_key_id = ?
                 ORDER BY id DESC
                 LIMIT ?
-                """,
-                params,
-            ).fetchall()
+            """
+            params.extend((action, actor_key_id))
+        elif action:
+            query = """
+                SELECT id, ts, action, actor_key_id, actor_owner_prefix, target, scan_type,
+                       job_id, task_id, result_file, status, detail
+                FROM audit_events
+                WHERE action = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """
+            params.append(action)
+        elif actor_key_id:
+            query = """
+                SELECT id, ts, action, actor_key_id, actor_owner_prefix, target, scan_type,
+                       job_id, task_id, result_file, status, detail
+                FROM audit_events
+                WHERE actor_key_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """
+            params.append(actor_key_id)
+        else:
+            query = """
+                SELECT id, ts, action, actor_key_id, actor_owner_prefix, target, scan_type,
+                       job_id, task_id, result_file, status, detail
+                FROM audit_events
+                ORDER BY id DESC
+                LIMIT ?
+            """
+        params.append(limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
     @staticmethod

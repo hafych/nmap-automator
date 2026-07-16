@@ -204,9 +204,7 @@ def evaluate_posture(
                         "port": port,
                         "proto": proto,
                         "service": name,
-                        "advice": (
-                            f"Unexpected open {proto}/{port} ({name}) vs expected posture."
-                        ),
+                        "advice": (f"Unexpected open {proto}/{port} ({name}) vs expected posture."),
                     }
                 )
 

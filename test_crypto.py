@@ -37,7 +37,9 @@ class CryptoRotationTests(unittest.TestCase):
         self.assertEqual(keys, [primary, previous])
 
     def test_load_rejects_missing_primary(self):
-        with mock.patch.dict(os.environ, {"FERNET_KEY": "", "FERNET_PREVIOUS_KEYS": ""}, clear=False):
+        with mock.patch.dict(
+            os.environ, {"FERNET_KEY": "", "FERNET_PREVIOUS_KEYS": ""}, clear=False
+        ):
             with self.assertRaisesRegex(RuntimeError, "FERNET_KEY"):
                 load_fernet_key_material()
 

@@ -760,7 +760,12 @@ def run_nmap_scan(
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip()
             # Negative or signalled exits after cancel.
-            if process_token and completed.returncode in (-signal.SIGTERM, -signal.SIGKILL, 137, 143):
+            if process_token and completed.returncode in (
+                -signal.SIGTERM,
+                -signal.SIGKILL,
+                137,
+                143,
+            ):
                 raise ScanCancelledError("Scan process terminated by cancel")
             suffix = f": {detail}" if detail else ""
             raise NmapScanError(f"nmap exited with status {completed.returncode}{suffix}")
