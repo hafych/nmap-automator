@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.9.4  
+**Текущая версия кода:** 1.9.5  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -183,12 +183,12 @@
 | P2-08 | ~~Trusted reverse-proxy mode~~ | `TRUSTED_PROXY_MODE` + `TRUSTED_PROXIES` allowlist | S |
 | P2-09 | GitNexus PDG/taint pass | security review automation | S |
 | P2-10 | Structured logging (JSON optional) | correlation id per job | M |
-| P2-11 | Metrics endpoint (Prometheus) | jobs active, scan duration, errors | M |
+| P2-11 | ~~Metrics endpoint (Prometheus)~~ | `GET /metrics` text exposition; job/scan series | M |
 | P2-12 | Webhooks (Slack/Discord/generic) | richer than Telegram-only | M |
 | P2-13 | Package as installable CLI | `recon-operator serve|scan|plan|inventory` | M |
 | P2-14 | Entry rename / dual entry | keep `autonmap.py` alias | S |
 
-**Критерий done P2:** модульная структура, static UI, digests pinned, audit trail, optional metrics.
+**Критерий done P2:** модульная структура, static UI, digests pinned, audit trail, metrics (`/metrics`) — **met in 1.9.5**.
 
 ---
 
@@ -416,6 +416,7 @@
 | 2026-07-16 | 1.9.2 | P2-02/03 static UI assets + favicon + cache headers |
 | 2026-07-16 | 1.9.3 | P2-04/05/08: pin GHA+redis digests; trusted proxy mode |
 | 2026-07-16 | 1.9.4 | P2-06/07: Fernet multi-key rotation + audit log |
+| 2026-07-16 | 1.9.5 | P2-11: Prometheus `/metrics` (Release F / P2 done bar) |
 
 ---
 

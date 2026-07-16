@@ -30,6 +30,7 @@ from telegram.error import TelegramError
 from recon_operator import auth as _auth
 from recon_operator import config as _config
 from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
+from recon_operator.metrics import METRICS
 from recon_planner import build_recon_plan, recon_plan_to_jsonl, recon_plan_to_markdown
 from scan_engine import (
     PRODUCT_NAME,
@@ -699,8 +700,12 @@ def check_rate_limit() -> bool:
     bucket = _rate_limit_bucket_key()
     client = _get_redis_client()
     if client is not None:
-        return _check_rate_limit_redis(client, bucket)
-    return _check_rate_limit_memory(bucket)
+        allowed = _check_rate_limit_redis(client, bucket)
+    else:
+        allowed = _check_rate_limit_memory(bucket)
+    if not allowed:
+        METRICS.inc("recon_operator_rate_limit_exceeded_total")
+    return allowed
 
 
 def _bool_query_param(name: str, default: bool = False) -> bool:
@@ -1107,16 +1112,47 @@ async def _prune_jobs_locked() -> None:
                 log_event(f"Failed to delete persisted job {job['job_id']}: {exc}")
 
 
+_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "timeout"})
+
+
+def _note_job_terminal_metrics(job: Dict[str, Any], *, previous_status: Any, status: str) -> None:
+    """Record finish counter + duration once when a job first becomes terminal."""
+    if status not in _TERMINAL_JOB_STATUSES:
+        return
+    if previous_status in _TERMINAL_JOB_STATUSES:
+        return
+    scan_type = str(job.get("scan_type") or "unknown")
+    METRICS.inc(
+        "recon_operator_jobs_finished_total",
+        status=str(status),
+        scan_type=scan_type,
+    )
+    started_mono = job.get("_metrics_started_mono")
+    if isinstance(started_mono, (int, float)):
+        METRICS.observe(
+            "recon_operator_scan_duration_seconds",
+            max(0.0, time.monotonic() - float(started_mono)),
+            scan_type=scan_type,
+            status=str(status),
+        )
+
+
 async def _set_job_fields(job_id: str, **fields: Any) -> None:
     async with _jobs_lock:
         job = scan_jobs.get(job_id)
         if not job:
             return
+        previous_status = job.get("status")
         job.update(fields)
         # Clear lease markers on terminal states.
-        if fields.get("status") in {"completed", "failed", "cancelled", "timeout"}:
+        if fields.get("status") in _TERMINAL_JOB_STATUSES:
             job["lease_owner"] = None
             job["lease_until"] = None
+            _note_job_terminal_metrics(
+                job,
+                previous_status=previous_status,
+                status=str(fields.get("status") or "unknown"),
+            )
         _persist_job(job)
 
 
@@ -1173,6 +1209,12 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
     try:
         heartbeat = asyncio.create_task(_lease_heartbeat())
         async with _get_scan_semaphore():
+            await _set_job_fields(
+                job_id,
+                status="running",
+                started_at=_utc_now_iso(),
+                _metrics_started_mono=time.monotonic(),
+            )
             results = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
@@ -1408,6 +1450,7 @@ async def create_scan_job(
         # Low-latency local attempt; claim ensures only one worker executes.
         task = asyncio.create_task(_run_scan_job(job_id))
         job["task"] = task
+        METRICS.inc("recon_operator_jobs_created_total", kind=str(kind or "immediate"))
         record_audit_event(
             "scan.create",
             target=target,
@@ -1571,14 +1614,18 @@ async def cancel_job(job_id: str):
                 scan_jobs[job_id] = job
         if not job or not job_visible_to_owner(job):
             return jsonify({"error": "Job not found"}), 404
-        if job["status"] in {"completed", "failed", "cancelled", "timeout"}:
+        if job["status"] in _TERMINAL_JOB_STATUSES:
             return jsonify({"message": f"Job already {job['status']}", "job_id": job_id}), 200
         task = job.get("task")
+        previous_status = job.get("status")
         job["status"] = "cancelled"
         job["finished_at"] = _utc_now_iso()
         job["error"] = "Scan cancelled"
         job["lease_owner"] = None
         job["lease_until"] = None
+        _note_job_terminal_metrics(
+            job, previous_status=previous_status, status="cancelled"
+        )
         if task is not None and not task.done():
             task.cancel()
         _persist_job(job)
@@ -2303,7 +2350,36 @@ def _check_nmap_available() -> bool:
         return False
 
 
+def _job_status_gauges() -> Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float]:
+    """Live gauges derived from in-memory job/task tables (for /metrics scrape)."""
+    queued = 0
+    running = 0
+    known = 0
+    for job in scan_jobs.values():
+        known += 1
+        status = job.get("status")
+        if status == "queued":
+            queued += 1
+        elif status == "running":
+            running += 1
+    return {
+        ("recon_operator_jobs_queued", ()): float(queued),
+        ("recon_operator_jobs_running", ()): float(running),
+        ("recon_operator_jobs_known", ()): float(known),
+        ("recon_operator_scheduled_tasks", ()): float(len(scan_tasks)),
+    }
+
+
+def render_metrics_text() -> str:
+    """Prometheus text body for the scrape endpoint."""
+    return METRICS.render_prometheus(
+        extra_gauges=_job_status_gauges(),
+        info_labels={"version": VERSION, "product": PRODUCT_NAME},
+    )
+
+
 def _health_payload(*, nmap_available: bool) -> dict:
+    gauges = _job_status_gauges()
     return {
         "status": "healthy" if nmap_available else "unhealthy",
         "product": PRODUCT_NAME,
@@ -2311,6 +2387,9 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "ready": nmap_available,
         "live": True,
         "tasks_count": len(scan_tasks),
+        "jobs_queued": int(gauges[("recon_operator_jobs_queued", ())]),
+        "jobs_running": int(gauges[("recon_operator_jobs_running", ())]),
+        "metrics_path": "/metrics",
         "telegram_configured": bot is not None,
         "uptime": str(_utc_now() - start_time),
         "fernet_key_configured": bool(FERNET_KEY),
@@ -2370,6 +2449,20 @@ async def readiness():
         "state_db": STATE_DB_PATH,
     }
     return jsonify(payload), 200 if nmap_available else 503
+
+
+@app.route("/metrics", methods=["GET"])
+async def metrics_endpoint():
+    """Prometheus text exposition (no secrets). Safe for local scrapers."""
+    body = render_metrics_text()
+    return (
+        body,
+        200,
+        {
+            "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.route("/health", methods=["GET"])
@@ -2520,6 +2613,17 @@ def build_openapi_spec() -> dict:
                     "responses": {
                         "200": {"description": "Healthy / ready"},
                         "503": {"description": "Unhealthy / not ready"},
+                    },
+                }
+            },
+            "/metrics": {
+                "get": {
+                    "summary": "Prometheus metrics scrape",
+                    "security": [],
+                    "responses": {
+                        "200": {
+                            "description": "Prometheus text exposition (jobs, scans, rates)"
+                        }
                     },
                 }
             },
@@ -2800,7 +2904,12 @@ async def api_docs():
             "product": PRODUCT_NAME,
             "version": VERSION,
             "openapi": "/openapi.json",
-            "probes": {"live": "/live", "ready": "/ready", "health": "/health"},
+            "probes": {
+                "live": "/live",
+                "ready": "/ready",
+                "health": "/health",
+                "metrics": "/metrics",
+            },
             "security": {
                 "api_auth_required": API_AUTH_REQUIRED,
                 "api_auth_header": API_AUTH_HEADER,
@@ -2891,6 +3000,10 @@ async def api_docs():
                 "GET /live": {"description": "Liveness probe (always 200 when process is up)"},
                 "GET /ready": {"description": "Readiness probe (503 when Nmap missing)"},
                 "GET /health": {"description": "Detailed health snapshot"},
+                "GET /metrics": {
+                    "description": "Prometheus text metrics (jobs queued/running, finish totals, durations)",
+                    "auth": "none (scrape; bind loopback or firewall in production)",
+                },
                 "GET /openapi.json": {"description": "OpenAPI 3 schema"},
                 "GET /tools": {
                     "description": "Inventory of Kali/pentest tools across recon categories",
