@@ -11,6 +11,7 @@ import json
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from recon_planner import build_recon_plan
+from scan_engine import diff_scan_results
 
 SCHEMA_VERSION = "recon-ai-pack/v1"
 
@@ -28,6 +29,8 @@ _BUDGET_LIMITS = {
         "max_gap": 4,
         "max_defense": 6,
         "max_ask": 3,
+        "max_inv": 6,
+        "max_changes": 8,
         "include_plan": True,
         "include_defense": True,
         "prefer_ready_next": True,
@@ -40,6 +43,8 @@ _BUDGET_LIMITS = {
         "max_gap": 12,
         "max_defense": 16,
         "max_ask": 5,
+        "max_inv": 16,
+        "max_changes": 24,
         "include_plan": True,
         "include_defense": True,
         "prefer_ready_next": False,
@@ -52,6 +57,8 @@ _BUDGET_LIMITS = {
         "max_gap": 40,
         "max_defense": 40,
         "max_ask": 8,
+        "max_inv": 40,
+        "max_changes": 80,
         "include_plan": True,
         "include_defense": True,
         "prefer_ready_next": False,
@@ -372,6 +379,13 @@ def build_ai_pack_rows(
             )
             gap_count += 1
 
+        # Inventory delta: only packages relevant to open-service plan steps.
+        inv_rows = _inventory_delta_rows(
+            recommendations,
+            max_rows=int(limits["max_inv"]),
+        )
+        rows.extend(inv_rows)
+
     # Clarifying questions (cheap, capped).
     ask_rows: List[Dict[str, Any]] = []
     if services:
@@ -508,6 +522,132 @@ def pack_to_json(rows: Sequence[Dict[str, Any]]) -> str:
     return json.dumps({"schema": SCHEMA_VERSION, "rows": list(rows)}, ensure_ascii=False)
 
 
+def _inventory_delta_rows(
+    recommendations: Sequence[Dict[str, Any]], *, max_rows: int
+) -> List[Dict[str, Any]]:
+    """Compact package readiness rows only for tools tied to open services."""
+    rows: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for rec in recommendations:
+        if not isinstance(rec, dict):
+            continue
+        package = str(rec.get("package") or rec.get("tool") or "").strip()
+        if not package or package in seen:
+            continue
+        seen.add(package)
+        status = str(rec.get("status") or "unknown")
+        rows.append(
+            {
+                "t": "inv",
+                "package": package,
+                "tool": rec.get("tool"),
+                "status": status,
+                "service": rec.get("service"),
+                "reason": f"relevant to open {rec.get('service') or 'service'}",
+            }
+        )
+        if len(rows) >= max_rows:
+            break
+    return rows
+
+
+def _change_finding_id(kind: str, host: str, protocol: str, port: int) -> str:
+    host_part = "".join(ch for ch in host if ch.isalnum())[:8] or "host"
+    return f"C-{kind[:3].upper()}-{host_part}-{protocol}{port}"
+
+
+def build_retest_pack_rows(
+    baseline: Dict[str, Any],
+    current: Dict[str, Any],
+    *,
+    budget: str = "s",
+    inventory: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Compact retest brief: current open services + defense + diff-focused changes."""
+    if not isinstance(baseline, dict) or not isinstance(current, dict):
+        raise ValueError("baseline and current must be parsed scan objects")
+    budget_key = normalize_budget(budget)
+    limits = _BUDGET_LIMITS[budget_key]
+    diff = diff_scan_results(baseline, current)
+
+    # Start from current pack (open services, findings, defense, next/gap).
+    rows = build_ai_pack_rows(current, budget=budget, inventory=inventory)
+    if rows and rows[0].get("t") == "meta":
+        meta = dict(rows[0])
+        meta["mode"] = "retest"
+        meta["usage"] = "Retest brief: prioritize t=change and t=diff; full archive via /results"
+        summary = diff.get("summary") if isinstance(diff.get("summary"), dict) else {}
+        meta["diff_changed"] = bool(summary.get("changed"))
+        meta["ports_opened"] = int(summary.get("ports_opened") or 0)
+        meta["ports_closed"] = int(summary.get("ports_closed") or 0)
+        rows[0] = meta
+
+    # Insert diff summary + change rows after meta.
+    insert_at = 1
+    diff_row = {
+        "t": "diff",
+        "changed": bool((diff.get("summary") or {}).get("changed")),
+        "hosts_added": len(diff.get("hosts_added") or []),
+        "hosts_removed": len(diff.get("hosts_removed") or []),
+        "ports_opened": len(diff.get("ports_opened") or []),
+        "ports_closed": len(diff.get("ports_closed") or []),
+    }
+    change_rows: List[Dict[str, Any]] = []
+    for item in diff.get("ports_opened") or []:
+        if not isinstance(item, dict):
+            continue
+        host = str(item.get("host") or "")
+        protocol = str(item.get("protocol") or "tcp")
+        try:
+            port = int(item.get("port"))
+        except (TypeError, ValueError):
+            continue
+        change_rows.append(
+            {
+                "t": "change",
+                "op": "opened",
+                "id": _change_finding_id("open", host, protocol, port),
+                "host": host,
+                "port": port,
+                "proto": protocol,
+                "service": item.get("service") or item.get("name") or "unknown",
+            }
+        )
+        if len(change_rows) >= int(limits["max_changes"]):
+            break
+    if len(change_rows) < int(limits["max_changes"]):
+        for item in diff.get("ports_closed") or []:
+            if not isinstance(item, dict):
+                continue
+            host = str(item.get("host") or "")
+            protocol = str(item.get("protocol") or "tcp")
+            try:
+                port = int(item.get("port"))
+            except (TypeError, ValueError):
+                continue
+            change_rows.append(
+                {
+                    "t": "change",
+                    "op": "closed",
+                    "id": _change_finding_id("cls", host, protocol, port),
+                    "host": host,
+                    "port": port,
+                    "proto": protocol,
+                    "service": item.get("service") or item.get("name") or "unknown",
+                }
+            )
+            if len(change_rows) >= int(limits["max_changes"]):
+                break
+
+    rows = rows[:insert_at] + [diff_row] + change_rows + rows[insert_at:]
+    if budget_key == "s":
+        rows = _apply_budget_s_hard_caps(rows)
+        if rows and rows[0].get("t") == "meta":
+            rows[0] = dict(rows[0])
+            rows[0]["mode"] = "retest"
+    return rows
+
+
 def build_ai_pack(
     scan: Dict[str, Any],
     *,
@@ -518,18 +658,73 @@ def build_ai_pack(
     result_id: Optional[str] = None,
     plan: Optional[Dict[str, Any]] = None,
     include_closed: bool = False,
+    baseline: Optional[Dict[str, Any]] = None,
+    mode: Optional[str] = None,
 ) -> Tuple[str, str, List[Dict[str, Any]]]:
-    """Return (body, content_type, rows)."""
-    rows = build_ai_pack_rows(
-        scan,
-        budget=budget,
-        inventory=inventory,
-        include_closed=include_closed,
-        job_id=job_id,
-        result_id=result_id,
-        plan=plan,
-    )
+    """Return (body, content_type, rows).
+
+    When ``mode=retest`` or ``baseline`` is provided, builds a retest-oriented pack.
+    """
+    mode_key = str(mode or "").strip().lower()
+    if baseline is not None or mode_key in {"retest", "diff"}:
+        if baseline is None:
+            raise ValueError("retest mode requires baseline scan object")
+        rows = build_retest_pack_rows(
+            baseline, scan, budget=budget, inventory=inventory
+        )
+    else:
+        rows = build_ai_pack_rows(
+            scan,
+            budget=budget,
+            inventory=inventory,
+            include_closed=include_closed,
+            job_id=job_id,
+            result_id=result_id,
+            plan=plan,
+        )
     fmt = str(format or "jsonl").strip().lower()
     if fmt in {"json", "application/json"}:
         return pack_to_json(rows), "application/json; charset=utf-8", rows
     return pack_to_ndjson(rows), "application/x-ndjson; charset=utf-8", rows
+
+
+def pack_from_json_file(
+    path: str,
+    *,
+    budget: str = "s",
+    inventory: Optional[Dict[str, Any]] = None,
+    format: str = "jsonl",
+    baseline_path: Optional[str] = None,
+) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """Offline helper: load scan JSON from disk and build a pack (CLI path)."""
+    from pathlib import Path
+
+    text = Path(path).read_text(encoding="utf-8")
+    scan = json.loads(text)
+    if not isinstance(scan, dict):
+        raise ValueError("scan file must contain a JSON object")
+    # Allow {scan: {...}} wrappers.
+    if "hosts" not in scan and isinstance(scan.get("scan"), dict):
+        scan = scan["scan"]
+    if "hosts" not in scan and isinstance(scan.get("result"), dict):
+        scan = scan["result"]
+    baseline = None
+    if baseline_path:
+        base_raw = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+        if isinstance(base_raw, dict):
+            if "hosts" in base_raw:
+                baseline = base_raw
+            elif isinstance(base_raw.get("scan"), dict):
+                baseline = base_raw["scan"]
+            elif isinstance(base_raw.get("result"), dict):
+                baseline = base_raw["result"]
+        if baseline is None:
+            raise ValueError("baseline file must contain a parsed scan object")
+    return build_ai_pack(
+        scan,
+        budget=budget,
+        inventory=inventory,
+        format=format,
+        baseline=baseline,
+        mode="retest" if baseline is not None else None,
+    )

@@ -32,15 +32,43 @@ curl -sS -H "X-API-KEY: $API_TOKEN" \
 
 | Budget | Use |
 | --- | --- |
-| `s` (default) | One LLM turn / brief |
-| `m` | Session context (more next/gap/defense rows; still no closed-port noise) |
+| `s` (default) | One LLM turn / brief (hard cap ≤4 KiB and ≤100 lines) |
+| `m` | Session context (more next/gap/defense/inv rows; still no closed-port noise) |
 | `l` or `detail=full` | Larger pack when needed; full archive remains `GET /results/<id>` |
 
 ### Line types (`t`)
 
-`meta`, `host`, `svc`, `finding`, `next`, `gap`, `defense`, `ask`
+`meta`, `host`, `svc`, `finding`, `next`, `gap`, `inv`, `defense`, `ask`, and for retest: `diff`, `change`
 
 Schema: `recon-ai-pack/v1`.
+
+### Retest (baseline vs current)
+
+```bash
+curl -sS -X POST "http://127.0.0.1:5000/ai/pack?mode=retest&budget=s" \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"baseline":{...},"scan":{...}}'
+```
+
+Offline CLI (no server):
+
+```bash
+python -m recon_operator pack current.json --budget s
+python -m recon_operator pack current.json --baseline baseline.json --budget s
+python -m recon_operator presets
+```
+
+### Engagement presets
+
+```bash
+curl -sS -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/presets
+curl -sS -X POST http://127.0.0.1:5000/scan \
+  -H "X-API-KEY: $API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"target":"127.0.0.1","preset":"map"}'
+```
+
+Ordered phases: `discovery` → `map` → `safe` (plus `depth` / `vuln` / `hybrid`).
 
 ## Agent rules (short)
 

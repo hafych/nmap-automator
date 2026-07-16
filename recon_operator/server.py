@@ -32,6 +32,12 @@ from recon_operator import config as _config
 from recon_operator.ai_pack import build_ai_pack, normalize_budget
 from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 from recon_operator.metrics import METRICS
+from recon_operator.presets import (
+    PHASE_ORDER,
+    apply_preset_to_payload,
+    list_presets,
+    next_phase,
+)
 from recon_planner import build_recon_plan, recon_plan_to_jsonl, recon_plan_to_markdown
 from scan_engine import (
     PRODUCT_NAME,
@@ -119,6 +125,7 @@ FERNET_KEY = _config.FERNET_KEY
 FERNET_PREVIOUS_KEYS_RAW = _config.FERNET_PREVIOUS_KEYS_RAW
 AUDIT_LOG_PATH = _config.AUDIT_LOG_PATH
 AUDIT_LOG_MAX_EVENTS = _config.AUDIT_LOG_MAX_EVENTS
+METRICS_AUTH_REQUIRED = _config.METRICS_AUTH_REQUIRED
 
 # --- Auth surface (source of truth: recon_operator.auth) ---
 API_KEY_SCOPES = _auth.API_KEY_SCOPES
@@ -1512,6 +1519,24 @@ async def async_scan(
             await asyncio.sleep(0.05)
 
 
+@app.route("/presets", methods=["GET"])
+async def presets_list():
+    """List named recon presets / ordered engagement phases."""
+    auth_error = require_api_auth("read")
+    if auth_error:
+        return auth_error
+    return (
+        jsonify(
+            {
+                "phases": PHASE_ORDER,
+                "presets": list_presets(),
+                "usage": 'POST /scan with {"target":"...","preset":"map"}',
+            }
+        ),
+        200,
+    )
+
+
 @app.route("/scan", methods=["POST"])
 async def start_scan():
     try:
@@ -1523,12 +1548,19 @@ async def start_scan():
             return jsonify({"error": "Rate limit exceeded"}), 429
 
         data = await request.get_json(silent=True)
+        data, preset_error = apply_preset_to_payload(data if isinstance(data, dict) else None)
+        if preset_error:
+            return jsonify({"error": preset_error}), 400
         target, scan_type, _, ports, scripts, discovery, error = _validate_scan_payload(data)
         if error:
             return jsonify({"error": error}), 400
 
         wait = _bool_query_param("wait", False)
-        log_event(f"Scan requested: {target}, type={scan_type}, wait={wait}")
+        preset_id = (data or {}).get("preset")
+        log_event(
+            f"Scan requested: {target}, type={scan_type}, wait={wait}"
+            + (f", preset={preset_id}" if preset_id else "")
+        )
 
         if wait:
             try:
@@ -1545,7 +1577,15 @@ async def start_scan():
             except Exception as e:
                 log_event(f"API error in /scan wait mode: {e}")
                 return jsonify({"error": "Internal scan error"}), 500
-            return jsonify(results or {"message": "Scan completed with no results"}), 200
+            payload = results or {"message": "Scan completed with no results"}
+            if isinstance(payload, dict) and preset_id:
+                payload = dict(payload)
+                payload["preset"] = preset_id
+                payload["preset_phase"] = (data or {}).get("preset_phase")
+                nxt = next_phase(str(preset_id))
+                if nxt:
+                    payload["next_preset"] = nxt
+            return jsonify(payload), 200
 
         job = await create_scan_job(
             target,
@@ -1556,6 +1596,17 @@ async def start_scan():
             discovery=discovery,
             owner_id=current_owner_id(),
         )
+        if preset_id and isinstance(job, dict):
+            job = dict(job)
+            job["preset"] = preset_id
+            job["preset_phase"] = (data or {}).get("preset_phase")
+            job["scan_type"] = scan_type
+            job["ports"] = ports
+            job["scripts"] = scripts
+            job["discovery"] = discovery
+            nxt = next_phase(str(preset_id))
+            if nxt:
+                job["next_preset"] = nxt
         return jsonify(job), 202
     except Exception as e:
         err = f"API error in /scan: {e}"
@@ -2370,12 +2421,44 @@ async def ai_pack():
 
     result_id = (request.args.get("result_id") or request.args.get("id") or "").strip() or None
     job_id = (request.args.get("job_id") or "").strip() or None
+    mode = (request.args.get("mode") or body.get("mode") or "").strip().lower() or None
     scan, error, resolved_result_id, resolved_job_id = await _resolve_scan_for_pack(
         body=body, result_id=result_id, job_id=job_id
     )
     if error:
         status = 404 if "not found" in error.lower() else 400
         return jsonify({"error": error}), status
+
+    baseline = None
+    if mode in {"retest", "diff"} or body.get("baseline") is not None:
+        base_ref = body.get("baseline")
+        if isinstance(base_ref, dict) and isinstance(base_ref.get("hosts"), list):
+            baseline = base_ref
+        elif isinstance(base_ref, dict) and (
+            base_ref.get("result_id") or base_ref.get("id") or base_ref.get("job_id")
+        ):
+            baseline, base_err, _, _ = await _resolve_scan_for_pack(
+                body=base_ref,
+                result_id=(base_ref.get("result_id") or base_ref.get("id")),
+                job_id=base_ref.get("job_id"),
+            )
+            if base_err:
+                return jsonify({"error": f"baseline: {base_err}"}), 400
+        elif isinstance(base_ref, str) and base_ref.strip():
+            baseline, base_err, _, _ = await _resolve_scan_for_pack(
+                body={}, result_id=base_ref.strip()
+            )
+            if base_err:
+                return jsonify({"error": f"baseline: {base_err}"}), 400
+        elif request.args.get("baseline_id"):
+            baseline, base_err, _, _ = await _resolve_scan_for_pack(
+                body={}, result_id=request.args.get("baseline_id")
+            )
+            if base_err:
+                return jsonify({"error": f"baseline: {base_err}"}), 400
+        if baseline is None:
+            return jsonify({"error": "retest mode requires baseline scan or baseline_id"}), 400
+        mode = mode or "retest"
 
     inventory = await asyncio.to_thread(
         get_cached_tool_inventory, expand=_bool_query_param("expand", False)
@@ -2390,6 +2473,8 @@ async def ai_pack():
             job_id=resolved_job_id,
             result_id=resolved_result_id,
             include_closed=include_closed and budget == "l",
+            baseline=baseline,
+            mode=mode,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -2404,7 +2489,7 @@ async def ai_pack():
         job_id=resolved_job_id,
         result_file=resolved_result_id,
         status=budget,
-        detail=f"lines={len(rows)};format={output_format}",
+        detail=f"lines={len(rows)};format={output_format};mode={mode or 'pack'}",
     )
     return pack_body, 200, {"Content-Type": content_type, "Cache-Control": "no-store"}
 
@@ -2533,6 +2618,7 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "jobs_queued": int(gauges[("recon_operator_jobs_queued", ())]),
         "jobs_running": int(gauges[("recon_operator_jobs_running", ())]),
         "metrics_path": "/metrics",
+        "metrics_auth_required": METRICS_AUTH_REQUIRED,
         "telegram_configured": bot is not None,
         "uptime": str(_utc_now() - start_time),
         "fernet_key_configured": bool(FERNET_KEY),
@@ -2596,7 +2682,16 @@ async def readiness():
 
 @app.route("/metrics", methods=["GET"])
 async def metrics_endpoint():
-    """Prometheus text exposition (no secrets). Safe for local scrapers."""
+    """Prometheus text exposition (no secrets).
+
+    Default is unauthenticated for local scrapers on loopback. Set
+    ``METRICS_AUTH_REQUIRED=true`` to require a read-scoped API key (recommended
+    when the port is reachable beyond localhost).
+    """
+    if METRICS_AUTH_REQUIRED:
+        auth_error = require_api_auth("read")
+        if auth_error:
+            return auth_error
     body = render_metrics_text()
     return (
         body,
