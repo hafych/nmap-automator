@@ -63,7 +63,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -331,6 +331,17 @@ RATE_LIMIT_INCLUDE_OWNER = _parse_bool_env("RATE_LIMIT_INCLUDE_OWNER", True)
 _redis_client: Any = None
 _redis_init_attempted = False
 _redis_available = False
+# Multi-worker job leases (SQLite claim + optional Redis fence).
+WORKER_ID = (os.getenv("WORKER_ID", "").strip() or f"worker-{uuid.uuid4().hex[:12]}")[:64]
+JOB_LEASE_SECONDS = _parse_int_env("JOB_LEASE_SECONDS", default=90, min_value=15, max_value=3600)
+JOB_CLAIM_POLL_SECONDS = _parse_int_env(
+    "JOB_CLAIM_POLL_SECONDS", default=2, min_value=1, max_value=60
+)
+REDIS_JOB_LEASE_PREFIX = (
+    os.getenv("REDIS_JOB_LEASE_PREFIX", "recon_operator:job_lease:").strip()
+    or "recon_operator:job_lease:"
+)
+_job_worker_task: Optional[asyncio.Task] = None
 MAX_CONCURRENT_SCANS = _parse_int_env("MAX_CONCURRENT_SCANS", default=2, min_value=1, max_value=20)
 MAX_SCHEDULED_TASKS = _parse_int_env(
     "MAX_SCHEDULED_TASKS", default=100, min_value=1, max_value=10_000
@@ -1254,6 +1265,7 @@ def _job_public_view(job: Dict[str, Any], *, include_result: bool = True) -> Dic
         "error": job.get("error"),
         "result_file": job.get("result_file"),
         "kind": job.get("kind", "immediate"),
+        "lease_owner": job.get("lease_owner"),
     }
     if include_result and job.get("status") == "completed":
         view["result"] = job.get("result")
@@ -1266,6 +1278,71 @@ def _persist_job(job: Dict[str, Any]) -> None:
         state_store.prune_jobs(MAX_SCAN_JOBS)
     except Exception as exc:
         log_event(f"Failed to persist job {job.get('job_id')}: {exc}")
+
+
+def _try_redis_job_lease(job_id: str, *, renew: bool = False) -> bool:
+    """Optional Redis fence so only one process holds a job lease."""
+    client = _get_redis_client()
+    if client is None:
+        return True
+    key = f"{REDIS_JOB_LEASE_PREFIX}{job_id}"
+    try:
+        if renew:
+            current = client.get(key)
+            if current not in (None, WORKER_ID):
+                return False
+            client.set(key, WORKER_ID, ex=JOB_LEASE_SECONDS)
+            return True
+        # SET NX — first claimant wins; allow same worker to refresh.
+        ok = client.set(key, WORKER_ID, nx=True, ex=JOB_LEASE_SECONDS)
+        if ok:
+            return True
+        return client.get(key) == WORKER_ID
+    except Exception as exc:
+        log_event(f"Redis job lease error for {job_id}: {exc}")
+        # Fail open to SQLite-only claim when Redis blips.
+        return True
+
+
+def _release_redis_job_lease(job_id: str) -> None:
+    client = _get_redis_client()
+    if client is None:
+        return
+    key = f"{REDIS_JOB_LEASE_PREFIX}{job_id}"
+    try:
+        current = client.get(key)
+        if current == WORKER_ID:
+            client.delete(key)
+    except Exception as exc:
+        log_event(f"Redis job lease release error for {job_id}: {exc}")
+
+
+def _claim_job_for_worker(job_id: str) -> Optional[Dict[str, Any]]:
+    """SQLite atomic claim + optional Redis fence."""
+    if not _try_redis_job_lease(job_id):
+        return None
+    claimed = state_store.try_claim_job(
+        job_id,
+        WORKER_ID,
+        now=time.time(),
+        lease_seconds=JOB_LEASE_SECONDS,
+        started_at=_utc_now_iso(),
+    )
+    if claimed is None:
+        _release_redis_job_lease(job_id)
+        return None
+    return claimed
+
+
+def _renew_job_lease(job_id: str) -> bool:
+    if not _try_redis_job_lease(job_id, renew=True):
+        return False
+    return state_store.renew_job_lease(
+        job_id,
+        WORKER_ID,
+        now=time.time(),
+        lease_seconds=JOB_LEASE_SECONDS,
+    )
 
 
 async def _prune_jobs_locked() -> None:
@@ -1294,26 +1371,65 @@ async def _set_job_fields(job_id: str, **fields: Any) -> None:
         if not job:
             return
         job.update(fields)
+        # Clear lease markers on terminal states.
+        if fields.get("status") in {"completed", "failed", "cancelled", "timeout"}:
+            job["lease_owner"] = None
+            job["lease_until"] = None
         _persist_job(job)
 
 
-async def _run_scan_job(job_id: str) -> None:
-    async with _jobs_lock:
-        job = scan_jobs.get(job_id)
-        if not job or job["status"] == "cancelled":
+async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
+    if not already_claimed:
+        claimed = await asyncio.to_thread(_claim_job_for_worker, job_id)
+        if claimed is None:
+            # Another worker owns this job (or it disappeared).
+            stored = await asyncio.to_thread(state_store.get_job, job_id)
+            async with _jobs_lock:
+                if stored is not None:
+                    existing_task = (scan_jobs.get(job_id) or {}).get("task")
+                    scan_jobs[job_id] = {**stored, "task": existing_task}
+                job = scan_jobs.get(job_id)
+                if job:
+                    job["task"] = None
             return
-        job["status"] = "running"
-        job["started_at"] = _utc_now_iso()
-        target = job["target"]
-        scan_type = job["scan_type"]
-        ports = job.get("ports")
-        scripts = job.get("scripts")
-        discovery = job.get("discovery")
-        owner_id = job.get("owner_id") or "local"
-        _persist_job(job)
+        async with _jobs_lock:
+            existing_task = (scan_jobs.get(job_id) or {}).get("task")
+            scan_jobs[job_id] = {**claimed, "task": existing_task}
+            job = scan_jobs[job_id]
+            if job.get("status") == "cancelled":
+                return
+            target = job["target"]
+            scan_type = job["scan_type"]
+            ports = job.get("ports")
+            scripts = job.get("scripts")
+            discovery = job.get("discovery")
+            owner_id = job.get("owner_id") or "local"
+    else:
+        async with _jobs_lock:
+            job = scan_jobs.get(job_id)
+            if not job or job["status"] == "cancelled":
+                return
+            target = job["target"]
+            scan_type = job["scan_type"]
+            ports = job.get("ports")
+            scripts = job.get("scripts")
+            discovery = job.get("discovery")
+            owner_id = job.get("owner_id") or "local"
 
     loop = asyncio.get_running_loop()
+    heartbeat: Optional[asyncio.Task] = None
+
+    async def _lease_heartbeat() -> None:
+        interval = max(5.0, JOB_LEASE_SECONDS / 3)
+        while True:
+            await asyncio.sleep(interval)
+            ok = await asyncio.to_thread(_renew_job_lease, job_id)
+            if not ok:
+                log_event(f"Lost job lease for {job_id}; stopping heartbeat")
+                return
+
     try:
+        heartbeat = asyncio.create_task(_lease_heartbeat())
         async with _get_scan_semaphore():
             results = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -1376,11 +1492,93 @@ async def _run_scan_job(job_id: str) -> None:
             error=str(exc),
         )
     finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+        await asyncio.to_thread(state_store.release_job_lease, job_id, WORKER_ID)
+        _release_redis_job_lease(job_id)
         async with _jobs_lock:
             job = scan_jobs.get(job_id)
             if job:
                 job["task"] = None
+                job["lease_owner"] = None
+                job["lease_until"] = None
             await _prune_jobs_locked()
+
+
+async def _adopt_claimed_job(claimed: Dict[str, Any]) -> None:
+    """Register a job claimed by the poller and run it locally."""
+    job_id = claimed["job_id"]
+    async with _jobs_lock:
+        existing = scan_jobs.get(job_id)
+        if existing and existing.get("task") is not None and not existing["task"].done():
+            return
+        active = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
+        if active >= MAX_SCAN_JOBS and job_id not in scan_jobs:
+            # Capacity full — release so another worker can take it later.
+            try:
+                state_store.release_job_lease(job_id, WORKER_ID)
+                state_store.upsert_job(
+                    {
+                        **claimed,
+                        "status": "queued",
+                        "lease_owner": None,
+                        "lease_until": None,
+                        "started_at": None,
+                    }
+                )
+            except Exception as exc:
+                log_event(f"Failed to requeue capacity-limited job {job_id}: {exc}")
+            _release_redis_job_lease(job_id)
+            return
+        job = {**claimed, "task": None}
+        scan_jobs[job_id] = job
+        task = asyncio.create_task(_run_scan_job(job_id, already_claimed=True))
+        job["task"] = task
+
+
+async def job_claim_loop(stop_event: Optional[asyncio.Event] = None) -> None:
+    """Poll SQLite for queued / expired-lease jobs (multi-worker recovery)."""
+    log_event(f"Job claim loop started (worker={WORKER_ID}, lease={JOB_LEASE_SECONDS}s)")
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            claimed = await asyncio.to_thread(
+                state_store.claim_next_job,
+                WORKER_ID,
+                now=time.time(),
+                lease_seconds=JOB_LEASE_SECONDS,
+                started_at=_utc_now_iso(),
+            )
+            if claimed is not None:
+                # Align Redis fence with SQLite claim.
+                if not _try_redis_job_lease(claimed["job_id"]):
+                    await asyncio.to_thread(
+                        state_store.release_job_lease, claimed["job_id"], WORKER_ID
+                    )
+                    try:
+                        state_store.upsert_job(
+                            {
+                                **claimed,
+                                "status": "queued",
+                                "lease_owner": None,
+                                "lease_until": None,
+                            }
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await _adopt_claimed_job(claimed)
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(f"Job claim loop error: {exc}")
+        await asyncio.sleep(JOB_CLAIM_POLL_SECONDS)
 
 
 async def create_scan_job(
@@ -1417,10 +1615,13 @@ async def create_scan_job(
             "result": None,
             "result_file": None,
             "kind": kind,
+            "lease_owner": None,
+            "lease_until": None,
             "task": None,
         }
         scan_jobs[job_id] = job
         _persist_job(job)
+        # Low-latency local attempt; claim ensures only one worker executes.
         task = asyncio.create_task(_run_scan_job(job_id))
         job["task"] = task
         return _job_public_view(job, include_result=False)
@@ -1571,6 +1772,10 @@ async def cancel_job(job_id: str):
 
     async with _jobs_lock:
         job = scan_jobs.get(job_id)
+        if job is None:
+            job = await asyncio.to_thread(state_store.get_job, job_id)
+            if job is not None:
+                scan_jobs[job_id] = job
         if not job or not job_visible_to_owner(job):
             return jsonify({"error": "Job not found"}), 404
         if job["status"] in {"completed", "failed", "cancelled", "timeout"}:
@@ -1579,9 +1784,12 @@ async def cancel_job(job_id: str):
         job["status"] = "cancelled"
         job["finished_at"] = _utc_now_iso()
         job["error"] = "Scan cancelled"
+        job["lease_owner"] = None
+        job["lease_until"] = None
         if task is not None and not task.done():
             task.cancel()
         _persist_job(job)
+    _release_redis_job_lease(job_id)
     log_event(f"Job {job_id} cancelled")
     return jsonify({"message": f"Job {job_id} cancelled", "job_id": job_id}), 200
 
@@ -2098,6 +2306,8 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "legacy_results_shared": LEGACY_RESULTS_SHARED,
         "api_key_count": len([key for key in API_AUTH_KEYS if not key.get("revoked")]),
         "named_api_keys": len(API_AUTH_KEYS) > 0,
+        "worker_id": WORKER_ID,
+        "job_lease_seconds": JOB_LEASE_SECONDS,
         "state_db": STATE_DB_PATH,
         "discovery_engines": {
             name: bool(path) for name, path in available_discovery_engines().items()
@@ -2690,17 +2900,29 @@ async def load_persisted_state():
         log_event(f"Failed to load persisted jobs: {exc}")
         jobs = []
 
+    now = time.time()
     async with _jobs_lock:
         for job in jobs:
-            # Do not resume in-flight work across restarts.
-            if job.get("status") in {"queued", "running"}:
-                job["status"] = "failed"
-                job["error"] = "Interrupted by service restart"
-                job["finished_at"] = job.get("finished_at") or _utc_now_iso()
-                try:
-                    state_store.upsert_job(job)
-                except Exception as exc:
-                    log_event(f"Failed to finalize interrupted job {job.get('job_id')}: {exc}")
+            status = job.get("status")
+            lease_until = job.get("lease_until")
+            lease_owner = job.get("lease_owner")
+            # Requeue work that this process can reclaim; leave active foreign leases alone.
+            if status == "queued":
+                job["lease_owner"] = None
+                job["lease_until"] = None
+            elif status == "running":
+                expired = lease_until is None or float(lease_until) < now
+                ours = lease_owner in (None, WORKER_ID)
+                if expired or ours:
+                    job["status"] = "queued"
+                    job["lease_owner"] = None
+                    job["lease_until"] = None
+                    job["started_at"] = None
+                    job["error"] = None
+                    try:
+                        state_store.upsert_job(job)
+                    except Exception as exc:
+                        log_event(f"Failed to requeue interrupted job {job.get('job_id')}: {exc}")
             scan_jobs[job["job_id"]] = job
         log_event(f"Loaded {len(scan_jobs)} persisted scan jobs from {STATE_DB_PATH}")
 
@@ -2733,7 +2955,8 @@ async def load_persisted_state():
 
 
 async def main():
-    log_event(f"{PRODUCT_NAME} started (version {VERSION})")
+    global _job_worker_task
+    log_event(f"{PRODUCT_NAME} started (version {VERSION}, worker={WORKER_ID})")
     await send_telegram_message(f"{PRODUCT_NAME} v{VERSION} started")
 
     await load_persisted_state()
@@ -2750,6 +2973,7 @@ async def main():
         except (NotImplementedError, AttributeError, ValueError):
             pass
 
+    _job_worker_task = asyncio.create_task(job_claim_loop(stop_event))
     shutdown_trigger = stop_event.wait if registered_signals else None
     server_task = asyncio.create_task(
         app.run_task(
@@ -2777,7 +3001,11 @@ async def main():
 
         if stop_event.is_set():
             log_event("Stop signal received")
+        stop_event.set()
         await send_telegram_message(f"{PRODUCT_NAME} is shutting down")
+
+        if _job_worker_task is not None:
+            _job_worker_task.cancel()
 
         _cleanup_finished_tasks()
         scheduled_tasks = list(scan_tasks.values())
@@ -2793,7 +3021,8 @@ async def main():
             for task in job_tasks:
                 task.cancel()
 
-        shutdown_tasks = [*scheduled_tasks, *job_tasks, server_task]
+        claim_tasks = [_job_worker_task] if _job_worker_task is not None else []
+        shutdown_tasks = [*scheduled_tasks, *job_tasks, *claim_tasks, server_task]
         try:
             await asyncio.wait_for(
                 asyncio.gather(*shutdown_tasks, return_exceptions=True),
@@ -2802,7 +3031,8 @@ async def main():
         except asyncio.TimeoutError:
             log_event("Forced task shutdown after timeout")
             for task in shutdown_tasks:
-                task.cancel()
+                if task is not None:
+                    task.cancel()
             await asyncio.gather(*shutdown_tasks, return_exceptions=True)
 
         log_event("Service stopped")

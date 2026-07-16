@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     finished_at TEXT,
     error TEXT,
     result_file TEXT,
-    result_json TEXT
+    result_json TEXT,
+    lease_owner TEXT,
+    lease_until REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_scan_jobs_created ON scan_jobs(created_at);
@@ -72,6 +74,10 @@ class StateStore:
         job_cols = self._table_columns(conn, "scan_jobs")
         if "owner_id" not in job_cols:
             conn.execute("ALTER TABLE scan_jobs ADD COLUMN owner_id TEXT")
+        if "lease_owner" not in job_cols:
+            conn.execute("ALTER TABLE scan_jobs ADD COLUMN lease_owner TEXT")
+        if "lease_until" not in job_cols:
+            conn.execute("ALTER TABLE scan_jobs ADD COLUMN lease_until REAL")
         task_cols = self._table_columns(conn, "scheduled_tasks")
         if "owner_id" not in task_cols:
             conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN owner_id TEXT")
@@ -79,6 +85,9 @@ class StateStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_jobs_owner ON scan_jobs(owner_id)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_owner ON scheduled_tasks(owner_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_jobs_lease ON scan_jobs(status, lease_until)"
         )
 
     def upsert_scheduled_task(
@@ -156,8 +165,9 @@ class StateStore:
                 """
                 INSERT INTO scan_jobs(
                     job_id, target, scan_type, ports, scripts, discovery, status, kind,
-                    owner_id, created_at, started_at, finished_at, error, result_file, result_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    owner_id, created_at, started_at, finished_at, error, result_file, result_json,
+                    lease_owner, lease_until
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     target=excluded.target,
                     scan_type=excluded.scan_type,
@@ -171,7 +181,9 @@ class StateStore:
                     finished_at=excluded.finished_at,
                     error=excluded.error,
                     result_file=excluded.result_file,
-                    result_json=excluded.result_json
+                    result_json=excluded.result_json,
+                    lease_owner=excluded.lease_owner,
+                    lease_until=excluded.lease_until
                 """,
                 (
                     job["job_id"],
@@ -189,6 +201,8 @@ class StateStore:
                     job.get("error"),
                     job.get("result_file"),
                     result_json,
+                    job.get("lease_owner"),
+                    job.get("lease_until"),
                 ),
             )
             conn.commit()
@@ -245,6 +259,112 @@ class StateStore:
             conn.execute("DELETE FROM scan_jobs WHERE job_id = ?", (job_id,))
             conn.commit()
 
+    def try_claim_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+        lease_seconds: float,
+        started_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim a queued (or expired-lease) job for ``worker_id``."""
+        lease_until = float(now) + float(lease_seconds)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scan_jobs
+                SET status = 'running',
+                    lease_owner = ?,
+                    lease_until = ?,
+                    started_at = COALESCE(started_at, ?),
+                    error = NULL
+                WHERE job_id = ?
+                  AND (
+                    status = 'queued'
+                    OR (
+                        status = 'running'
+                        AND (lease_until IS NULL OR lease_until < ?)
+                    )
+                  )
+                """,
+                (worker_id, lease_until, started_at, job_id, float(now)),
+            )
+            conn.commit()
+            if cursor.rowcount < 1:
+                return None
+            row = conn.execute("SELECT * FROM scan_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return self._row_to_job(dict(row)) if row is not None else None
+
+    def claim_next_job(
+        self,
+        worker_id: str,
+        *,
+        now: float,
+        lease_seconds: float,
+        started_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Claim the oldest claimable job for this worker, if any."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT job_id FROM scan_jobs
+                WHERE status = 'queued'
+                   OR (
+                        status = 'running'
+                        AND (lease_until IS NULL OR lease_until < ?)
+                   )
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (float(now),),
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = row["job_id"]
+        return self.try_claim_job(
+            job_id,
+            worker_id,
+            now=now,
+            lease_seconds=lease_seconds,
+            started_at=started_at,
+        )
+
+    def renew_job_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        lease_until = float(now) + float(lease_seconds)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scan_jobs
+                SET lease_until = ?
+                WHERE job_id = ?
+                  AND lease_owner = ?
+                  AND status = 'running'
+                """,
+                (lease_until, job_id, worker_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def release_job_lease(self, job_id: str, worker_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE scan_jobs
+                SET lease_owner = NULL, lease_until = NULL
+                WHERE job_id = ? AND lease_owner = ?
+                """,
+                (job_id, worker_id),
+            )
+            conn.commit()
+
     @staticmethod
     def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
         result = None
@@ -270,5 +390,7 @@ class StateStore:
             "error": row.get("error"),
             "result_file": row.get("result_file"),
             "result": result,
+            "lease_owner": row.get("lease_owner"),
+            "lease_until": row.get("lease_until"),
             "task": None,
         }

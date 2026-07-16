@@ -256,9 +256,13 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `MAX_REQUESTS_PER_WINDOW` | `10` | Per-client costly-request limit |
 | `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets (memory backend) |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window |
-| `REDIS_URL` | empty | Optional Redis URL for shared rate limits across workers |
+| `REDIS_URL` | empty | Optional Redis URL for shared rate limits and job-lease fence |
 | `REDIS_RATE_LIMIT_PREFIX` | `recon_operator:rl:` | Key prefix for Redis rate-limit sorted sets |
 | `RATE_LIMIT_INCLUDE_OWNER` | `true` | Bucket by IP + token owner hash (multi-token isolation) |
+| `WORKER_ID` | random | Stable worker identity for job leases (set per process) |
+| `JOB_LEASE_SECONDS` | `90` | How long a worker holds an exclusive scan-job lease |
+| `JOB_CLAIM_POLL_SECONDS` | `2` | Poll interval for reclaiming queued / expired-lease jobs |
+| `REDIS_JOB_LEASE_PREFIX` | `recon_operator:job_lease:` | Redis key prefix for optional job-lease fence |
 | `MIN_SCHEDULE_INTERVAL_MINUTES` | `1` | Smallest recurring-scan interval |
 | `MAX_SCHEDULE_INTERVAL_MINUTES` | `10080` | Largest interval, in minutes |
 | `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
@@ -325,6 +329,21 @@ REDIS_URL=redis://127.0.0.1:6379/0
 ```
 
 `/health` reports `rate_limit_backend` as `memory`, `redis`, or `memory_fallback`.
+
+### Multi-worker job leases
+
+Scan jobs are claimed with an exclusive lease in SQLite (`lease_owner` / `lease_until`).
+Only the claiming worker runs the Nmap process. A background claim loop recovers
+`queued` jobs and expired leases after crashes. When `REDIS_URL` is set, a Redis
+`SET NX` fence adds a second lock for multi-host deploys sharing the same state DB.
+
+```bash
+# process A
+WORKER_ID=worker-a STATE_DB_PATH=/shared/recon.db REDIS_URL=redis://127.0.0.1:6379/0 python autonmap.py
+
+# process B
+WORKER_ID=worker-b STATE_DB_PATH=/shared/recon.db REDIS_URL=redis://127.0.0.1:6379/0 python autonmap.py
+```
 
 ## Development
 

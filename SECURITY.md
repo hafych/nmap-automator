@@ -25,6 +25,8 @@ contact channel without disclosing the vulnerability.
   authorized engagement scope (IPs, CIDRs, hostnames, or `*.suffix` wildcards).
 - For multi-worker deploys set `REDIS_URL` so rate limits are shared; without it each process
   enforces its own window.
+- Share `STATE_DB_PATH` (and preferably Redis) across workers so job leases prevent duplicate
+  scans; set a distinct `WORKER_ID` per process.
 - Bind to loopback unless a trusted reverse proxy or firewall restricts access.
 - Never publish `.env`, Fernet keys, API tokens, Telegram credentials, decrypted results, or
   assessment artifacts.

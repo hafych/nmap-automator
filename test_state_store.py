@@ -71,6 +71,78 @@ class StateStoreTests(unittest.TestCase):
             self.assertGreaterEqual(deleted, 3)
             self.assertLessEqual(len(store.list_jobs()), 2)
 
+    def test_job_lease_claim_is_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "lease.db"))
+            store.upsert_job(
+                {
+                    "job_id": "lease-1",
+                    "target": "127.0.0.1",
+                    "scan_type": "Ping",
+                    "status": "queued",
+                    "kind": "immediate",
+                    "created_at": "t0",
+                    "result": None,
+                }
+            )
+            now = 1_000_000.0
+            first = store.try_claim_job(
+                "lease-1",
+                "worker-a",
+                now=now,
+                lease_seconds=30,
+                started_at="t1",
+            )
+            self.assertIsNotNone(first)
+            self.assertEqual(first["status"], "running")
+            self.assertEqual(first["lease_owner"], "worker-a")
+
+            second = store.try_claim_job(
+                "lease-1",
+                "worker-b",
+                now=now + 1,
+                lease_seconds=30,
+                started_at="t2",
+            )
+            self.assertIsNone(second)
+
+            # Expired lease can be reclaimed by another worker.
+            third = store.try_claim_job(
+                "lease-1",
+                "worker-b",
+                now=now + 60,
+                lease_seconds=30,
+                started_at="t3",
+            )
+            self.assertIsNotNone(third)
+            self.assertEqual(third["lease_owner"], "worker-b")
+
+            store.upsert_job(
+                {
+                    "job_id": "lease-2",
+                    "target": "127.0.0.1",
+                    "scan_type": "TCP",
+                    "status": "queued",
+                    "kind": "immediate",
+                    "created_at": "t4",
+                    "result": None,
+                }
+            )
+            claimed = store.claim_next_job(
+                "worker-c",
+                now=now + 120,
+                lease_seconds=30,
+                started_at="t5",
+            )
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed["job_id"], "lease-2")
+            self.assertTrue(
+                store.renew_job_lease("lease-2", "worker-c", now=now + 125, lease_seconds=30)
+            )
+            store.release_job_lease("lease-2", "worker-c")
+            released = store.get_job("lease-2")
+            self.assertIsNone(released.get("lease_owner"))
+
 
 if __name__ == "__main__":
     unittest.main()
