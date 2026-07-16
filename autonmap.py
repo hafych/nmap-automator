@@ -63,7 +63,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -321,6 +321,16 @@ MAX_REQUESTS_PER_WINDOW = _parse_int_env(
 MAX_RATE_LIMIT_CLIENTS = _parse_int_env(
     "MAX_RATE_LIMIT_CLIENTS", default=10_000, min_value=100, max_value=100_000
 )
+# Optional shared rate-limit backend for multi-worker deploys (empty = in-process memory).
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_RATE_LIMIT_PREFIX = (
+    os.getenv("REDIS_RATE_LIMIT_PREFIX", "recon_operator:rl:").strip() or "recon_operator:rl:"
+)
+# Include authenticated owner hash in the bucket so tokens are limited independently of IP.
+RATE_LIMIT_INCLUDE_OWNER = _parse_bool_env("RATE_LIMIT_INCLUDE_OWNER", True)
+_redis_client: Any = None
+_redis_init_attempted = False
+_redis_available = False
 MAX_CONCURRENT_SCANS = _parse_int_env("MAX_CONCURRENT_SCANS", default=2, min_value=1, max_value=20)
 MAX_SCHEDULED_TASKS = _parse_int_env(
     "MAX_SCHEDULED_TASKS", default=100, min_value=1, max_value=10_000
@@ -803,11 +813,67 @@ def _cleanup_finished_tasks() -> list:
     return finished_task_ids
 
 
-def check_rate_limit() -> bool:
+def _rate_limit_bucket_key() -> str:
+    """Build a stable rate-limit bucket from client IP and optional owner id."""
     client_ip = _client_key()
+    if not RATE_LIMIT_INCLUDE_OWNER:
+        return client_ip
+    try:
+        owner = getattr(g, "owner_id", None)
+    except RuntimeError:
+        owner = None
+    if not owner or owner == "local":
+        return client_ip
+    return f"{client_ip}:o{owner[:12]}"
+
+
+def _get_redis_client() -> Any:
+    """Lazy-connect Redis when REDIS_URL is configured. Returns None on failure/disabled."""
+    global _redis_client, _redis_init_attempted, _redis_available
+    if not REDIS_URL:
+        return None
+    if _redis_init_attempted:
+        return _redis_client if _redis_available else None
+    _redis_init_attempted = True
+    try:
+        import redis  # type: ignore
+    except ImportError:
+        log_event("REDIS_URL is set but redis package is not installed; using memory rate limits")
+        _redis_available = False
+        return None
+    try:
+        client = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+            health_check_interval=30,
+        )
+        client.ping()
+        _redis_client = client
+        _redis_available = True
+        log_event("Redis rate-limit backend connected")
+        return client
+    except Exception as exc:
+        log_event(f"Redis rate-limit backend unavailable ({exc}); using memory fallback")
+        _redis_client = None
+        _redis_available = False
+        return None
+
+
+def rate_limit_backend() -> str:
+    """Return active rate-limit backend name for health/docs."""
+    if REDIS_URL and _get_redis_client() is not None:
+        return "redis"
+    if REDIS_URL:
+        return "memory_fallback"
+    return "memory"
+
+
+def _check_rate_limit_memory(bucket: str) -> bool:
     now = time.time()
 
-    if client_ip not in rate_limits and len(rate_limits) >= MAX_RATE_LIMIT_CLIENTS:
+    if bucket not in rate_limits and len(rate_limits) >= MAX_RATE_LIMIT_CLIENTS:
         stale_before = now - RATE_LIMIT_WINDOW_SECONDS
         stale_clients = [
             key
@@ -824,16 +890,64 @@ def check_rate_limit() -> bool:
             )
             rate_limits.pop(oldest_client, None)
 
-    request_window = rate_limits[client_ip]
-    rate_limits[client_ip] = [
+    request_window = rate_limits[bucket]
+    rate_limits[bucket] = [
         req_time for req_time in request_window if now - req_time < RATE_LIMIT_WINDOW_SECONDS
     ]
 
-    if len(rate_limits[client_ip]) >= MAX_REQUESTS_PER_WINDOW:
+    if len(rate_limits[bucket]) >= MAX_REQUESTS_PER_WINDOW:
         return False
 
-    rate_limits[client_ip].append(now)
+    rate_limits[bucket].append(now)
     return True
+
+
+_REDIS_RATE_LIMIT_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+  return 0
+end
+redis.call('ZADD', key, now, member)
+redis.call('EXPIRE', key, window + 1)
+return 1
+"""
+
+
+def _check_rate_limit_redis(client: Any, bucket: str) -> bool:
+    """Sliding-window limit via Redis sorted set (atomic Lua, shared across workers)."""
+    now = time.time()
+    key = f"{REDIS_RATE_LIMIT_PREFIX}{bucket}"
+    member = f"{now:.6f}:{secrets.token_hex(4)}"
+    try:
+        # Prefer EVAL for atomicity under concurrent workers.
+        allowed = client.eval(
+            _REDIS_RATE_LIMIT_LUA,
+            1,
+            key,
+            str(now),
+            str(RATE_LIMIT_WINDOW_SECONDS),
+            str(MAX_REQUESTS_PER_WINDOW),
+            member,
+        )
+        return bool(int(allowed))
+    except Exception as exc:
+        log_event(f"Redis rate limit error for {bucket}: {exc}; falling back to memory")
+        return _check_rate_limit_memory(bucket)
+
+
+def check_rate_limit() -> bool:
+    """Enforce per-window request budget (memory or shared Redis)."""
+    bucket = _rate_limit_bucket_key()
+    client = _get_redis_client()
+    if client is not None:
+        return _check_rate_limit_redis(client, bucket)
+    return _check_rate_limit_memory(bucket)
 
 
 def _bool_query_param(name: str, default: bool = False) -> bool:
@@ -1971,6 +2085,8 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "nmap_available": nmap_available,
         "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+        "rate_limit_backend": rate_limit_backend(),
+        "rate_limit_include_owner": RATE_LIMIT_INCLUDE_OWNER,
         "max_concurrent_scans": MAX_CONCURRENT_SCANS,
         "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
         "max_scan_jobs": MAX_SCAN_JOBS,

@@ -170,13 +170,14 @@ Missing tools не устанавливались автоматически: э
 
 ### P1 — выполнить перед multi-user/public deployment
 
-- [x] ~~SQLite persistence for jobs/schedules (single-node).~~ Redis multi-worker still open.
+- [x] ~~SQLite persistence for jobs/schedules (single-node).~~ Job leases still open.
 - [x] ~~Multi API tokens (`API_AUTH_TOKENS`) + per-token ownership of jobs/tasks/new results.~~
 - [x] ~~`LEGACY_RESULTS_SHARED` flag to hide pre-ownership result files (default true).~~
 - [x] ~~Target allowlist / engagement scopes (`TARGET_ALLOWLIST`, `TARGET_ALLOWLIST_FILE`).~~
 - [x] ~~Named API keys + scopes (`API_AUTH_KEYS`, `read`/`scan`/`admin`, `/auth/whoami`).~~
+- [x] ~~Optional Redis shared rate limits (`REDIS_URL`; memory fallback).~~
 - [ ] Full multi-tenant RBAC / UI accounts (token isolation only today).
-- [ ] Redis multi-worker rate limits / leases.
+- [ ] Redis multi-worker job leases / queue.
 - [x] ~~Поднять `autonmap.py` coverage до ≥75% (~82%; overall ~78%; fail_under 75).~~
 - [ ] Добавить CI browser E2E + axe-core для keyboard/ARIA/responsive regressions.
 
@@ -211,7 +212,7 @@ Missing tools не устанавливались автоматически: э
 ### P3 — дальше
 
 - [ ] Multi-user / scoped API keys.
-- [ ] Redis for multi-worker rate limits (SQLite covers single-node durable state).
+- [x] ~~Redis for multi-worker rate limits.~~ (job leases still open; SQLite covers single-node durable state)
 - [ ] Favicon/static asset caching after extracting inline UI assets.
 - [ ] Optional locale switch.
 - [ ] Rename GitHub repository path from `nmap-automator` → `recon-operator` (when ready).

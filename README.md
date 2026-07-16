@@ -254,8 +254,11 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum JSON request body size |
 | `MAX_IMPORT_XML_BYTES` | `67108864` | Maximum imported Nmap XML size |
 | `MAX_REQUESTS_PER_WINDOW` | `10` | Per-client costly-request limit |
-| `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets |
+| `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets (memory backend) |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window |
+| `REDIS_URL` | empty | Optional Redis URL for shared rate limits across workers |
+| `REDIS_RATE_LIMIT_PREFIX` | `recon_operator:rl:` | Key prefix for Redis rate-limit sorted sets |
+| `RATE_LIMIT_INCLUDE_OWNER` | `true` | Bucket by IP + token owner hash (multi-token isolation) |
 | `MIN_SCHEDULE_INTERVAL_MINUTES` | `1` | Smallest recurring-scan interval |
 | `MAX_SCHEDULE_INTERVAL_MINUTES` | `10080` | Largest interval, in minutes |
 | `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
@@ -307,6 +310,21 @@ docker run --rm \
   -e FERNET_KEY \
   recon-operator
 ```
+
+### Optional Redis rate limits
+
+Single-worker deploys need no Redis (in-process buckets). For multiple workers or
+instances, share the sliding window:
+
+```bash
+# start optional redis profile
+docker compose --profile redis up -d
+
+# in .env
+REDIS_URL=redis://127.0.0.1:6379/0
+```
+
+`/health` reports `rate_limit_backend` as `memory`, `redis`, or `memory_fallback`.
 
 ## Development
 

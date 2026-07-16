@@ -8,6 +8,8 @@ services:
       API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN in .env}
       FERNET_KEY: ${FERNET_KEY:?Set FERNET_KEY in .env}
       STATE_DB_PATH: /app/data/recon_operator.db
+      # Optional shared rate limits (enable with: docker compose --profile redis up)
+      REDIS_URL: ${REDIS_URL:-}
     ports:
       - "127.0.0.1:5000:5000"
     init: true
@@ -20,6 +22,22 @@ services:
       - scan-state:/app/data
     restart: unless-stopped
     stop_grace_period: 40s
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional: shared rate-limit backend for multi-worker / multi-instance deploys.
+  # docker compose --profile redis up -d
+  # Then set REDIS_URL=redis://redis:6379/0 in .env
+  redis:
+    profiles: ["redis"]
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
 

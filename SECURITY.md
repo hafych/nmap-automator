@@ -23,6 +23,8 @@ contact channel without disclosing the vulnerability.
   are not visible to every operator.
 - Prefer an explicit `TARGET_ALLOWLIST` / `TARGET_ALLOWLIST_FILE` so scans cannot leave the
   authorized engagement scope (IPs, CIDRs, hostnames, or `*.suffix` wildcards).
+- For multi-worker deploys set `REDIS_URL` so rate limits are shared; without it each process
+  enforces its own window.
 - Bind to loopback unless a trusted reverse proxy or firewall restricts access.
 - Never publish `.env`, Fernet keys, API tokens, Telegram credentials, decrypted results, or
   assessment artifacts.
