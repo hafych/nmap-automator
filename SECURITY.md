@@ -29,6 +29,10 @@ contact channel without disclosing the vulnerability.
   scans and scheduler leadership avoids duplicate recurring schedules; set a distinct
   `WORKER_ID` per process.
 - Bind to loopback unless a trusted reverse proxy or firewall restricts access.
+- If the app sits behind a reverse proxy and you need accurate client IPs for rate
+  limits, set `TRUSTED_PROXY_MODE=true` **and** a non-empty `TRUSTED_PROXIES`
+  allowlist (IPs/CIDRs of the proxy peers). Spoofed `X-Forwarded-For` /
+  `X-Real-IP` headers from untrusted peers are ignored.
 - Never publish `.env`, Fernet keys, API tokens, Telegram credentials, decrypted results, or
   assessment artifacts.
 - Keep target-size, concurrency, rate, and timeout limits appropriate for the authorized
