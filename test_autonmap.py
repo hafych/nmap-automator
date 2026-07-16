@@ -630,7 +630,16 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         async def ignore_message(_message):
             return None
 
-        def fake_scan(target, scan_type, ports=None, scripts=None, discovery=None, owner_id=None):
+        def fake_scan(
+            target,
+            scan_type,
+            ports=None,
+            scripts=None,
+            discovery=None,
+            owner_id=None,
+            process_token=None,
+            **_kwargs,
+        ):
             return {
                 "hosts": [{"host": target, "hostname": "N/A", "state": "up", "protocols": {}}],
                 "scan_count": 1,

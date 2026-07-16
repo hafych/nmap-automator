@@ -125,7 +125,7 @@ class ScanEngineUnitTests(unittest.TestCase):
         self.assertIn(443, rust)
 
     def test_hybrid_scan_uses_discovered_ports(self):
-        def fake_discover(target, engine="auto", ports_hint=None, timeout_sec=120):
+        def fake_discover(target, engine="auto", ports_hint=None, timeout_sec=120, **_kwargs):
             return {
                 "engine": "naabu",
                 "command": ["naabu", "-host", target],

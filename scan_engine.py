@@ -10,8 +10,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -20,6 +22,10 @@ from kali_ai_scan import parse_nmap_xml
 
 PRODUCT_NAME = "Recon Operator"
 SCHEMA_VERSION = "recon-operator-result/v1"
+
+# Active child processes keyed by optional token (usually job_id) for hard cancel.
+_ACTIVE_PROCS: Dict[str, subprocess.Popen] = {}
+_PROC_LOCK = threading.Lock()
 
 # API scan type names → Nmap argv fragments (multi-profile, not Nmap-only product).
 SCAN_TYPE_ARGS: Dict[str, List[str]] = {
@@ -65,8 +71,127 @@ class DiscoveryError(RuntimeError):
     """Raised when a hybrid discovery frontend fails hard."""
 
 
+class ScanCancelledError(RuntimeError):
+    """Raised when a tracked scan process is killed via cancel (job_id token)."""
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _register_process(token: Optional[str], proc: subprocess.Popen) -> None:
+    if not token:
+        return
+    with _PROC_LOCK:
+        previous = _ACTIVE_PROCS.get(token)
+        _ACTIVE_PROCS[token] = proc
+    if previous is not None and previous.poll() is None and previous is not proc:
+        _terminate_process(previous)
+
+
+def _unregister_process(token: Optional[str], proc: Optional[subprocess.Popen] = None) -> None:
+    if not token:
+        return
+    with _PROC_LOCK:
+        current = _ACTIVE_PROCS.get(token)
+        if current is None:
+            return
+        if proc is None or current is proc:
+            _ACTIVE_PROCS.pop(token, None)
+
+
+def _terminate_process(proc: subprocess.Popen) -> None:
+    """Terminate a process and its group (started with start_new_session=True)."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            return
+    try:
+        proc.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            return
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def kill_active_process(token: str) -> bool:
+    """Kill the process group registered under ``token`` (typically a job_id).
+
+    Returns True if a live process was signalled.
+    """
+    if not token:
+        return False
+    with _PROC_LOCK:
+        proc = _ACTIVE_PROCS.get(token)
+    if proc is None:
+        return False
+    if proc.poll() is not None:
+        _unregister_process(token, proc)
+        return False
+    _terminate_process(proc)
+    _unregister_process(token, proc)
+    return True
+
+
+def _run_tracked(
+    command: Sequence[str],
+    *,
+    timeout: Optional[float],
+    process_token: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    """Run argv command; when ``process_token`` is set, enable process-group cancel.
+
+    Without a token, uses ``subprocess.run`` (compatible with existing unit mocks).
+    """
+    if not process_token:
+        return subprocess.run(
+            list(command),
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+        )
+    try:
+        proc = subprocess.Popen(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise
+    _register_process(process_token, proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process(proc)
+            _unregister_process(process_token, proc)
+            raise
+        return subprocess.CompletedProcess(
+            args=list(command),
+            returncode=proc.returncode if proc.returncode is not None else -1,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    finally:
+        _unregister_process(process_token, proc)
 
 
 def supported_scan_types() -> Sequence[str]:
@@ -237,6 +362,7 @@ def discover_open_ports(
     engine: str = "auto",
     ports_hint: Optional[str] = None,
     timeout_sec: int = 120,
+    process_token: Optional[str] = None,
 ) -> dict:
     """Run Naabu or RustScan (argv only) and return open TCP ports."""
     resolved = resolve_discovery_engine(engine)
@@ -260,12 +386,10 @@ def discover_open_ports(
         parser = _parse_rustscan_output
 
     try:
-        completed = subprocess.run(
+        completed = _run_tracked(
             command,
-            capture_output=True,
-            check=False,
-            text=True,
             timeout=timeout_sec,
+            process_token=process_token,
         )
     except subprocess.TimeoutExpired as exc:
         raise DiscoveryError(
@@ -283,6 +407,51 @@ def discover_open_ports(
         "returncode": completed.returncode,
         "stderr": (completed.stderr or "").strip()[:2000],
     }
+
+
+def ensure_operator_result(
+    payload: dict,
+    *,
+    target: str = "",
+    scan_type: str = "",
+    ports: Optional[str] = None,
+    scripts: Optional[str] = None,
+) -> dict:
+    """Normalize either ``ai-nmap-report/v1`` or operator result into operator shape.
+
+    - Operator shape hosts use ``protocols`` maps (already returned as-is, schema filled).
+    - ``kali_ai_scan`` / raw parse hosts use a flat ``ports`` list → :func:`report_to_api_result`.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, list):
+        raise ValueError("payload.hosts must be a list")
+    if not hosts:
+        out = dict(payload)
+        out.setdefault("schema", SCHEMA_VERSION)
+        out.setdefault("product", PRODUCT_NAME)
+        out.setdefault("target", target or payload.get("target") or "")
+        out.setdefault("scan_type", scan_type or payload.get("scan_type") or "")
+        return out
+    first = hosts[0] if isinstance(hosts[0], dict) else {}
+    if "protocols" in first:
+        out = dict(payload)
+        out.setdefault("schema", SCHEMA_VERSION)
+        out.setdefault("product", PRODUCT_NAME)
+        if target and not out.get("target"):
+            out["target"] = target
+        if scan_type and not out.get("scan_type"):
+            out["scan_type"] = scan_type
+        return out
+    # Flat ports list (ai-nmap-report / parse_nmap_xml shape).
+    return report_to_api_result(
+        payload,
+        target=target or str(payload.get("target") or ""),
+        scan_type=scan_type or str(payload.get("scan_type") or "Import"),
+        ports=ports if ports is not None else payload.get("ports"),
+        scripts=scripts if scripts is not None else payload.get("scripts"),
+    )
 
 
 def report_to_api_result(
@@ -519,8 +688,13 @@ def run_nmap_scan(
     ports: Optional[str] = None,
     scripts: Optional[str] = None,
     discovery: Optional[str] = None,
+    process_token: Optional[str] = None,
 ) -> dict:
-    """Run recon scan: optional hybrid discovery + Nmap service/port scan."""
+    """Run recon scan: optional hybrid discovery + Nmap service/port scan.
+
+    When ``process_token`` is set (typically a job id), the running process group
+    can be killed via :func:`kill_active_process`.
+    """
     requested_type = scan_type
     nmap_type = scan_type
     effective_ports = ports
@@ -538,6 +712,7 @@ def run_nmap_scan(
             engine=discovery_mode,
             ports_hint=ports,
             timeout_sec=discovery_budget,
+            process_token=process_token,
         )
         found = discovery_meta.get("ports") or []
         if not found:
@@ -572,12 +747,10 @@ def run_nmap_scan(
         if discovery_meta is not None:
             nmap_timeout = max(60, scan_timeout_sec - 5)
         try:
-            completed = subprocess.run(
+            completed = _run_tracked(
                 command,
-                capture_output=True,
-                check=False,
-                text=True,
                 timeout=nmap_timeout,
+                process_token=process_token,
             )
         except subprocess.TimeoutExpired as exc:
             raise NmapTimeoutError(f"Nmap did not finish within {nmap_timeout} seconds") from exc
@@ -586,10 +759,16 @@ def run_nmap_scan(
 
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip()
+            # Negative or signalled exits after cancel.
+            if process_token and completed.returncode in (-signal.SIGTERM, -signal.SIGKILL, 137, 143):
+                raise ScanCancelledError("Scan process terminated by cancel")
             suffix = f": {detail}" if detail else ""
             raise NmapScanError(f"nmap exited with status {completed.returncode}{suffix}")
 
         if not xml_path.is_file() or xml_path.stat().st_size == 0:
+            if process_token:
+                # Cancelled mid-write can leave empty XML.
+                raise ScanCancelledError("Scan cancelled before XML was produced")
             raise NmapScanError("nmap finished without producing XML output")
 
         report = parse_nmap_xml(xml_path)

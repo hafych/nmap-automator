@@ -43,6 +43,9 @@ and for retest: `diff`, `change`
 
 Schema: `recon-ai-pack/v1`.
 
+Offline packs accept either **operator** results (`protocols` map) or **`ai-nmap-report/v1`**
+hosts (`ports` list) via `scan_engine.ensure_operator_result`.
+
 ### Expected posture (defense verification)
 
 Set `EXPECTED_POSTURE` / `EXPECTED_POSTURE_FILE` or POST to `/posture/evaluate`:
