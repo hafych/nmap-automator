@@ -191,6 +191,8 @@ Missing tools не устанавливались автоматически: э
 - [x] ~~Pin Docker base image by digest.~~ (GitHub Actions digests still open)
 - [x] ~~OpenAPI 3 schema at `/openapi.json` (plus human `/api/docs`).~~
 - [x] ~~Retention для CLI `ai_reports` (`AI_REPORTS_MAX_DIRS` / `AI_REPORTS_MAX_AGE_DAYS`).~~
+- [x] ~~Package boundary: `recon_operator/` (`server`, `auth`, `jobs`, `scheduler`, `api`, `config`) + `autonmap` shim.~~
+- [ ] Further extract implementation out of `recon_operator/server.py` into leaf modules.
 - [ ] Повторить GitNexus taint/PDG анализ после обновления index session.
 - [ ] Generated contract tests from OpenAPI (optional next step).
 
