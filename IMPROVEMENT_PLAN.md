@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.10.0  
+**Текущая версия кода:** 1.10.1  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -182,7 +182,7 @@
 | P2-07 | ~~Audit log (who scanned what when)~~ | SQLite `audit_events` + optional JSONL; `GET /audit` admin | M |
 | P2-08 | ~~Trusted reverse-proxy mode~~ | `TRUSTED_PROXY_MODE` + `TRUSTED_PROXIES` allowlist | S |
 | P2-09 | GitNexus PDG/taint pass | security review automation | S |
-| P2-10 | Structured logging (JSON optional) | correlation id per job | M |
+| P2-10 | ~~Structured logging (JSON optional)~~ | `STRUCTURED_LOGS` JSON lines + job_id fields | M |
 | P2-11 | ~~Metrics endpoint (Prometheus)~~ | `GET /metrics` text exposition; job/scan series | M |
 | P2-12 | Webhooks (Slack/Discord/generic) | richer than Telegram-only | M |
 | P2-13 | Package as installable CLI | `recon-operator serve|scan|plan|inventory` | M |
@@ -419,6 +419,7 @@
 | 2026-07-16 | 1.9.5 | P2-11: Prometheus `/metrics` (Release F / P2 done bar) |
 | 2026-07-16 | 1.9.6 | AI-01: budgeted `/ai/pack` (token-efficient recon handoff) |
 | 2026-07-16 | 1.10.0 | Master-plan remainder: presets, retest pack, CLI pack, metrics auth policy, threat model |
+| 2026-07-16 | 1.10.1 | Posture drift, UI AI Brief/presets, structured logs |
 
 ---
 

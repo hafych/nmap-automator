@@ -44,6 +44,17 @@ UI_HTML = r"""<!doctype html>
           <label>Target
             <input id="target" value="127.0.0.1" spellcheck="false">
           </label>
+          <label>Engagement preset
+            <select id="preset">
+              <option value="">custom (use profile below)</option>
+              <option value="discovery">discovery — host liveness</option>
+              <option value="map">map — service map</option>
+              <option value="safe">safe — safe NSE depth</option>
+              <option value="depth">depth — full TCP/scripts</option>
+              <option value="vuln">vuln — vuln NSE (authorized)</option>
+              <option value="hybrid">hybrid — discovery + version</option>
+            </select>
+          </label>
           <div class="row">
             <label>Scan profile
               <select id="scanType">
@@ -151,6 +162,7 @@ UI_HTML = r"""<!doctype html>
               <button data-view="json" type="button" role="tab" aria-selected="false" aria-controls="resultBox">JSON</button>
               <button data-view="jsonl" type="button" role="tab" aria-selected="false" aria-controls="resultBox">JSONL</button>
               <button data-view="plan" type="button" role="tab" aria-selected="false" aria-controls="resultBox">Recon Plan</button>
+              <button data-view="brief" type="button" role="tab" aria-selected="false" aria-controls="resultBox">AI Brief</button>
               <button data-view="diff" type="button" role="tab" aria-selected="false" aria-controls="resultBox">Diff</button>
             </div>
           </header>
@@ -166,6 +178,7 @@ UI_HTML = r"""<!doctype html>
               <span class="hint" id="resultLabel">No scan result yet.</span>
               <div class="actions">
                 <button class="secondary" id="planBtn" type="button">Build Plan</button>
+                <button class="secondary" id="briefBtn" type="button">AI Pack</button>
                 <button class="secondary" id="copyBtn" type="button">Copy View</button>
               </div>
             </div>

@@ -427,6 +427,8 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Scan History", body)
         self.assertIn("Import XML", body)
         self.assertIn("Diff last two", body)
+        self.assertIn("AI Brief", body)
+        self.assertIn("Engagement preset", body)
         self.assertIn("/static/dashboard.css", body)
         self.assertIn("/static/dashboard.js", body)
         self.assertIn("/static/favicon.svg", body)

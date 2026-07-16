@@ -38,9 +38,20 @@ curl -sS -H "X-API-KEY: $API_TOKEN" \
 
 ### Line types (`t`)
 
-`meta`, `host`, `svc`, `finding`, `next`, `gap`, `inv`, `defense`, `ask`, and for retest: `diff`, `change`
+`meta`, `host`, `svc`, `finding`, `next`, `gap`, `inv`, `defense`, `ask`, `posture`, `drift`,
+and for retest: `diff`, `change`
 
 Schema: `recon-ai-pack/v1`.
+
+### Expected posture (defense verification)
+
+Set `EXPECTED_POSTURE` / `EXPECTED_POSTURE_FILE` or POST to `/posture/evaluate`:
+
+```json
+{"deny_unexpected": true, "services": [{"port": 22, "proto": "tcp", "name": "ssh"}]}
+```
+
+Drift rows appear in AI packs automatically when posture is configured.
 
 ### Retest (baseline vs current)
 
