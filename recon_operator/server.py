@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import InvalidToken
 from dotenv import load_dotenv
 from quart import Quart, g, jsonify, request
 from telegram import Bot
@@ -29,6 +29,7 @@ from telegram.error import TelegramError
 
 from recon_operator import auth as _auth
 from recon_operator import config as _config
+from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 from recon_planner import build_recon_plan, recon_plan_to_jsonl, recon_plan_to_markdown
 from scan_engine import (
     PRODUCT_NAME,
@@ -113,6 +114,9 @@ TARGET_ALLOWLIST = _config.TARGET_ALLOWLIST
 HOST_TIMEOUT_SEC = _config.HOST_TIMEOUT_SEC
 NMAP_MAX_RETRIES = _config.NMAP_MAX_RETRIES
 FERNET_KEY = _config.FERNET_KEY
+FERNET_PREVIOUS_KEYS_RAW = _config.FERNET_PREVIOUS_KEYS_RAW
+AUDIT_LOG_PATH = _config.AUDIT_LOG_PATH
+AUDIT_LOG_MAX_EVENTS = _config.AUDIT_LOG_MAX_EVENTS
 
 # --- Auth surface (source of truth: recon_operator.auth) ---
 API_KEY_SCOPES = _auth.API_KEY_SCOPES
@@ -175,17 +179,12 @@ if API_AUTH_REQUIRED and not API_AUTH_TOKENS:
         "Set API_AUTH_TOKEN, API_AUTH_TOKENS, and/or API_AUTH_KEYS."
     )
 
-if not FERNET_KEY:
-    raise RuntimeError(
-        "FERNET_KEY is not set. Provide it in .env or the environment. "
-        "Without it stored results cannot be decrypted."
-    )
 try:
-    cipher = Fernet(FERNET_KEY.encode())
-except Exception as exc:
-    raise RuntimeError(
-        "Invalid FERNET_KEY. Check the format (must be a valid Fernet key)."
-    ) from exc
+    FERNET_KEYS = load_fernet_key_material()
+    cipher = build_fernet_cipher(FERNET_KEYS)
+except RuntimeError:
+    raise
+FERNET_KEY_COUNT = len(FERNET_KEYS)
 
 
 # Static UI assets live at the repo-root ``static/`` directory (not under this package).
@@ -246,6 +245,73 @@ def get_scan_type_choices() -> str:
 def log_event(event: str):
     logging.info(event)
     print(event)
+
+
+def record_audit_event(
+    action: str,
+    *,
+    target: Optional[str] = None,
+    scan_type: Optional[str] = None,
+    job_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    result_file: Optional[str] = None,
+    status: Optional[str] = None,
+    detail: Optional[str] = None,
+    actor_key_id: Optional[str] = None,
+    actor_owner_prefix: Optional[str] = None,
+) -> None:
+    """Append a security-relevant event without secrets (tokens/keys).
+
+    Stored in SQLite via state_store; optionally mirrored to AUDIT_LOG_PATH as JSONL.
+    """
+    try:
+        key_id = actor_key_id if actor_key_id is not None else current_api_key_id()
+        if actor_owner_prefix is not None:
+            owner_prefix = actor_owner_prefix
+        else:
+            owner = current_owner_id()
+            owner_prefix = owner[:12] if owner else None
+        # Bound free-text fields; never accept raw tokens.
+        safe_detail = (detail or "")[:500] or None
+        ts = _utc_now_iso()
+        state_store.append_audit_event(
+            ts=ts,
+            action=action,
+            actor_key_id=(str(key_id)[:64] if key_id else None),
+            actor_owner_prefix=(str(owner_prefix)[:16] if owner_prefix else None),
+            target=(str(target)[:256] if target else None),
+            scan_type=(str(scan_type)[:64] if scan_type else None),
+            job_id=(str(job_id)[:64] if job_id else None),
+            task_id=(str(task_id)[:200] if task_id else None),
+            result_file=(str(result_file)[:260] if result_file else None),
+            status=(str(status)[:64] if status else None),
+            detail=safe_detail,
+            max_events=AUDIT_LOG_MAX_EVENTS,
+        )
+        if AUDIT_LOG_PATH:
+            line = json.dumps(
+                {
+                    "ts": ts,
+                    "action": action,
+                    "actor_key_id": key_id,
+                    "actor_owner_prefix": owner_prefix,
+                    "target": target,
+                    "scan_type": scan_type,
+                    "job_id": job_id,
+                    "task_id": task_id,
+                    "result_file": result_file,
+                    "status": status,
+                    "detail": safe_detail,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            path = Path(AUDIT_LOG_PATH)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception as exc:
+        log_event(f"Audit log write failed: {exc}")
 
 
 def _validate_scan_payload(
@@ -1129,12 +1195,29 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             result_file=result_file,
             error=None,
         )
+        record_audit_event(
+            "scan.finish",
+            target=target,
+            scan_type=scan_type,
+            job_id=job_id,
+            result_file=result_file,
+            status="completed",
+            actor_owner_prefix=(owner_id[:12] if owner_id else None),
+        )
     except asyncio.CancelledError:
         await _set_job_fields(
             job_id,
             status="cancelled",
             finished_at=_utc_now_iso(),
             error="Scan cancelled",
+        )
+        record_audit_event(
+            "scan.finish",
+            target=target,
+            scan_type=scan_type,
+            job_id=job_id,
+            status="cancelled",
+            actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
         raise
     except asyncio.TimeoutError:
@@ -1147,6 +1230,14 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             finished_at=_utc_now_iso(),
             error=err,
         )
+        record_audit_event(
+            "scan.finish",
+            target=target,
+            scan_type=scan_type,
+            job_id=job_id,
+            status="timeout",
+            actor_owner_prefix=(owner_id[:12] if owner_id else None),
+        )
     except TimeoutError as exc:
         err = str(exc)
         log_event(err)
@@ -1157,6 +1248,14 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             finished_at=_utc_now_iso(),
             error=err,
         )
+        record_audit_event(
+            "scan.finish",
+            target=target,
+            scan_type=scan_type,
+            job_id=job_id,
+            status="timeout",
+            actor_owner_prefix=(owner_id[:12] if owner_id else None),
+        )
     except (NmapNotFoundError, NmapScanError, Exception) as exc:
         err = f"Scan error for {target} ({scan_type}): {exc}"
         log_event(err)
@@ -1166,6 +1265,15 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             status="failed",
             finished_at=_utc_now_iso(),
             error=str(exc),
+        )
+        record_audit_event(
+            "scan.finish",
+            target=target,
+            scan_type=scan_type,
+            job_id=job_id,
+            status="failed",
+            detail=str(exc)[:200],
+            actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
     finally:
         if heartbeat is not None:
@@ -1300,6 +1408,15 @@ async def create_scan_job(
         # Low-latency local attempt; claim ensures only one worker executes.
         task = asyncio.create_task(_run_scan_job(job_id))
         job["task"] = task
+        record_audit_event(
+            "scan.create",
+            target=target,
+            scan_type=scan_type,
+            job_id=job_id,
+            status="queued",
+            detail=kind,
+            actor_owner_prefix=owner[:12] if owner else None,
+        )
         return _job_public_view(job, include_result=False)
 
 
@@ -1467,6 +1584,13 @@ async def cancel_job(job_id: str):
         _persist_job(job)
     _release_redis_job_lease(job_id)
     log_event(f"Job {job_id} cancelled")
+    record_audit_event(
+        "scan.cancel",
+        target=job.get("target"),
+        scan_type=job.get("scan_type"),
+        job_id=job_id,
+        status="cancelled",
+    )
     return jsonify({"message": f"Job {job_id} cancelled", "job_id": job_id}), 200
 
 
@@ -1722,6 +1846,14 @@ async def add_scheduled_scan():
                 }
             )
         log_event(f"Scan {target} scheduled every {interval} minutes")
+        record_audit_event(
+            "schedule.create",
+            target=target,
+            scan_type=scan_type,
+            task_id=task_id,
+            status="scheduled",
+            detail=f"interval={interval}",
+        )
 
         return jsonify(
             {
@@ -1815,6 +1947,7 @@ async def cancel_task(task_id):
         log_event(f"Failed to delete persisted task {task_id}: {exc}")
     if deleted:
         log_event(f"Task {task_id} cancelled")
+        record_audit_event("schedule.cancel", task_id=task_id, status="cancelled")
         await send_telegram_message(f"Task {task_id} cancelled")
         return jsonify({"message": f"Task {task_id} cancelled"}), 200
     return jsonify({"error": "Task not found"}), 404
@@ -1979,6 +2112,13 @@ async def import_result_xml():
         result.get("target") or "xml-import",
         scan_type,
         owner_id=current_owner_id(),
+    )
+    record_audit_event(
+        "result.import",
+        target=result.get("target") or "xml-import",
+        scan_type=scan_type,
+        result_file=filename,
+        status="imported",
     )
     return jsonify({"id": filename, "filename": filename, "result": result}), 201
 
@@ -2174,6 +2314,7 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "telegram_configured": bot is not None,
         "uptime": str(_utc_now() - start_time),
         "fernet_key_configured": bool(FERNET_KEY),
+        "fernet_key_count": FERNET_KEY_COUNT,
         "nmap_available": nmap_available,
         "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
@@ -2324,6 +2465,34 @@ def build_openapi_spec() -> dict:
                         "200": {"description": "Key id, label, scopes, owner prefix"},
                         "401": {"description": "Missing API token"},
                         "403": {"description": "Invalid or revoked key"},
+                    },
+                }
+            },
+            "/audit": {
+                "get": {
+                    "summary": "List recent audit events (admin)",
+                    "parameters": [
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "schema": {"type": "integer", "default": 100, "maximum": 1000},
+                        },
+                        {
+                            "name": "action",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "Filter by action (e.g. scan.create)",
+                        },
+                        {
+                            "name": "actor",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "Filter by API key id",
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Audit event list"},
+                        "403": {"description": "Admin scope required"},
                     },
                 }
             },
@@ -2598,6 +2767,31 @@ async def auth_whoami():
     )
 
 
+@app.route("/audit", methods=["GET"])
+async def list_audit_events():
+    """List recent audit events (admin). Never includes API tokens or Fernet keys."""
+    auth_error = require_api_auth("admin")
+    if auth_error:
+        return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    limit = _parse_optional_limit(request.args.get("limit"), default=100, max_value=1000)
+    action = (request.args.get("action") or "").strip() or None
+    actor = (request.args.get("actor") or request.args.get("key_id") or "").strip() or None
+    try:
+        events = await asyncio.to_thread(
+            state_store.list_audit_events,
+            limit=limit,
+            action=action,
+            actor_key_id=actor,
+        )
+    except Exception as exc:
+        log_event(f"Failed to list audit events: {exc}")
+        return jsonify({"error": "Failed to list audit events"}), 500
+    return jsonify({"events": events, "count": len(events)}), 200
+
+
 @app.route("/api/docs", methods=["GET"])
 async def api_docs():
     return jsonify(
@@ -2622,6 +2816,15 @@ async def api_docs():
                 "GET /auth/whoami": {
                     "description": "Authenticated key id, label, scopes, owner prefix (no secret)",
                     "scope": "any valid key",
+                },
+                "GET /audit": {
+                    "description": "Recent audit events (who scanned what when; no secrets)",
+                    "scope": "admin",
+                    "query": {
+                        "limit": "Max events (default 100, max 1000)",
+                        "action": "Optional action filter (scan.create, scan.finish, …)",
+                        "actor": "Optional API key id filter",
+                    },
                 },
                 "POST /scan": {
                     "description": "Queue an immediate scan (202 job) or wait with ?wait=1",

@@ -49,6 +49,24 @@ CREATE TABLE IF NOT EXISTS leadership (
     owner_id TEXT NOT NULL,
     lease_until REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor_key_id TEXT,
+    actor_owner_prefix TEXT,
+    target TEXT,
+    scan_type TEXT,
+    job_id TEXT,
+    task_id TEXT,
+    result_file TEXT,
+    status TEXT,
+    detail TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action);
 """
 
 
@@ -418,6 +436,89 @@ class StateStore:
                 (lock_name, worker_id),
             )
             conn.commit()
+
+    def append_audit_event(
+        self,
+        *,
+        ts: str,
+        action: str,
+        actor_key_id: Optional[str] = None,
+        actor_owner_prefix: Optional[str] = None,
+        target: Optional[str] = None,
+        scan_type: Optional[str] = None,
+        job_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        result_file: Optional[str] = None,
+        status: Optional[str] = None,
+        detail: Optional[str] = None,
+        max_events: int = 10_000,
+    ) -> None:
+        """Append an audit event and prune oldest rows beyond max_events."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_events(
+                    ts, action, actor_key_id, actor_owner_prefix, target, scan_type,
+                    job_id, task_id, result_file, status, detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    action,
+                    actor_key_id,
+                    actor_owner_prefix,
+                    target,
+                    scan_type,
+                    job_id,
+                    task_id,
+                    result_file,
+                    status,
+                    detail,
+                ),
+            )
+            if max_events > 0:
+                conn.execute(
+                    """
+                    DELETE FROM audit_events
+                    WHERE id NOT IN (
+                        SELECT id FROM audit_events ORDER BY id DESC LIMIT ?
+                    )
+                    """,
+                    (int(max_events),),
+                )
+            conn.commit()
+
+    def list_audit_events(
+        self,
+        *,
+        limit: int = 100,
+        action: Optional[str] = None,
+        actor_key_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 1000))
+        clauses: List[str] = []
+        params: List[Any] = []
+        if action:
+            clauses.append("action = ?")
+            params.append(action)
+        if actor_key_id:
+            clauses.append("actor_key_id = ?")
+            params.append(actor_key_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, ts, action, actor_key_id, actor_owner_prefix, target, scan_type,
+                       job_id, task_id, result_file, status, detail
+                FROM audit_events
+                {where}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:

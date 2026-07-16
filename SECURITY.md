@@ -42,3 +42,8 @@ contact channel without disclosing the vulnerability.
 - Treat generated recon commands as operator-reviewed suggestions, not autonomous actions.
 - Back up the Fernet key separately from encrypted results and rotate API credentials after
   suspected exposure.
+- Fernet rotation: generate a new `FERNET_KEY`, move the old value into
+  `FERNET_PREVIOUS_KEYS` (comma-separated or JSON array). New results encrypt with the
+  primary key; decrypt accepts primary + previous until legacy files are re-written.
+- Audit trail: `GET /audit` (admin) lists who scanned what when (key id + owner prefix,
+  no tokens/keys). Optionally set `AUDIT_LOG_PATH` for a JSONL mirror.

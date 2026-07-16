@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.9.3  
+**Текущая версия кода:** 1.9.4  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -178,8 +178,8 @@
 | P2-03 | ~~Favicon + static asset pipeline~~ | `static/favicon.svg` + `/favicon.ico` route | S |
 | P2-04 | ~~Pin GitHub Actions by SHA~~ | `actions/*@<full-sha> # vN` in `ci.yml` | S |
 | P2-05 | ~~Pin Compose image digests on publish~~ | `redis:7-alpine@sha256:…` in `compose.yaml` | S |
-| P2-06 | Key rotation for Fernet (multi-key) | encrypt new, decrypt old | M |
-| P2-07 | Audit log (who scanned what when) | append-only, no secrets | M |
+| P2-06 | ~~Key rotation for Fernet (multi-key)~~ | `FERNET_PREVIOUS_KEYS` + MultiFernet; `decrypt.py` aligned | M |
+| P2-07 | ~~Audit log (who scanned what when)~~ | SQLite `audit_events` + optional JSONL; `GET /audit` admin | M |
 | P2-08 | ~~Trusted reverse-proxy mode~~ | `TRUSTED_PROXY_MODE` + `TRUSTED_PROXIES` allowlist | S |
 | P2-09 | GitNexus PDG/taint pass | security review automation | S |
 | P2-10 | Structured logging (JSON optional) | correlation id per job | M |
@@ -415,6 +415,7 @@
 | 2026-07-16 | 1.9.1 | P2-01 leaf extract: real `config` + `auth` modules; server re-exports |
 | 2026-07-16 | 1.9.2 | P2-02/03 static UI assets + favicon + cache headers |
 | 2026-07-16 | 1.9.3 | P2-04/05/08: pin GHA+redis digests; trusted proxy mode |
+| 2026-07-16 | 1.9.4 | P2-06/07: Fernet multi-key rotation + audit log |
 
 ---
 

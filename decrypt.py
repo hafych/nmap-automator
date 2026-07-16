@@ -3,8 +3,10 @@ import os
 import sys
 import tempfile
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import InvalidToken
 from dotenv import load_dotenv
+
+from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 
 load_dotenv()
 
@@ -46,14 +48,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    fernet_key = os.getenv("FERNET_KEY", "").strip()
-    if not fernet_key:
-        raise RuntimeError("FERNET_KEY is required in environment.")
-
-    try:
-        cipher = Fernet(fernet_key.encode())
-    except Exception as exc:
-        raise RuntimeError("Invalid FERNET_KEY. Must be valid Fernet key.") from exc
+    # Primary FERNET_KEY encrypts; FERNET_PREVIOUS_KEYS decrypt older results.
+    keys = load_fernet_key_material()
+    cipher = build_fernet_cipher(keys)
 
     with open(args.input_file, "rb") as f:
         encrypted_data = f.read()

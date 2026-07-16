@@ -389,6 +389,34 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["status"], "healthy")
         self.assertIn("jobs_count", payload)
+        self.assertIn("fernet_key_count", payload)
+        self.assertGreaterEqual(payload["fernet_key_count"], 1)
+
+    async def test_audit_requires_admin_and_lists_events(self):
+        autonmap.record_audit_event(
+            "scan.create",
+            target="127.0.0.1",
+            scan_type="Ping",
+            job_id="audit-job-1",
+            status="queued",
+            actor_key_id="primary",
+            actor_owner_prefix="abcd12345678",
+        )
+        denied = await self.client.get("/audit")
+        self.assertEqual(denied.status_code, 401)
+
+        response = await self.client.get(
+            "/audit?limit=10&action=scan.create",
+            headers={"X-API-KEY": "test-token"},
+        )
+        payload = await response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(payload["count"], 1)
+        self.assertTrue(any(ev.get("job_id") == "audit-job-1" for ev in payload["events"]))
+        # Secrets must never appear in audit payloads.
+        blob = str(payload)
+        self.assertNotIn("test-token", blob)
+        self.assertNotIn(autonmap.FERNET_KEY, blob)
 
     async def test_dashboard_loads(self):
         response = await self.client.get("/")
