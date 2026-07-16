@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.9.2  
+**Текущая версия кода:** 1.9.3  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -176,11 +176,11 @@
 | P2-01 | ~~Разбить `autonmap.py` god-module~~ | `recon_operator/` package + leaf `config`/`auth`; jobs/scheduler/api still server-backed | L |
 | P2-02 | ~~Static UI assets + cache headers~~ | `static/dashboard.{css,js}` + public cache; HTML shell in `ui.py` | M |
 | P2-03 | ~~Favicon + static asset pipeline~~ | `static/favicon.svg` + `/favicon.ico` route | S |
-| P2-04 | Pin GitHub Actions by SHA | Dependabot updates digests | S |
-| P2-05 | Pin Compose image digests on publish | | S |
+| P2-04 | ~~Pin GitHub Actions by SHA~~ | `actions/*@<full-sha> # vN` in `ci.yml` | S |
+| P2-05 | ~~Pin Compose image digests on publish~~ | `redis:7-alpine@sha256:…` in `compose.yaml` | S |
 | P2-06 | Key rotation for Fernet (multi-key) | encrypt new, decrypt old | M |
 | P2-07 | Audit log (who scanned what when) | append-only, no secrets | M |
-| P2-08 | Trusted reverse-proxy mode | `X-Forwarded-For` opt-in, documented | S |
+| P2-08 | ~~Trusted reverse-proxy mode~~ | `TRUSTED_PROXY_MODE` + `TRUSTED_PROXIES` allowlist | S |
 | P2-09 | GitNexus PDG/taint pass | security review automation | S |
 | P2-10 | Structured logging (JSON optional) | correlation id per job | M |
 | P2-11 | Metrics endpoint (Prometheus) | jobs active, scan duration, errors | M |
@@ -414,6 +414,7 @@
 | 2026-07-16 | 1.9.0 | P2-01 package boundary: `recon_operator/` + `autonmap` compatibility shim |
 | 2026-07-16 | 1.9.1 | P2-01 leaf extract: real `config` + `auth` modules; server re-exports |
 | 2026-07-16 | 1.9.2 | P2-02/03 static UI assets + favicon + cache headers |
+| 2026-07-16 | 1.9.3 | P2-04/05/08: pin GHA+redis digests; trusted proxy mode |
 
 ---
 

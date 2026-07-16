@@ -83,6 +83,9 @@ MAX_RATE_LIMIT_CLIENTS = _config.MAX_RATE_LIMIT_CLIENTS
 REDIS_URL = _config.REDIS_URL
 REDIS_RATE_LIMIT_PREFIX = _config.REDIS_RATE_LIMIT_PREFIX
 RATE_LIMIT_INCLUDE_OWNER = _config.RATE_LIMIT_INCLUDE_OWNER
+TRUSTED_PROXY_MODE = _config.TRUSTED_PROXY_MODE
+TRUSTED_PROXIES = _config.TRUSTED_PROXIES
+_load_trusted_proxies = _config._load_trusted_proxies
 WORKER_ID = _config.WORKER_ID
 JOB_LEASE_SECONDS = _config.JOB_LEASE_SECONDS
 JOB_CLAIM_POLL_SECONDS = _config.JOB_CLAIM_POLL_SECONDS
@@ -416,8 +419,65 @@ def make_task_id(target: str, scan_type: str, owner_id: Optional[str] = None) ->
     return f"o{owner[:12]}-{target}-{scan_type}"
 
 
+def _peer_is_trusted_proxy(peer: str) -> bool:
+    """Return True when the direct TCP peer is listed in TRUSTED_PROXIES."""
+    if not peer or peer == "unknown":
+        return False
+    try:
+        peer_ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    for entry in TRUSTED_PROXIES:
+        try:
+            if "/" in entry:
+                if peer_ip in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif peer_ip == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _first_valid_ip(candidates: str) -> Optional[str]:
+    """Return the first parseable IP from a comma-separated header value."""
+    for part in candidates.split(","):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        # Strip optional port for IPv4 host:port (not bracketed IPv6).
+        if candidate.count(":") == 1 and not candidate.startswith("["):
+            candidate = candidate.split(":", 1)[0].strip()
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return None
+
+
 def _client_key() -> str:
-    return request.remote_addr or "unknown"
+    """Client identifier for rate limiting.
+
+    By default uses the direct peer address. When ``TRUSTED_PROXY_MODE`` is on
+    and the peer is in ``TRUSTED_PROXIES``, prefer ``X-Forwarded-For`` (leftmost
+    valid IP) or ``X-Real-IP``. Spoofed headers from untrusted peers are ignored.
+    """
+    peer = request.remote_addr or "unknown"
+    if not TRUSTED_PROXY_MODE or not _peer_is_trusted_proxy(peer):
+        return peer
+
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        forwarded = _first_valid_ip(xff)
+        if forwarded:
+            return forwarded
+
+    xreal = (request.headers.get("X-Real-IP") or "").strip()
+    if xreal:
+        real_ip = _first_valid_ip(xreal)
+        if real_ip:
+            return real_ip
+    return peer
 
 
 def _cleanup_finished_tasks() -> list:
@@ -2119,6 +2179,8 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         "rate_limit_backend": rate_limit_backend(),
         "rate_limit_include_owner": RATE_LIMIT_INCLUDE_OWNER,
+        "trusted_proxy_mode": TRUSTED_PROXY_MODE,
+        "trusted_proxies_count": len(TRUSTED_PROXIES),
         "max_concurrent_scans": MAX_CONCURRENT_SCANS,
         "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
         "max_scan_jobs": MAX_SCAN_JOBS,

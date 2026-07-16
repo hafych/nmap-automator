@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -72,6 +72,49 @@ REDIS_RATE_LIMIT_PREFIX = (
 )
 # Include authenticated owner hash in the bucket so tokens are limited independently of IP.
 RATE_LIMIT_INCLUDE_OWNER = _parse_bool_env("RATE_LIMIT_INCLUDE_OWNER", True)
+
+# Trusted reverse-proxy mode (opt-in). When enabled, client IP for rate limits may come
+# from X-Forwarded-For / X-Real-IP — but only when the direct peer is in TRUSTED_PROXIES.
+TRUSTED_PROXY_MODE = _parse_bool_env("TRUSTED_PROXY_MODE", False)
+
+
+def _load_trusted_proxies() -> List[str]:
+    """Load proxy peer allowlist (IPs or CIDRs). Empty when proxy mode is off."""
+    entries: List[str] = []
+    raw = os.getenv("TRUSTED_PROXIES", "").strip()
+    if raw:
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "TRUSTED_PROXIES must be a JSON array or comma-separated list"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise RuntimeError("TRUSTED_PROXIES JSON value must be an array of strings")
+            entries.extend(str(item).strip() for item in parsed if str(item).strip())
+        else:
+            entries.extend(part.strip() for part in raw.split(",") if part.strip())
+
+    unique: List[str] = []
+    seen = set()
+    for entry in entries:
+        key = entry.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+        if len(unique) > 1000:
+            raise RuntimeError("TRUSTED_PROXIES exceeds 1000 entries")
+    return unique
+
+
+TRUSTED_PROXIES = _load_trusted_proxies()
+if TRUSTED_PROXY_MODE and not TRUSTED_PROXIES:
+    raise RuntimeError(
+        "TRUSTED_PROXY_MODE=true requires a non-empty TRUSTED_PROXIES allowlist "
+        "(IPs/CIDRs of reverse proxies that may set X-Forwarded-For / X-Real-IP)."
+    )
 
 # Multi-worker job leases (SQLite claim + optional Redis fence).
 WORKER_ID = (os.getenv("WORKER_ID", "").strip() or f"worker-{uuid.uuid4().hex[:12]}")[:64]

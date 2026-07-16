@@ -30,7 +30,8 @@ services:
   # Then set REDIS_URL=redis://redis:6379/0 in .env
   redis:
     profiles: ["redis"]
-    image: redis:7-alpine
+    # Multi-arch manifest digest for redis:7-alpine (refresh periodically).
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "127.0.0.1:6379:6379"

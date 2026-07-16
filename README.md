@@ -216,6 +216,8 @@ The default deployment is intentionally local and single-operator:
 - dashboard CSP uses per-response nonces plus `'self'` for `/static/*` (no `unsafe-inline`);
 - static UI assets and favicon are served with short public cache headers;
 - the server and Compose port bind to loopback;
+- GitHub Actions and optional Compose Redis image are pinned by digest/SHA;
+- trusted reverse-proxy client IP is opt-in (`TRUSTED_PROXY_MODE` + `TRUSTED_PROXIES`);
 - scan types are allow-listed and targets are bounded;
 - subprocesses use argv rather than a shell;
 - Nmap XML uses an XXE-safe parser;
@@ -260,6 +262,8 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets (memory backend) |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window |
 | `REDIS_URL` | empty | Optional Redis URL for shared rate limits and job-lease fence |
+| `TRUSTED_PROXY_MODE` | `false` | Opt-in: honor `X-Forwarded-For` / `X-Real-IP` for rate-limit client IP |
+| `TRUSTED_PROXIES` | empty | Required when proxy mode is on: proxy peer IPs/CIDRs (comma or JSON) |
 | `REDIS_RATE_LIMIT_PREFIX` | `recon_operator:rl:` | Key prefix for Redis rate-limit sorted sets |
 | `RATE_LIMIT_INCLUDE_OWNER` | `true` | Bucket by IP + token owner hash (multi-token isolation) |
 | `WORKER_ID` | random | Stable worker identity for job leases (set per process) |

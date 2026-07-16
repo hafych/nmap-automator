@@ -255,6 +255,71 @@ class RateLimitTests(unittest.TestCase):
             autonmap.RATE_LIMIT_INCLUDE_OWNER = original_flag
             autonmap._client_key = original_client_key
 
+    def test_peer_trust_and_forwarded_ip_parsing(self):
+        original_mode = autonmap.TRUSTED_PROXY_MODE
+        original_proxies = list(autonmap.TRUSTED_PROXIES)
+        try:
+            autonmap.TRUSTED_PROXY_MODE = True
+            autonmap.TRUSTED_PROXIES[:] = ["10.0.0.0/8", "127.0.0.1"]
+            self.assertTrue(autonmap._peer_is_trusted_proxy("10.1.2.3"))
+            self.assertTrue(autonmap._peer_is_trusted_proxy("127.0.0.1"))
+            self.assertFalse(autonmap._peer_is_trusted_proxy("8.8.8.8"))
+            self.assertFalse(autonmap._peer_is_trusted_proxy("unknown"))
+            self.assertEqual(autonmap._first_valid_ip("203.0.113.9, 10.0.0.1"), "203.0.113.9")
+            self.assertEqual(autonmap._first_valid_ip("not-an-ip, 198.51.100.4"), "198.51.100.4")
+            self.assertIsNone(autonmap._first_valid_ip("bogus"))
+        finally:
+            autonmap.TRUSTED_PROXY_MODE = original_mode
+            autonmap.TRUSTED_PROXIES[:] = original_proxies
+
+    def test_client_key_uses_xff_only_from_trusted_peer(self):
+        original_mode = autonmap.TRUSTED_PROXY_MODE
+        original_proxies = list(autonmap.TRUSTED_PROXIES)
+        try:
+            autonmap.TRUSTED_PROXY_MODE = True
+            autonmap.TRUSTED_PROXIES[:] = ["127.0.0.1"]
+
+            class _Req:
+                def __init__(self, remote_addr, headers):
+                    self.remote_addr = remote_addr
+                    self.headers = headers
+
+            original_request = autonmap.request
+            try:
+                autonmap.request = _Req("127.0.0.1", {"X-Forwarded-For": "203.0.113.50, 10.0.0.2"})
+                self.assertEqual(autonmap._client_key(), "203.0.113.50")
+
+                autonmap.request = _Req("8.8.8.8", {"X-Forwarded-For": "203.0.113.50"})
+                self.assertEqual(autonmap._client_key(), "8.8.8.8")
+
+                autonmap.request = _Req("127.0.0.1", {"X-Real-IP": "198.51.100.7"})
+                self.assertEqual(autonmap._client_key(), "198.51.100.7")
+            finally:
+                autonmap.request = original_request
+        finally:
+            autonmap.TRUSTED_PROXY_MODE = original_mode
+            autonmap.TRUSTED_PROXIES[:] = original_proxies
+
+    def test_load_trusted_proxies_from_env(self):
+        with mock.patch.dict(
+            os.environ,
+            {"TRUSTED_PROXIES": "127.0.0.1, 10.0.0.0/8, 127.0.0.1"},
+            clear=False,
+        ):
+            self.assertEqual(
+                autonmap._load_trusted_proxies(),
+                ["127.0.0.1", "10.0.0.0/8"],
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"TRUSTED_PROXIES": '["192.0.2.1"]'},
+            clear=False,
+        ):
+            self.assertEqual(autonmap._load_trusted_proxies(), ["192.0.2.1"])
+        with mock.patch.dict(os.environ, {"TRUSTED_PROXIES": "[not-json"}, clear=False):
+            with self.assertRaises(RuntimeError):
+                autonmap._load_trusted_proxies()
+
 
 class ResultPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_encrypted_results_are_owner_only(self):
