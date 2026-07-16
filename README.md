@@ -186,6 +186,8 @@ curl http://127.0.0.1:5000/openapi.json
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/` and `/ui` | Browser dashboard |
+| `GET` | `/static/*` | Dashboard CSS/JS/favicon assets (public cache) |
+| `GET` | `/favicon.ico` | Favicon (SVG) |
 | `GET` | `/live` | Liveness probe (process up) |
 | `GET` | `/ready` | Readiness probe (Nmap available) |
 | `GET` | `/health` | Detailed health snapshot |
@@ -211,7 +213,8 @@ curl http://127.0.0.1:5000/openapi.json
 The default deployment is intentionally local and single-operator:
 
 - authentication is required by default (one or more API tokens);
-- dashboard CSP uses per-response nonces (no `unsafe-inline`);
+- dashboard CSP uses per-response nonces plus `'self'` for `/static/*` (no `unsafe-inline`);
+- static UI assets and favicon are served with short public cache headers;
 - the server and Compose port bind to loopback;
 - scan types are allow-listed and targets are bounded;
 - subprocesses use argv rather than a shell;
@@ -376,7 +379,8 @@ pip-audit -r requirements.txt
 | `recon_operator/server.py` | Quart app, routes, jobs, scheduling, encryption |
 | `scan_engine.py` | Nmap runner, hybrid Naabu/RustScan discovery, import, diff |
 | `state_store.py` | SQLite persistence for jobs and schedules |
-| `ui.py` | Self-contained operator dashboard |
+| `ui.py` | Operator dashboard HTML shell (CSS/JS in `static/`) |
+| `static/` | Cacheable dashboard assets (`dashboard.css`, `dashboard.js`, `favicon.svg`) |
 | `kali_ai_scan.py` | CLI Nmap runner, safe XML parser, AI artifact generator |
 | `tool_inventory.py` | Kali package and command inventory |
 | `recon_planner.py` | Service-aware multi-tool follow-up plans (review-only) |

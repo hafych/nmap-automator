@@ -185,7 +185,13 @@ except Exception as exc:
     ) from exc
 
 
-app = Quart(__name__)
+# Static UI assets live at the repo-root ``static/`` directory (not under this package).
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+app = Quart(
+    __name__,
+    static_folder=str(_STATIC_DIR),
+    static_url_path="/static",
+)
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BODY_BYTES
 scan_tasks: Dict[str, asyncio.Task] = {}
 scan_jobs: Dict[str, Dict[str, Any]] = {}
@@ -2016,10 +2022,13 @@ async def recon_plan():
 def _render_dashboard_html() -> tuple:
     nonce = secrets.token_urlsafe(18)
     html = UI_HTML.replace("__CSP_NONCE__", nonce)
+    # 'self' covers /static/* assets; nonces still bind the dashboard link/script tags.
     csp = (
-        f"default-src 'self'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
-        f"connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; "
-        f"form-action 'self'"
+        f"default-src 'self'; "
+        f"style-src 'self' 'nonce-{nonce}'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        f"connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; "
+        f"base-uri 'self'; form-action 'self'"
     )
     return (
         html,
@@ -2027,6 +2036,7 @@ def _render_dashboard_html() -> tuple:
         {
             "Content-Type": "text/html; charset=utf-8",
             "Content-Security-Policy": csp,
+            "Cache-Control": "no-store",
         },
     )
 
@@ -2037,9 +2047,24 @@ async def dashboard():
     return _render_dashboard_html()
 
 
+@app.route("/favicon.ico", methods=["GET"])
+async def favicon():
+    """Browsers probe /favicon.ico; serve the SVG asset with cacheable headers."""
+    path = _STATIC_DIR / "favicon.svg"
+    if not path.is_file():
+        return "", 404
+    return await app.send_static_file("favicon.svg")
+
+
 @app.after_request
 async def add_security_headers(response):
-    response.headers.setdefault("Cache-Control", "no-store")
+    path = request.path or ""
+    is_static = path.startswith("/static/") or path == "/favicon.ico"
+    if is_static:
+        # Fingerprint-free static assets: short public cache (override no-store default).
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    else:
+        response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -2047,7 +2072,11 @@ async def add_security_headers(response):
     # HTML dashboard sets a nonce-based CSP; API responses get a tight default.
     if "Content-Security-Policy" not in response.headers:
         content_type = (response.content_type or "").lower()
-        if "text/html" in content_type:
+        if is_static:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+            )
+        elif "text/html" in content_type:
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; frame-ancestors 'none'; base-uri 'self'"
             )
