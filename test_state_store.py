@@ -116,6 +116,10 @@ class StateStoreTests(unittest.TestCase):
             )
             self.assertIsNotNone(third)
             self.assertEqual(third["lease_owner"], "worker-b")
+            # Keep lease-1 active so claim_next must pick a different job.
+            self.assertTrue(
+                store.renew_job_lease("lease-1", "worker-b", now=now + 120, lease_seconds=300)
+            )
 
             store.upsert_job(
                 {
@@ -130,14 +134,14 @@ class StateStoreTests(unittest.TestCase):
             )
             claimed = store.claim_next_job(
                 "worker-c",
-                now=now + 120,
+                now=now + 125,
                 lease_seconds=30,
                 started_at="t5",
             )
             self.assertIsNotNone(claimed)
             self.assertEqual(claimed["job_id"], "lease-2")
             self.assertTrue(
-                store.renew_job_lease("lease-2", "worker-c", now=now + 125, lease_seconds=30)
+                store.renew_job_lease("lease-2", "worker-c", now=now + 130, lease_seconds=30)
             )
             store.release_job_lease("lease-2", "worker-c")
             released = store.get_job("lease-2")
