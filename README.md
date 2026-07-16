@@ -9,6 +9,9 @@
 
 > Formerly **Nmap Automator**. The product is not Nmap-only: it orchestrates authorized recon around Nmap, Kali tool inventory, multi-tool follow-up plans, AI-readable exports, and encrypted history.
 
+> [!IMPORTANT]
+> **Beta:** APIs and artifact formats may still change before the first stable release. Open an issue with the command and environment if a workflow breaks on your platform.
+
 > [!WARNING]
 > Use this project only on systems you own or are explicitly authorized to assess.
 > Unauthorized scanning may be illegal and disruptive.

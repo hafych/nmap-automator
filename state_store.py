@@ -76,9 +76,7 @@ class StateStore:
         if "owner_id" not in task_cols:
             conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN owner_id TEXT")
         # Owner indexes after column migration so older DBs upgrade cleanly.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_scan_jobs_owner ON scan_jobs(owner_id)"
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_jobs_owner ON scan_jobs(owner_id)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_owner ON scheduled_tasks(owner_id)"
         )
