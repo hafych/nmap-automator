@@ -34,7 +34,7 @@ def _write_private_text(path: str, text: str) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Decrypt result file encrypted by nmap-automator.")
+    parser = argparse.ArgumentParser(description="Decrypt result file encrypted by Recon Operator.")
     parser.add_argument("input_file", help="Path to encrypted result file")
     parser.add_argument(
         "-o",

@@ -1,7 +1,11 @@
 """Kali-oriented tool inventory and AI handoff helpers."""
 
+from __future__ import annotations
+
+import argparse
 import json
 import shutil
+import sys
 from typing import Dict, Iterable, List
 
 from kali_ai_scan import apt_policy, run_command, utc_now
@@ -269,3 +273,57 @@ def inventory_to_markdown(inventory: Dict) -> str:
         lines.append(f"- `{name}`: `{install}`")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Export local Kali/pentest tool inventory for operators and AI handoff."
+    )
+    parser.add_argument(
+        "--format",
+        choices=("json", "jsonl", "markdown", "md"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="Expand metapackage dependency trees (slower)",
+    )
+    parser.add_argument(
+        "--profiles",
+        nargs="*",
+        default=None,
+        help="Optional profile names (default: all official profiles)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Write to file instead of stdout",
+    )
+    return parser
+
+
+def main(argv: List[str] = None) -> int:
+    parser = build_cli_parser()
+    args = parser.parse_args(argv)
+    inventory = build_tool_inventory(profiles=args.profiles, expand=args.expand)
+    fmt = args.format.lower()
+    if fmt == "json":
+        content = json.dumps(inventory, indent=2, ensure_ascii=False) + "\n"
+    elif fmt == "jsonl":
+        content = inventory_to_jsonl(inventory)
+    else:
+        content = inventory_to_markdown(inventory)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        print(f"Wrote inventory to {args.output}")
+    else:
+        sys.stdout.write(content)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

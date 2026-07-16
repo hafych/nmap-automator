@@ -1,37 +1,34 @@
-# Nmap Automator
+# Recon Operator
 
-**A security-focused Nmap orchestration API and dashboard for repeatable, authorized network reconnaissance.**
-
-> [!IMPORTANT]
-> **Beta:** APIs and artifact formats may change before the first stable release. If a workflow breaks on your platform, please open an issue with the command and environment details.
+**A security-focused multi-tool recon control plane: Nmap engine, Kali inventory, review-only planner, encrypted results, and an operator dashboard.**
 
 [![CI](https://github.com/hafych/nmap-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/hafych/nmap-automator/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Nmap](https://img.shields.io/badge/powered%20by-Nmap-214478)](https://nmap.org/)
+[![Nmap](https://img.shields.io/badge/scanner-Nmap-214478)](https://nmap.org/)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-Nmap Automator turns Nmap into an operator-friendly workflow: launch or schedule scans,
-track tasks in a browser, keep results encrypted at rest, inventory Kali tools, and export
-clean JSON, JSONL, Markdown, and XML for analysis pipelines and AI assistants.
+> Formerly **Nmap Automator**. The product is not Nmap-only: it orchestrates authorized recon around Nmap, Kali tool inventory, multi-tool follow-up plans, AI-readable exports, and encrypted history.
+
+> [!IMPORTANT]
+> **Beta:** APIs and artifact formats may still change before the first stable release. Open an issue with the command and environment if a workflow breaks on your platform.
 
 > [!WARNING]
 > Use this project only on systems you own or are explicitly authorized to assess.
 > Unauthorized scanning may be illegal and disruptive.
 
-## Why Nmap Automator?
+## Why Recon Operator?
 
-Running one Nmap command is easy. Operating repeatable scans safely is harder. This project
-adds the controls and artifacts needed around Nmap without hiding the scanner itself.
+Running one scanner is easy. Operating repeatable recon safely is harder. This project adds the controls and artifacts operators need without auto-exploiting targets.
 
-| Need | What Nmap Automator adds |
+| Need | What Recon Operator adds |
 | --- | --- |
-| Repeatable reconnaissance | Immediate and recurring TCP, SYN, UDP, OS, aggressive, and ping scans |
-| A usable control surface | Async Quart API plus a responsive browser dashboard |
-| Safer operation | API-key auth, target bounds, rate limits, concurrency limits, and timeouts |
-| Protected results | Fernet encryption, atomic replacement, and owner-only file permissions |
-| Automation-friendly output | XML, JSON, JSONL, Markdown, manifests, and service-aware recon plans |
-| Kali visibility | Inventory of essential tools and 13 official metapackage profiles |
-| AI-assisted analysis | Compact observation streams and review-only follow-up command suggestions |
+| Repeatable recon | Immediate and recurring profiles: TCP, SYN, UDP, Version, Safe, Vuln, Full, OS, Aggressive, Ping |
+| Multi-tool awareness | Kali essentials + 13 metapackage profiles; review-only recon plans (curl, whatweb, ssh-audit, …) |
+| Control surface | Async Quart API plus a responsive browser dashboard |
+| Safer operation | API-key auth, target bounds, rate limits, concurrency limits, timeouts |
+| Protected results | Fernet encryption, atomic replacement, retention, owner-only permissions |
+| Automation handoff | XML, JSON, JSONL, Markdown, manifests, job history, scan diffs |
+| AI-assisted analysis | Compact observation streams and install-aware follow-up suggestions (never auto-executed) |
 
 ## Quick start
 
@@ -54,7 +51,7 @@ docker compose ps
 ```
 
 Open [http://127.0.0.1:5000](http://127.0.0.1:5000), enter the API token, and run a
-TCP scan against an authorized target.
+TCP or Ping scan against an authorized target.
 
 ### Local Python
 
@@ -74,31 +71,36 @@ cp .env.example .env
 python autonmap.py
 ```
 
-The service binds to `127.0.0.1:5000` by default. The default `TCP` profile is
-unprivileged; `SYN`, `UDP`, `OS`, and parts of `Aggressive` may require elevated network
-privileges.
+The service binds to `127.0.0.1:5000` by default. Default `TCP` is unprivileged;
+`SYN`, `UDP`, `OS`, and parts of `Aggressive` may require elevated network privileges.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    Operator[Operator or API client] -->|API key| Quart[Quart API and dashboard]
-    Quart --> Limits[Validation, rate limits, concurrency, timeouts]
-    Limits --> Nmap[Nmap]
-    Nmap --> Parse[Result parsing]
+    Operator[Operator or API client] -->|API key| Quart[Recon Operator API and dashboard]
+    Quart --> Jobs[Scan job queue]
+    Jobs --> Limits[Validation, rate limits, concurrency, timeouts]
+    Limits --> Engine[scan_engine]
+    Engine --> Nmap[Nmap XML]
+    Nmap --> Parse[defused XML parse]
     Parse --> Encrypt[Fernet-encrypted storage]
     Parse --> Export[JSON, JSONL, XML, Markdown]
-    Parse --> Planner[Review-only recon planner]
+    Parse --> Planner[Review-only multi-tool recon planner]
     Inventory[Kali tool inventory] --> Quart
     Planner --> Export
+    Encrypt --> ResultsAPI[History, import, diff]
 ```
 
-The planner never executes its recommendations. It validates and shell-quotes scan fields,
-marks each command as `ready`, `missing`, or `unknown`, and leaves execution to the operator.
+The planner never executes its recommendations. It shell-quotes fields, marks each
+command as `ready`, `missing`, or `unknown`, and leaves execution to the operator.
 
 ## Core workflows
 
 ### Run an immediate scan
+
+Scans are queued as jobs by default (`202 Accepted`). Poll until completion, or pass
+`?wait=1` for a blocking response.
 
 ```bash
 export API_TOKEN='replace-with-your-token'
@@ -106,13 +108,27 @@ export API_TOKEN='replace-with-your-token'
 curl -X POST http://127.0.0.1:5000/scan \
   -H "X-API-KEY: $API_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"target":"127.0.0.1","scan_type":"TCP"}'
+  -d '{"target":"127.0.0.1","scan_type":"Version","ports":"22,80,443"}'
+# -> {"job_id":"...","status":"queued",...}
+
+curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
+
+curl -X POST 'http://127.0.0.1:5000/scan?wait=1' \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"127.0.0.1","scan_type":"Ping"}'
 ```
 
-Supported `scan_type` values: `TCP`, `SYN`, `UDP`, `OS`, `Aggressive`, and `Ping`.
-Targets may be an IP, a bounded CIDR, `localhost`, or a syntactically valid DNS name.
+Supported `scan_type` values: `TCP`, `SYN`, `UDP`, `OS`, `Aggressive`, `Ping`,
+`Version`, `Safe`, `Vuln`, `Full`, plus hybrid discovery profiles `Hybrid`,
+`HybridNaabu`, and `HybridRustScan` (fast port discovery → Nmap `-sV` on open ports).
+Optional `ports`, `scripts`, and `discovery` (`auto`|`naabu`|`rustscan`|`none`) fields
+are accepted. Naabu/RustScan are optional PATH tools — not required for pure Nmap profiles.
 
-### Schedule and manage recurring scans
+Scheduled tasks and job history are stored in SQLite (`STATE_DB_PATH`, default
+`data/recon_operator.db`) so restarts restore schedules and completed job metadata.
+
+### Schedule, history, import, diff
 
 ```bash
 curl -X POST http://127.0.0.1:5000/schedule \
@@ -120,208 +136,261 @@ curl -X POST http://127.0.0.1:5000/schedule \
   -H 'Content-Type: application/json' \
   -d '{"target":"192.168.1.0/24","scan_type":"TCP","interval":30}'
 
-curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/tasks
+curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/results
+curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/results/<filename>
 
-curl -X DELETE -H "X-API-KEY: $API_TOKEN" \
-  http://127.0.0.1:5000/tasks/192.168.1.0%2F24-TCP
+curl -X POST http://127.0.0.1:5000/results/import \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"xml":"<?xml ... nmaprun ...>","target":"lab"}'
+
+curl -X POST http://127.0.0.1:5000/results/diff \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline":{"id":"old.json"},"current":{"id":"new.json"}}'
 ```
 
-### Create AI-readable scan artifacts
-
-Run Nmap and create a complete artifact bundle:
+### AI-readable scan artifacts (CLI)
 
 ```bash
 python kali_ai_scan.py deps
-python kali_ai_scan.py run 127.0.0.1 \
-  --profile tcp \
-  --scan-timeout 1800 \
-  --out ai_reports
-```
-
-Or safely import existing Nmap XML:
-
-```bash
+python kali_ai_scan.py run 127.0.0.1 --profile tcp --out ai_reports
 python kali_ai_scan.py parse nmap.xml --out ai_reports/imported-scan
 ```
 
-Each bundle contains:
-
-- `nmap.xml` — canonical raw Nmap output.
-- `hosts.json` — structured hosts, ports, and services.
-- `observations.jsonl` — compact host and service observations.
-- `summary.md` — human-readable scan summary.
-- `manifest.json` — provenance, toolchain state, paths, and statistics.
-
-Imported XML is parsed with `defusedxml` and capped at 64 MiB. Artifact directories use
-mode `0700`; raw and derived files are atomically written with owner-only mode `0600` on
-POSIX systems.
-
-### Inventory Kali tools
-
-The inventory endpoint checks essential commands, installed packages, and 13 official Kali
-metapackage profiles. `expand=1` follows metapackage dependencies and is slower.
+### Inventory Kali tools and build a recon plan
 
 ```bash
-curl -H "X-API-KEY: $API_TOKEN" \
-  'http://127.0.0.1:5000/tools?expand=0'
+# API
+curl -H "X-API-KEY: $API_TOKEN" 'http://127.0.0.1:5000/tools?expand=0'
+curl -H "X-API-KEY: $API_TOKEN" 'http://127.0.0.1:5000/tools/ai-context?format=jsonl'
 
-curl -H "X-API-KEY: $API_TOKEN" \
-  'http://127.0.0.1:5000/tools/ai-context?format=jsonl&expand=0'
-```
+# Standalone CLI (no API server required)
+python tool_inventory.py --format json
+python tool_inventory.py --format jsonl -o inventory.jsonl
+python tool_inventory.py --format markdown --profiles recon web
 
-### Generate a recon plan
-
-```bash
 curl -X POST \
   -H "X-API-KEY: $API_TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary @scan-result.json \
   'http://127.0.0.1:5000/recon/plan?format=markdown'
+
+curl http://127.0.0.1:5000/live
+curl http://127.0.0.1:5000/ready
+curl http://127.0.0.1:5000/openapi.json
 ```
 
 ## API surface
 
-Health and dashboard routes are public. Operational routes require the configured API token
-unless authentication was explicitly disabled.
-
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/` and `/ui` | Browser dashboard |
-| `GET` | `/health` | Service and Nmap health |
+| `GET` | `/live` | Liveness probe (process up) |
+| `GET` | `/ready` | Readiness probe (Nmap available) |
+| `GET` | `/health` | Detailed health snapshot |
+| `GET` | `/openapi.json` | OpenAPI 3 schema |
 | `GET` | `/api/docs` | Runtime API description |
-| `POST` | `/scan` | Immediate scan |
+| `POST` | `/scan` | Queue immediate scan (`202`); `?wait=1` blocks |
+| `GET` | `/jobs` | List scan jobs |
+| `GET` | `/jobs/<id>` | Job status and result |
+| `DELETE` | `/jobs/<id>` | Cancel a queued or running job |
 | `POST` | `/schedule` | Recurring scan |
 | `GET` | `/tasks` | List scheduled tasks |
 | `DELETE` | `/tasks/<id>` | Cancel a scheduled task |
+| `GET` | `/results` | List encrypted result files |
+| `GET` | `/results/<id>` | Decrypt and return a stored result |
+| `POST` | `/results/import` | Import Nmap XML into encrypted history |
+| `POST` | `/results/diff` | Diff two scan results |
 | `GET` | `/tools` | Kali tool inventory |
 | `GET` | `/tools/ai-context` | JSONL or Markdown inventory context |
-| `POST` | `/recon/plan` | JSON or Markdown follow-up plan |
-
-```bash
-curl http://127.0.0.1:5000/health
-curl http://127.0.0.1:5000/api/docs
-```
+| `POST` | `/recon/plan` | JSON or Markdown multi-tool follow-up plan |
 
 ## Security model
 
 The default deployment is intentionally local and single-operator:
 
-- authentication is required by default;
+- authentication is required by default (one or more API tokens);
+- dashboard CSP uses per-response nonces (no `unsafe-inline`);
 - the server and Compose port bind to loopback;
 - scan types are allow-listed and targets are bounded;
 - subprocesses use argv rather than a shell;
 - Nmap XML uses an XXE-safe parser;
 - result files are encrypted with Fernet and written atomically;
+- recon recommendations are never auto-executed;
 - the default container runs non-root with a read-only root filesystem and
   `no-new-privileges`.
 
-This is not a multi-tenant authorization system. Before public or multi-user deployment, add
-scoped identities, task/result ownership, durable shared rate limits, and an explicit target
-authorization policy. See [SECURITY.md](SECURITY.md) for the supported deployment baseline
-and private vulnerability reporting process.
+This is not a multi-tenant authorization system. See [SECURITY.md](SECURITY.md).
 
 ## Configuration
-
-All options are environment variables and may be placed in `.env`.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `FERNET_KEY` | required | Key used to encrypt stored results |
-| `API_AUTH_TOKEN` | required | Token expected in the API authentication header |
+| `API_AUTH_TOKEN` | required* | Primary token expected in the API authentication header |
+| `API_AUTH_TOKENS` | empty | Optional extra tokens (comma list or JSON array); full admin access |
+| `API_AUTH_KEYS` | empty | Optional named keys JSON: `id`, `label`, `token`, `scopes`, `created_at`, `revoked` |
 | `API_AUTH_REQUIRED` | `true` | Disable only for isolated local development |
 | `API_AUTH_HEADER` | `X-API-KEY` | Header carrying the API token |
+
+\* At least one of `API_AUTH_TOKEN` / `API_AUTH_TOKENS` / `API_AUTH_KEYS` is required when auth is enabled.
+Multiple tokens are isolated by ownership: jobs, scheduled tasks, and new encrypted
+results are tagged with a hash of the presenting token. Named keys support least-privilege
+scopes: `read` (history/tools/plan), `scan` (create/cancel; includes read), `admin` (all).
+Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing the secret.
+
 | `APP_HOST` | `127.0.0.1` | Bind address |
 | `APP_PORT` | `5000` | Listen port |
 | `MAX_CONCURRENT_SCANS` | `2` | Maximum concurrent scans |
 | `MAX_SCHEDULED_TASKS` | `100` | Maximum retained recurring scans |
+| `MAX_SCAN_JOBS` | `200` | Maximum retained scan jobs in memory |
 | `SCAN_TIMEOUT_SECONDS` | `1800` | Total Nmap process timeout |
 | `NMAP_HOST_TIMEOUT_SEC` | `300` | Nmap per-host timeout |
 | `NMAP_MAX_RETRIES` | `2` | Nmap probe retries |
 | `MAX_TARGET_ADDRESSES` | `4096` | Largest accepted CIDR range |
+| `TARGET_ALLOWLIST` | empty | Optional engagement scope: IPs, CIDRs, hostnames, `*.domain` (comma or JSON) |
+| `TARGET_ALLOWLIST_FILE` | empty | Optional file of allowlist entries (`#` comments allowed); empty = unrestricted |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum JSON request body size |
+| `MAX_IMPORT_XML_BYTES` | `67108864` | Maximum imported Nmap XML size |
 | `MAX_REQUESTS_PER_WINDOW` | `10` | Per-client costly-request limit |
-| `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets |
+| `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets (memory backend) |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window |
+| `REDIS_URL` | empty | Optional Redis URL for shared rate limits and job-lease fence |
+| `REDIS_RATE_LIMIT_PREFIX` | `recon_operator:rl:` | Key prefix for Redis rate-limit sorted sets |
+| `RATE_LIMIT_INCLUDE_OWNER` | `true` | Bucket by IP + token owner hash (multi-token isolation) |
+| `WORKER_ID` | random | Stable worker identity for job leases (set per process) |
+| `JOB_LEASE_SECONDS` | `90` | How long a worker holds an exclusive scan-job lease |
+| `JOB_CLAIM_POLL_SECONDS` | `2` | Poll interval for reclaiming queued / expired-lease jobs |
+| `REDIS_JOB_LEASE_PREFIX` | `recon_operator:job_lease:` | Redis key prefix for optional job-lease fence |
+| `SCHEDULER_LEADER_SECONDS` | `30` | Leadership lease for recurring schedules |
+| `SCHEDULER_LEADER_POLL_SECONDS` | `5` | How often workers contest/renew scheduler leadership |
+| `REDIS_LEADER_PREFIX` | `recon_operator:leader:` | Redis key prefix for optional leadership fence |
 | `MIN_SCHEDULE_INTERVAL_MINUTES` | `1` | Smallest recurring-scan interval |
 | `MAX_SCHEDULE_INTERVAL_MINUTES` | `10080` | Largest interval, in minutes |
 | `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
+| `RESULTS_MAX_FILES` | `500` | Max encrypted result files retained |
+| `RESULTS_MAX_AGE_DAYS` | `0` | Delete results older than N days (`0` = off) |
+| `LEGACY_RESULTS_SHARED` | `true` | Show pre-ownership result files to any auth operator; set `false` for multi-token isolation |
+| `STATE_DB_PATH` | `data/recon_operator.db` | SQLite for jobs + scheduled tasks |
+| `AI_REPORTS_MAX_DIRS` | `100` | Max CLI `ai_reports` run directories retained |
+| `AI_REPORTS_MAX_AGE_DAYS` | `0` | Delete CLI report dirs older than N days (`0` = off) |
 | `SCAN_LOG_PATH` | `logs/scan_log.txt` | Rotating application log |
 | `TOOL_INVENTORY_CACHE_SECONDS` | `300` | Kali inventory cache lifetime |
 | `INITIAL_TASKS` | `[]` | JSON array of startup recurring scans |
 | `TELEGRAM_BOT_TOKEN` | empty | Optional Telegram bot token |
 | `TELEGRAM_CHAT_ID` | empty | Optional Telegram destination |
 
-Example startup task:
-
-```dotenv
-INITIAL_TASKS=[{"target":"192.168.1.0/24","scan_type":"TCP","interval":30}]
-```
-
 ## Encrypted results
 
-API results are stored only in encrypted form. Back up `FERNET_KEY` separately; existing
-results cannot be recovered if the key is lost.
-
 ```bash
-# Print plaintext
 python decrypt.py encrypted_results/<result>.json
-
-# Write plaintext to an owner-only file
 python decrypt.py encrypted_results/<result>.json -o result.json
 ```
 
-## Docker notes
+### Ownership and migration (1.7+)
 
-The default Compose profile persists only logs and encrypted results. Privileged scan types
-are intentionally not enabled in the default container configuration.
+New encrypted result filenames look like `o{12hex}_{target}_{type}_{timestamp}.json`,
+where `{12hex}` is the first 12 hex characters of `sha256(api_token)`. Jobs and scheduled
+task ids use the same owner hash prefix.
+
+| Situation | Behavior |
+| --- | --- |
+| Single token (default) | Same as before; new files get an owner prefix, all APIs work |
+| Multiple tokens | Each operator only sees their jobs, schedules, and owned result files |
+| Pre-1.7 result files (no `o…_` prefix) | Visible to any authenticated operator while `LEGACY_RESULTS_SHARED=true` |
+| Multi-token harden | Set `LEGACY_RESULTS_SHARED=false` to hide unowned legacy files |
+
+Clients that previously assumed `POST /scan` always returned the scan body should use
+`?wait=1` or poll `GET /jobs/<job_id>`. Cancel scripts should use the `task_id` returned
+from `POST /schedule` (now `o{owner}-target-type`).
+
+## Docker notes
 
 ```bash
 docker compose logs -f
 
-docker build -f dockerfile -t nmap-automator .
+docker build -f dockerfile -t recon-operator .
 docker run --rm \
   -p 127.0.0.1:5000:5000 \
   -e API_AUTH_TOKEN \
   -e FERNET_KEY \
-  nmap-automator
+  recon-operator
 ```
+
+### Optional Redis rate limits
+
+Single-worker deploys need no Redis (in-process buckets). For multiple workers or
+instances, share the sliding window:
+
+```bash
+# start optional redis profile
+docker compose --profile redis up -d
+
+# in .env
+REDIS_URL=redis://127.0.0.1:6379/0
+```
+
+`/health` reports `rate_limit_backend` as `memory`, `redis`, or `memory_fallback`.
+
+### Multi-worker job leases
+
+Scan jobs are claimed with an exclusive lease in SQLite (`lease_owner` / `lease_until`).
+Only the claiming worker runs the Nmap process. A background claim loop recovers
+`queued` jobs and expired leases after crashes. When `REDIS_URL` is set, a Redis
+`SET NX` fence adds a second lock for multi-host deploys sharing the same state DB.
+
+```bash
+# process A
+WORKER_ID=worker-a STATE_DB_PATH=/shared/recon.db REDIS_URL=redis://127.0.0.1:6379/0 python autonmap.py
+
+# process B
+WORKER_ID=worker-b STATE_DB_PATH=/shared/recon.db REDIS_URL=redis://127.0.0.1:6379/0 python autonmap.py
+```
+
+Recurring schedules use **scheduler leader election** (SQLite `leadership` table + optional
+Redis fence). Only the leader runs `periodic_scan` loops; other workers persist
+`POST /schedule` and cancel requests to the shared DB, and the leader syncs them.
 
 ## Development
 
 ```bash
 python -m pip install -r requirements-dev.txt
-
 ruff format --check .
 ruff check .
 python -m coverage run -m unittest discover -v
 python -m coverage report
 bandit -q -ll -r . \
-  -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_tool_inventory.py
+  -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_scan_engine.py,./test_tool_inventory.py
 pip-audit -r requirements.txt
 ```
-
-CI tests Python 3.10, 3.12, and 3.14, enforces coverage and formatting, runs Bandit, and
-audits dependencies. Dependabot tracks pip, GitHub Actions, and Docker updates.
 
 ## Project layout
 
 | Path | Responsibility |
 | --- | --- |
-| `autonmap.py` | Quart API, validation, scheduling, scanning, encryption, and shutdown |
+| `autonmap.py` | Quart API entrypoint (legacy filename), jobs, scheduling, encryption |
+| `scan_engine.py` | Nmap runner, hybrid Naabu/RustScan discovery, import, diff |
+| `state_store.py` | SQLite persistence for jobs and schedules |
 | `ui.py` | Self-contained operator dashboard |
-| `kali_ai_scan.py` | Nmap runner, safe XML parser, and artifact generator |
+| `kali_ai_scan.py` | CLI Nmap runner, safe XML parser, AI artifact generator |
 | `tool_inventory.py` | Kali package and command inventory |
-| `recon_planner.py` | Service-aware, AI-readable follow-up plans |
+| `recon_planner.py` | Service-aware multi-tool follow-up plans (review-only) |
 | `decrypt.py` | Fernet result decryption utility |
 | `test_*.py` | Unit and async API regression tests |
+
+## Roadmap
+
+The prioritized improvement plan (completed work, P0–P3 backlog, release sequence, and
+definition of done) lives in [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md).
 
 ## Contributing
 
 Bug reports, focused improvements, and platform-specific validation are welcome. Please read
 [CONTRIBUTING.md](CONTRIBUTING.md) and use private reporting for security vulnerabilities.
 
-If Nmap Automator helps your workflow, consider starring the repository so other operators
-can discover it.
+Repository path may still be `nmap-automator` on GitHub for continuity; the product name is
+**Recon Operator**.
 
 ## License
 
