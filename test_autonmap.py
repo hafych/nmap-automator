@@ -161,9 +161,16 @@ class TaskCleanupTests(unittest.IsolatedAsyncioTestCase):
 class RateLimitTests(unittest.TestCase):
     def setUp(self):
         autonmap.rate_limits.clear()
+        # Force memory backend for unit tests of the in-process path.
+        autonmap._redis_init_attempted = True
+        autonmap._redis_available = False
+        autonmap._redis_client = None
 
     def tearDown(self):
         autonmap.rate_limits.clear()
+        autonmap._redis_init_attempted = False
+        autonmap._redis_available = False
+        autonmap._redis_client = None
 
     def test_stale_client_is_evicted_when_bucket_table_is_full(self):
         original_limit = autonmap.MAX_RATE_LIMIT_CLIENTS
@@ -182,6 +189,71 @@ class RateLimitTests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertNotIn("stale", autonmap.rate_limits)
         self.assertIn("new", autonmap.rate_limits)
+
+    def test_redis_sliding_window_blocks_and_allows(self):
+        class FakeRedis:
+            def __init__(self):
+                self.store = {}
+
+            def eval(self, _script, _numkeys, key, now, window, limit, member):
+                now_f = float(now)
+                window_f = float(window)
+                limit_i = int(limit)
+                members = [
+                    (name, score)
+                    for name, score in self.store.get(key, [])
+                    if score > now_f - window_f
+                ]
+                if len(members) >= limit_i:
+                    self.store[key] = members
+                    return 0
+                members.append((member, now_f))
+                self.store[key] = members
+                return 1
+
+        fake = FakeRedis()
+        bucket = "127.0.0.1:otestowner01"
+        original_max = autonmap.MAX_REQUESTS_PER_WINDOW
+        autonmap.MAX_REQUESTS_PER_WINDOW = 2
+        try:
+            self.assertTrue(autonmap._check_rate_limit_redis(fake, bucket))
+            self.assertTrue(autonmap._check_rate_limit_redis(fake, bucket))
+            self.assertFalse(autonmap._check_rate_limit_redis(fake, bucket))
+        finally:
+            autonmap.MAX_REQUESTS_PER_WINDOW = original_max
+        key = f"{autonmap.REDIS_RATE_LIMIT_PREFIX}{bucket}"
+        self.assertEqual(len(fake.store.get(key, [])), 2)
+
+    def test_rate_limit_backend_reports_memory_without_redis_url(self):
+        original_url = autonmap.REDIS_URL
+        original_attempted = autonmap._redis_init_attempted
+        original_available = autonmap._redis_available
+        original_client = autonmap._redis_client
+        try:
+            autonmap.REDIS_URL = ""
+            autonmap._redis_init_attempted = False
+            autonmap._redis_available = False
+            autonmap._redis_client = None
+            self.assertEqual(autonmap.rate_limit_backend(), "memory")
+        finally:
+            autonmap.REDIS_URL = original_url
+            autonmap._redis_init_attempted = original_attempted
+            autonmap._redis_available = original_available
+            autonmap._redis_client = original_client
+
+    def test_bucket_key_includes_owner_when_enabled(self):
+        original_flag = autonmap.RATE_LIMIT_INCLUDE_OWNER
+        original_client_key = autonmap._client_key
+        autonmap._client_key = lambda: "10.0.0.1"
+        try:
+            autonmap.RATE_LIMIT_INCLUDE_OWNER = False
+            self.assertEqual(autonmap._rate_limit_bucket_key(), "10.0.0.1")
+            autonmap.RATE_LIMIT_INCLUDE_OWNER = True
+            # Outside request context owner falls back to IP-only.
+            self.assertEqual(autonmap._rate_limit_bucket_key(), "10.0.0.1")
+        finally:
+            autonmap.RATE_LIMIT_INCLUDE_OWNER = original_flag
+            autonmap._client_key = original_client_key
 
 
 class ResultPersistenceTests(unittest.IsolatedAsyncioTestCase):
