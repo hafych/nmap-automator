@@ -180,7 +180,8 @@ Missing tools не устанавливались автоматически: э
 - [x] ~~Schedule multi-instance leader election (P1-03).~~
 - [ ] Full multi-tenant RBAC / UI accounts (token isolation only today).
 - [x] ~~Поднять `autonmap.py` coverage до ≥75% (~82%; overall ~78%; fail_under 75).~~
-- [x] ~~CI browser E2E (Playwright dashboard smoke).~~ axe-core still open.
+- [x] ~~CI browser E2E (Playwright dashboard smoke).~~
+- [x] ~~axe-core a11y + keyboard/ARIA/320px regression in e2e.~~
 - [x] ~~OpenAPI contract / route-parity tests.~~
 
 ### P2 — security и maintainability
