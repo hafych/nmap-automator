@@ -65,6 +65,27 @@ class ProcessCancelTests(unittest.TestCase):
         self.assertFalse(kill_active_process(token))
 
 
+class ProcessCancelExtraTests(unittest.TestCase):
+    def test_kill_missing_token_returns_false(self):
+        self.assertFalse(kill_active_process(""))
+        self.assertFalse(kill_active_process("no-such-token"))
+
+    def test_run_tracked_timeout_terminates(self):
+        token = "timeout-token"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            _run_tracked(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                timeout=0.2,
+                process_token=token,
+            )
+        self.assertFalse(kill_active_process(token))
+
+    def test_ensure_operator_result_empty_hosts(self):
+        out = ensure_operator_result({"hosts": []}, target="x", scan_type="Ping")
+        self.assertEqual(out["schema"], SCHEMA_VERSION)
+        self.assertEqual(out["target"], "x")
+
+
 class SchemaBridgeTests(unittest.TestCase):
     def test_ensure_operator_result_from_ai_report_shape(self):
         ai_shape = {
