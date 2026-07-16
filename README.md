@@ -371,7 +371,9 @@ pip-audit -r requirements.txt
 
 | Path | Responsibility |
 | --- | --- |
-| `autonmap.py` | Quart API entrypoint (legacy filename), jobs, scheduling, encryption |
+| `autonmap.py` | Compatibility entrypoint (`import autonmap` / `python autonmap.py`) |
+| `recon_operator/` | Application package (server, auth, jobs, scheduler, api, config) |
+| `recon_operator/server.py` | Quart app, routes, jobs, scheduling, encryption |
 | `scan_engine.py` | Nmap runner, hybrid Naabu/RustScan discovery, import, diff |
 | `state_store.py` | SQLite persistence for jobs and schedules |
 | `ui.py` | Self-contained operator dashboard |
@@ -379,7 +381,14 @@ pip-audit -r requirements.txt
 | `tool_inventory.py` | Kali package and command inventory |
 | `recon_planner.py` | Service-aware multi-tool follow-up plans (review-only) |
 | `decrypt.py` | Fernet result decryption utility |
-| `test_*.py` | Unit and async API regression tests |
+| `test_*.py` / `e2e/` | Unit, contract, and browser regression tests |
+
+Start the API with any of:
+
+```bash
+python autonmap.py
+python -m recon_operator
+```
 
 ## Contributing
 
