@@ -133,6 +133,66 @@ class PlaybookHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(any(p.get("id") == "standard" for p in body.get("playbooks") or []))
 
+    async def test_playbook_cancel_and_unknown(self):
+        response = await self.client.post(
+            "/playbook/run",
+            headers=self.headers,
+            json={"target": "127.0.0.1", "phases": ["discovery", "map", "safe"]},
+        )
+        payload = await response.get_json()
+        self.assertEqual(response.status_code, 202)
+        engagement_id = payload["engagement_id"]
+        cancelled = await self.client.delete(
+            f"/playbook/{engagement_id}",
+            headers={"X-API-KEY": "test-token"},
+        )
+        body = await cancelled.get_json()
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(body.get("status"), "cancelled")
+
+        missing = await self.client.get(
+            "/playbook/does-not-exist",
+            headers={"X-API-KEY": "test-token"},
+        )
+        self.assertEqual(missing.status_code, 404)
+
+        bad = await self.client.post(
+            "/playbook/run",
+            headers=self.headers,
+            json={"target": "127.0.0.1", "playbook": "nope"},
+        )
+        self.assertEqual(bad.status_code, 400)
+
+    async def test_playbook_stops_on_failed_job(self):
+        async def fail_run(job_id, *, already_claimed=False):
+            await autonmap._set_job_fields(
+                job_id,
+                status="failed",
+                finished_at=autonmap._utc_now_iso(),
+                error="forced fail",
+            )
+
+        autonmap._run_scan_job = fail_run
+        response = await self.client.post(
+            "/playbook/run",
+            headers=self.headers,
+            json={"target": "127.0.0.1", "playbook": "quick"},
+        )
+        payload = await response.get_json()
+        engagement_id = payload["engagement_id"]
+        final = None
+        for _ in range(40):
+            status = await self.client.get(
+                f"/playbook/{engagement_id}",
+                headers={"X-API-KEY": "test-token"},
+            )
+            final = await status.get_json()
+            if final.get("status") in {"completed", "failed", "cancelled"}:
+                break
+            await asyncio.sleep(0.05)
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["steps"][0]["status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()
