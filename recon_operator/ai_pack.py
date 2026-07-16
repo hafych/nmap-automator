@@ -397,9 +397,7 @@ def build_ai_pack_rows(
         rows.extend(inv_rows)
 
     # Defense posture drift (optional expected posture).
-    posture_rows = posture_pack_rows(
-        scan, expected_posture, max_rows=int(limits["max_drift"])
-    )
+    posture_rows = posture_pack_rows(scan, expected_posture, max_rows=int(limits["max_drift"]))
     rows.extend(posture_rows)
 
     # Clarifying questions (cheap, capped).
@@ -462,11 +460,15 @@ def _stamp_budget_s_meta(
     if not rows:
         return rows
     rest = list(rows[1:]) if rows[0].get("t") == "meta" else list(rows)
-    meta = dict(rows[0]) if rows[0].get("t") == "meta" else {
-        "t": "meta",
-        "schema": SCHEMA_VERSION,
-        "budget": "s",
-    }
+    meta = (
+        dict(rows[0])
+        if rows[0].get("t") == "meta"
+        else {
+            "t": "meta",
+            "schema": SCHEMA_VERSION,
+            "budget": "s",
+        }
+    )
     meta.pop("bytes", None)
     meta["truncated"] = bool(truncated or len(rows) < original_len)
     meta["lines"] = 1 + len(rest)
@@ -484,31 +486,29 @@ def _apply_budget_s_hard_caps(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
     if not rows:
         return rows
     original_len = len(rows)
-    kept = _enforce_hard_caps(
-        rows, max_lines=BUDGET_S_MAX_LINES, max_bytes=BUDGET_S_MAX_BYTES
-    )
+    kept = _enforce_hard_caps(rows, max_lines=BUDGET_S_MAX_LINES, max_bytes=BUDGET_S_MAX_BYTES)
     truncated = len(kept) < original_len
 
     while kept:
-        stamped = _stamp_budget_s_meta(
-            kept, truncated=truncated, original_len=original_len
-        )
+        stamped = _stamp_budget_s_meta(kept, truncated=truncated, original_len=original_len)
         size = pack_bytes(stamped)
         if size <= BUDGET_S_MAX_BYTES and len(stamped) <= BUDGET_S_MAX_LINES:
             return stamped
         if len(kept) <= 1:
             # Only meta left: strip verbose keys, then fall back to minimal meta.
-            meta = dict(stamped[0]) if stamped else {
-                "t": "meta",
-                "schema": SCHEMA_VERSION,
-                "budget": "s",
-            }
+            meta = (
+                dict(stamped[0])
+                if stamped
+                else {
+                    "t": "meta",
+                    "schema": SCHEMA_VERSION,
+                    "budget": "s",
+                }
+            )
             for key in ("usage", "guardrail", "open_services", "hosts", "include_closed"):
                 meta.pop(key, None)
             meta["truncated"] = True
-            slim = _stamp_budget_s_meta(
-                [meta], truncated=True, original_len=original_len
-            )
+            slim = _stamp_budget_s_meta([meta], truncated=True, original_len=original_len)
             if pack_bytes(slim) <= BUDGET_S_MAX_BYTES:
                 return slim
             return [

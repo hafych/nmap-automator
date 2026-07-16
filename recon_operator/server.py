@@ -27,8 +27,8 @@ from quart import Quart, g, jsonify, request
 from telegram import Bot
 from telegram.error import TelegramError
 
-from recon_operator import auth as _auth
-from recon_operator import config as _config
+import recon_operator.auth as _auth
+import recon_operator.config as _config
 from recon_operator.ai_pack import build_ai_pack, normalize_budget
 from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 from recon_operator.metrics import METRICS
@@ -145,7 +145,7 @@ _expand_scopes = _auth._expand_scopes
 _public_api_key_view = _auth._public_api_key_view
 _load_api_auth_keys = _auth._load_api_auth_keys
 _load_api_auth_tokens = _auth._load_api_auth_tokens
-API_AUTH_KEYS = _auth.API_AUTH_KEYS
+API_AUTH_KEYS = _auth.reload_api_auth_registry()
 API_AUTH_TOKENS = _auth.API_AUTH_TOKENS
 API_AUTH_TOKEN = _auth.API_AUTH_TOKEN
 _resolve_api_key = _auth._resolve_api_key
@@ -2007,9 +2007,7 @@ async def cancel_job(job_id: str):
         job["error"] = "Scan cancelled"
         job["lease_owner"] = None
         job["lease_until"] = None
-        _note_job_terminal_metrics(
-            job, previous_status=previous_status, status="cancelled"
-        )
+        _note_job_terminal_metrics(job, previous_status=previous_status, status="cancelled")
         if task is not None and not task.done():
             task.cancel()
         _persist_job(job)
@@ -2749,12 +2747,8 @@ async def ai_pack():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    output_format = (
-        request.args.get("format") or body.get("format") or "jsonl"
-    ).strip().lower()
-    include_closed = _bool_query_param("include_closed", False) or bool(
-        body.get("include_closed")
-    )
+    output_format = (request.args.get("format") or body.get("format") or "jsonl").strip().lower()
+    include_closed = _bool_query_param("include_closed", False) or bool(body.get("include_closed"))
     # Full archive still available via detail=full|l budget or /results/<id>.
     if str(request.args.get("detail") or body.get("detail") or "").lower() in {
         "full",
@@ -3204,9 +3198,7 @@ def build_openapi_spec() -> dict:
                     "summary": "Prometheus metrics scrape",
                     "security": [],
                     "responses": {
-                        "200": {
-                            "description": "Prometheus text exposition (jobs, scans, rates)"
-                        }
+                        "200": {"description": "Prometheus text exposition (jobs, scans, rates)"}
                     },
                 }
             },

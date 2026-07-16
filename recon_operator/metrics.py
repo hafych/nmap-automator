@@ -51,9 +51,7 @@ class MetricsRegistry:
         self._lock = threading.Lock()
         self._counters: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = defaultdict(float)
         self._gauges: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = {}
-        self._histograms: Dict[
-            Tuple[str, Tuple[Tuple[str, str], ...]], Dict[str, Any]
-        ] = {}
+        self._histograms: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], Dict[str, Any]] = {}
         self._duration_buckets = tuple(sorted(float(b) for b in duration_buckets))
         self._started_at = time.time()
         # HELP/TYPE metadata for known series.
@@ -182,9 +180,7 @@ class MetricsRegistry:
 
         # Group by metric name for stable output.
         names = sorted(
-            {n for n, _ in counters}
-            | {n for n, _ in gauges}
-            | {n for n, _ in histograms}
+            {n for n, _ in counters} | {n for n, _ in gauges} | {n for n, _ in histograms}
         )
         for name in names:
             ensure_meta(name)

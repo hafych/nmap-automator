@@ -11,7 +11,7 @@
 - **Release A (2026-07-15):** единый `scan_engine` (subprocess + defused XML, без `python-nmap`), async jobs (`POST /scan` → 202 + `/jobs`), history API (`/results`), EN error model, retention, UI history + job polling.
 - Ранее: UI a11y, atomic encrypted writes, decrypt UX, CI matrix, Docker hardening, recon planner, Kali inventory.
 - Quality gate после Release A: 55 tests pass; coverage gate raised to 58%; Ruff/Bandit — pass.
-- Dockerfile и Compose: static audit pass. Runtime Docker build may still need owner Docker Desktop setup.
+- Dockerfile и Compose: static audit и runtime smoke pass; контейнер healthy, `/live` + `/ready` и Ping `127.0.0.1` подтверждены.
 
 ## Критерии готовности
 
@@ -20,14 +20,14 @@
 - [x] ~~API, задачи, шифрование, planner, inventory и artifacts проверены тестами и smoke-сценариями.~~
 - [x] ~~Форматирование, линтер, coverage, Bandit и dependency audit пройдены.~~
 - [x] ~~Перед изменениями выполнен GitNexus impact-анализ.~~ Все изменённые индексированные символы получили риск `LOW`; HIGH/CRITICAL не было.
-- [ ] Runtime Docker build/healthcheck на машине с уже настроенным Docker daemon без privilege prompt.
+- [x] ~~Runtime Docker build/healthcheck.~~ Colima поднята без privilege prompt; image build, healthy container, `/live`, `/ready` и loopback Ping прошли; тестовые volumes удалены.
 
 ## 0. Исходное состояние и воспроизводимость
 
 - [x] ~~Сохранить существующие пользовательские изменения.~~ Не затронуты pre-existing изменения в `.claude/skills/gitnexus/*`, `AGENTS.md`, `CLAUDE.md`.
 - [x] ~~Проверить system Python.~~ Python 3.14.4; без dev dependencies discovery ожидаемо дал 5 ImportError.
 - [x] ~~Создать изолированное окружение и установить pins.~~ `.venv`, `pip check` — no broken requirements.
-- [x] ~~Обновить GitNexus index.~~ Локальный `analyze --pdg`: 1,471 nodes, 4,248 edges, 17 clusters, 85 flows; import cycles — 0.
+- [x] ~~Обновить GitNexus index.~~ Свежий branch index через `analyze --pdg`: 6,987 nodes, 23,494 edges, 300 flows; import cycles — 0, taint findings — 0.
 - [x] ~~Проверить production dependencies.~~ Все pins актуальны на 2026-07-10; `pip-audit` не нашёл CVE.
 - [x] ~~Проверить dev dependencies.~~ Bandit 1.9.4, pip-audit 2.10.1 и Ruff 0.15.21 актуальны; coverage обновлён `7.13.5 → 7.15.0`.
 - [x] ~~Проверить README quick start.~~ Установка, `kali_ai_scan.py deps/run/parse`, API curl-сценарии и decrypt соответствуют реализации; документация дополнена правами CLI artifacts.
@@ -135,23 +135,23 @@ Missing tools не устанавливались автоматически: э
 - [x] ~~HTTP security.~~ no-store, nosniff, DENY, referrer policy, permissions policy и frame-ancestors.
 - [x] ~~Production config.~~ Loopback default, auth+Fernet required, debug off, Compose read-only/non-root/no-new-privileges.
 - [x] ~~Static security checks.~~ Bandit medium/high — 0; pip-audit production/dev — 0 known vulnerabilities; GitNexus import cycles — 0.
-- [ ] GitNexus MCP PDG/taint consumer должен увидеть свежий local `--pdg` index. CLI rebuild успешен, но текущий MCP session продолжил возвращать stale `no PDG layer`; перепроверить после перезапуска MCP.
+- [x] ~~GitNexus PDG/taint pass.~~ Свежий branch index содержит PDG; CLI cycle check — 0, CLI и MCP taint analysis — 0 findings. Старый MCP cycle-result оставался session-cached, поэтому итог подтверждён прямым запросом к свежему branch graph.
 
 ## 5. Качество, CI и поставка
 
-- [x] ~~`ruff format --check .`.~~ 12 files already formatted.
+- [x] ~~`ruff format --check .`.~~ 45 files already formatted.
 - [x] ~~`ruff check .`.~~ All checks passed.
 - [x] ~~`python -m compileall -q .`.~~ Pass.
-- [x] ~~Полный unittest.~~ 41/41 pass на Python 3.14.4.
-- [x] ~~Coverage.~~ 62% branch coverage; configured minimum 55%; critical new branches covered.
+- [x] ~~Полный unittest.~~ 174/174 pass на Python 3.14.4, включая чистый unittest-discovery bootstrap.
+- [x] ~~Coverage.~~ 75% total coverage; configured minimum 75%; CI bootstrap regression covered.
 - [x] ~~Bandit.~~ Medium/high findings — 0.
 - [x] ~~pip-audit.~~ Production и dev requirements — no known vulnerabilities.
 - [x] ~~Compose config.~~ Required-secret validation работает; с test secrets `docker compose config --quiet` — pass.
 - [x] ~~Dockerfile/Compose static audit.~~ `USER app`, read-only root, named writable volumes, loopback port, healthcheck, SIGTERM, 40s grace period.
 - [x] ~~CI versions.~~ `actions/checkout@v4 → @v6`, `actions/setup-python@v5 → @v6`; Python matrix 3.10/3.12/3.14 сохранена.
 - [x] ~~Dependabot.~~ Weekly pip, GitHub Actions и Docker updates включены.
-- [x] ~~GitNexus `detect_changes`.~~ Risk `medium`: результат включает pre-existing пользовательские instruction-файлы и ошибочно относит соседний неизменённый `utc_now` к diff hunk; фактические product changes ограничены UI, CLI artifact/decrypt paths, tests и CI/dependency docs. Три отмеченных inventory/recon flows повторно покрыты unit/API tests.
-- [ ] Docker runtime build/up/healthcheck — нужен один раз после разрешения Docker Desktop privileged network setup владельцем машины.
+- [x] ~~GitNexus `detect_changes`.~~ Консервативный общий risk `critical`: Ruff затронул крупные `scan_network`, AI pack, metrics и cancel flows. AST-сравнение подтвердило эквивалентность всех восьми formatting-only файлов и отмеченных функций `cancel_job`, `ai_pack`, `build_openapi_spec`; функциональные auth/SQL/lazy-import изменения отдельно получили `LOW` impact и покрыты полным test + Docker smoke.
+- [x] ~~Docker runtime build/up/healthcheck.~~ Image build и healthy container прошли; `/live`, `/ready`, authenticated Ping scan `127.0.0.1` — pass; тестовые volumes удалены.
 
 ## 6. Приоритизированный backlog улучшений
 
@@ -193,7 +193,7 @@ Missing tools не устанавливались автоматически: э
 - [x] ~~Retention для CLI `ai_reports` (`AI_REPORTS_MAX_DIRS` / `AI_REPORTS_MAX_AGE_DAYS`).~~
 - [x] ~~Package boundary: `recon_operator/` (`server`, `auth`, `jobs`, `scheduler`, `api`, `config`) + `autonmap` shim.~~
 - [ ] Further extract implementation out of `recon_operator/server.py` into leaf modules.
-- [ ] Повторить GitNexus taint/PDG анализ после обновления index session.
+- [x] ~~Повторить GitNexus taint/PDG анализ после обновления index session.~~ Cycles 0; taint findings 0.
 - [ ] Generated contract tests from OpenAPI (optional next step).
 
 ### Release B — выполнено (2026-07-15)
@@ -237,7 +237,7 @@ Missing tools не устанавливались автоматически: э
 | CLI-001 | P2 | Decrypt | Исправлено | Wrong key/corrupt input теперь concise error, exit 1, без traceback |
 | DEP-001 | P2 | Tooling | Исправлено | coverage `7.13.5 → 7.15.0`; остальные Python pins актуальны |
 | CI-001 | P1 | CI runtime | Исправлено | checkout/setup-python обновлены до Node 24-compatible major v6 |
-| ENV-002 | P2 | Docker | Ограничение среды | Docker daemon требует owner-approved privileged network setup; config/static audit pass |
+| ENV-002 | P2 | Docker | Закрыто | Runtime image build, healthy container, health endpoints и loopback Ping scan прошли через Colima без privilege prompt |
 | SEC-002 | P2 | CSP | Done | Static UI split + nonces/`'self'`; no `'unsafe-inline'` |
 | ARC-001 | P1 | Scaling | Backlog | Tasks и limiter находятся в process memory; подходит только single worker/operator |
 

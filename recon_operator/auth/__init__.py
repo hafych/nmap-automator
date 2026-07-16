@@ -14,11 +14,10 @@ import os
 import re
 import secrets
 import sys
+from importlib import import_module
 from typing import Any, Dict, List, Optional
 
 from quart import g, jsonify, request
-
-from recon_operator.config import API_AUTH_HEADER, API_AUTH_REQUIRED
 
 # Scopes are defined here (auth domain). config does not own them.
 API_KEY_SCOPES = frozenset({"read", "scan", "admin"})
@@ -194,10 +193,29 @@ def _load_api_auth_tokens() -> list:
     return [key["token"] for key in _load_api_auth_keys() if not key.get("revoked")]
 
 
-API_AUTH_KEYS: List[Dict[str, Any]] = _load_api_auth_keys()
-API_AUTH_TOKENS: List[str] = [key["token"] for key in API_AUTH_KEYS if not key.get("revoked")]
-# Backward-compatible alias used by docs and older code paths.
-API_AUTH_TOKEN = API_AUTH_TOKENS[0] if API_AUTH_TOKENS else ""
+API_AUTH_KEYS: List[Dict[str, Any]] = []
+API_AUTH_TOKENS: List[str] = []
+API_AUTH_TOKEN = ""
+
+
+def reload_api_auth_registry() -> List[Dict[str, Any]]:
+    """Reload the auth registry from the current process environment.
+
+    ``unittest discover`` imports package directories before test modules. That
+    can import this module before a test bootstrap has installed its isolated
+    environment. The server calls this function during its own import so the
+    registry reflects the environment that actually starts the application.
+    """
+    global API_AUTH_KEYS, API_AUTH_TOKENS, API_AUTH_TOKEN
+
+    API_AUTH_KEYS = _load_api_auth_keys()
+    API_AUTH_TOKENS = [key["token"] for key in API_AUTH_KEYS if not key.get("revoked")]
+    # Backward-compatible alias used by docs and older code paths.
+    API_AUTH_TOKEN = API_AUTH_TOKENS[0] if API_AUTH_TOKENS else ""
+    return API_AUTH_KEYS
+
+
+reload_api_auth_registry()
 
 
 def _runtime_server():
@@ -223,14 +241,18 @@ def _live_api_auth_required() -> bool:
     server = _runtime_server()
     if server is not None and hasattr(server, "API_AUTH_REQUIRED"):
         return bool(server.API_AUTH_REQUIRED)
-    return bool(API_AUTH_REQUIRED)
+    config = import_module("recon_operator.config")
+
+    return bool(config.API_AUTH_REQUIRED)
 
 
 def _live_api_auth_header() -> str:
     server = _runtime_server()
     if server is not None and hasattr(server, "API_AUTH_HEADER"):
         return str(server.API_AUTH_HEADER)
-    return API_AUTH_HEADER
+    config = import_module("recon_operator.config")
+
+    return str(config.API_AUTH_HEADER)
 
 
 def _resolve_api_key(candidate: str) -> Optional[Dict[str, Any]]:

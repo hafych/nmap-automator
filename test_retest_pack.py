@@ -84,9 +84,7 @@ INVENTORY = {
 
 class RetestPackTests(unittest.TestCase):
     def test_retest_pack_highlights_opened_service_and_defense(self):
-        rows = build_retest_pack_rows(
-            BASELINE, CURRENT, budget="s", inventory=INVENTORY
-        )
+        rows = build_retest_pack_rows(BASELINE, CURRENT, budget="s", inventory=INVENTORY)
         body, _, _ = build_ai_pack(
             CURRENT, budget="s", inventory=INVENTORY, baseline=BASELINE, mode="retest"
         )

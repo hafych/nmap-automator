@@ -96,7 +96,9 @@ def get_preset(preset_id: str) -> Optional[Dict[str, Any]]:
     return dict(preset) if preset else None
 
 
-def apply_preset_to_payload(payload: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def apply_preset_to_payload(
+    payload: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Merge preset fields into a scan payload.
 
     Explicit payload keys win over preset defaults (operator override).

@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.11.1  
+**Текущая версия кода:** 1.11.2<br>
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -125,10 +125,10 @@
 | --- | --- | --- | ---: |
 | P0-01 | `git push` ветки `beta-hardening` | remote синхронизирован | S |
 | P0-02 | Открыть PR → `main` с changelog 1.2–1.7 | reviewable release | S |
-| P0-03 | Docker runtime smoke: `compose up`, `/live`, `/ready`, Ping scan | подтвердить container path | S |
+| P0-03 | ~~Docker runtime smoke: `compose up`, `/live`, `/ready`, Ping scan~~ | container path подтверждён | S |
 | P0-04 | Обновить GitNexus index после merge | актуальный code graph | S |
 
-**Статус 2026-07-16:** ~~P0-01 push~~ + ~~P0-02 PR~~ → https://github.com/hafych/nmap-automator/pull/10 (1.7.2). P0-03 Docker smoke / P0-04 reindex after merge.
+**Статус 2026-07-16:** ~~P0-01 push~~ + ~~P0-02 PR~~ → https://github.com/hafych/nmap-automator/pull/14; ~~P0-03 Docker smoke~~ выполнен на `1.11.2`; P0-04 остаётся повторить после merge (индекс текущей ветки уже обновлён с PDG).
 
 **Критерий done:** PR green CI, compose health ok, README quick start воспроизводим.
 
@@ -181,7 +181,7 @@
 | P2-06 | ~~Key rotation for Fernet (multi-key)~~ | `FERNET_PREVIOUS_KEYS` + MultiFernet; `decrypt.py` aligned | M |
 | P2-07 | ~~Audit log (who scanned what when)~~ | SQLite `audit_events` + optional JSONL; `GET /audit` admin | M |
 | P2-08 | ~~Trusted reverse-proxy mode~~ | `TRUSTED_PROXY_MODE` + `TRUSTED_PROXIES` allowlist | S |
-| P2-09 | GitNexus PDG/taint pass | security review automation | S |
+| P2-09 | ~~GitNexus PDG/taint pass~~ | свежий PDG: cycles 0, taint findings 0 | S |
 | P2-10 | ~~Structured logging (JSON optional)~~ | `STRUCTURED_LOGS` JSON lines + job_id fields | M |
 | P2-11 | ~~Metrics endpoint (Prometheus)~~ | `GET /metrics` text exposition; job/scan series | M |
 | P2-12 | Webhooks (Slack/Discord/generic) | richer than Telegram-only | M |
@@ -233,7 +233,7 @@
 
 ### Release D — «Ship & stabilize» (1 неделя)
 
-1. ~~P0-01 push + P0-02 PR~~ — **done** ([PR #10](https://github.com/hafych/nmap-automator/pull/10)); P0-03 Docker smoke / P0-04 reindex still open  
+1. ~~P0-01 push + P0-02 PR + P0-03 Docker smoke~~ — **done** ([PR #14](https://github.com/hafych/nmap-automator/pull/14)); P0-04 reindex remains after merge
 2. ~~P1-10…P1-11 coverage~~ — **done** (autonmap ~82%, overall ~79%, fail_under 75)  
 3. ~~P1-08 legacy results policy flag~~ — **done** (`LEGACY_RESULTS_SHARED`)  
 4. ~~Changelog + migration notes~~ — **done** (README + §13 / SECURITY notes)  
@@ -422,6 +422,7 @@
 | 2026-07-16 | 1.10.1 | Posture drift, UI AI Brief/presets, structured logs |
 | 2026-07-16 | 1.11.0 | Playbook chain runner (POST /playbook/run sequential phases) |
 | 2026-07-16 | 1.11.1 | Hard-cancel Nmap process group + ensure_operator_result schema bridge |
+| 2026-07-16 | 1.11.2 | CI bootstrap fix, SQL audit hardening, Ruff cleanup, Docker + GitNexus PDG/taint validation |
 
 ---
 

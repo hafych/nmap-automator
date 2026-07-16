@@ -193,6 +193,16 @@ class StateStoreTests(unittest.TestCase):
             self.assertTrue(all(row["action"] == "scan.create" for row in only_create))
             by_actor = store.list_audit_events(actor_key_id="primary", limit=10)
             self.assertEqual(len(by_actor), 3)
+            combined = store.list_audit_events(
+                action="scan.create", actor_key_id="primary", limit=10
+            )
+            self.assertTrue(combined)
+            self.assertTrue(
+                all(
+                    row["action"] == "scan.create" and row["actor_key_id"] == "primary"
+                    for row in combined
+                )
+            )
 
 
 if __name__ == "__main__":
