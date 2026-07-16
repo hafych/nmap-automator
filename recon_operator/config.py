@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -33,6 +33,8 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
 
 # When true, GET /metrics requires a valid API key with read scope (safer non-loopback).
 METRICS_AUTH_REQUIRED = _parse_bool_env("METRICS_AUTH_REQUIRED", False)
+# When true, log_event emits a JSON line with timestamp/level/message (correlation-friendly).
+STRUCTURED_LOGS = _parse_bool_env("STRUCTURED_LOGS", False)
 
 
 def _parse_int_env(

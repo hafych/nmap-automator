@@ -2,6 +2,7 @@ const state = {
       lastResult: null,
       previousResult: null,
       lastPlan: null,
+      lastBrief: null,
       lastDiff: null,
       toolsContext: "",
       view: "summary",
@@ -69,6 +70,7 @@ const state = {
       $("refreshBtn").disabled = isBusy;
       $("toolsBtn").disabled = isBusy;
       $("planBtn").disabled = isBusy;
+      if ($("briefBtn")) $("briefBtn").disabled = isBusy;
       $("historyBtn").disabled = isBusy;
       $("importBtn").disabled = isBusy;
       $("diffBtn").disabled = isBusy;
@@ -77,9 +79,14 @@ const state = {
     function scanPayload() {
       const body = {
         target: $("target").value,
-        scan_type: $("scanType").value,
         interval: Number($("interval").value),
       };
+      const preset = ($("preset") && $("preset").value.trim()) || "";
+      if (preset) {
+        body.preset = preset;
+      } else {
+        body.scan_type = $("scanType").value;
+      }
       const ports = $("ports").value.trim();
       const scripts = $("scripts").value.trim();
       const discovery = $("discovery").value.trim();
@@ -232,11 +239,14 @@ const state = {
       if (state.view === "json") content = result ? JSON.stringify(result, null, 2) : "";
       if (state.view === "jsonl") content = observations(result).map((row) => JSON.stringify(row)).join("\n");
       if (state.view === "plan") content = planText(state.lastPlan);
+      if (state.view === "brief") content = state.lastBrief || "Load an AI pack (low-token brief) after a scan.";
       if (state.view === "diff") content = diffText(state.lastDiff);
       if (state.view === "summary") content = summary(result);
       $("resultBox").value = content;
       if (state.view === "plan") {
         $("resultLabel").textContent = state.lastPlan ? "PLAN view" : "Build a recon plan first.";
+      } else if (state.view === "brief") {
+        $("resultLabel").textContent = state.lastBrief ? "AI BRIEF (budget=s pack)" : "No AI pack yet.";
       } else if (state.view === "diff") {
         $("resultLabel").textContent = state.lastDiff ? "DIFF view" : "No diff yet.";
       } else if (result) {
@@ -409,6 +419,57 @@ const state = {
       if (state.lastResult) state.previousResult = state.lastResult;
       state.lastResult = result;
       state.lastPlan = null;
+      state.lastBrief = null;
+    }
+
+    async function loadAiBrief({ retest = false } = {}) {
+      if (!state.lastResult) {
+        say("Run a scan first.", true);
+        return;
+      }
+      setBusy(true);
+      try {
+        const payload = { scan: state.lastResult, budget: "s" };
+        let path = "/ai/pack?budget=s";
+        if (retest && state.previousResult) {
+          payload.baseline = state.previousResult;
+          path = "/ai/pack?mode=retest&budget=s";
+        }
+        const response = await fetch(path, {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify(payload),
+        });
+        const text = await response.text();
+        if (!response.ok) {
+          let detail = response.statusText;
+          try {
+            const errBody = JSON.parse(text);
+            if (errBody && errBody.error) detail = errBody.error;
+          } catch (_e) {
+            /* ignore */
+          }
+          throw new Error(`${response.status}: ${detail}`);
+        }
+        state.lastBrief = text;
+        state.view = "brief";
+        document.querySelectorAll(".tabs button").forEach((item) => {
+          const selected = item.dataset.view === "brief";
+          item.classList.toggle("active", selected);
+          item.setAttribute("aria-selected", String(selected));
+        });
+        renderResult();
+        const lines = text.split("\n").filter(Boolean).length;
+        say(
+          retest
+            ? `AI retest pack loaded (${lines} lines).`
+            : `AI pack loaded (${lines} lines, budget=s).`
+        );
+      } catch (error) {
+        say(error.message, true);
+      } finally {
+        setBusy(false);
+      }
     }
 
     async function runScan() {
@@ -560,6 +621,9 @@ const state = {
     $("historyBtn").addEventListener("click", () => refreshHistory());
     $("toolsBtn").addEventListener("click", refreshTools);
     $("planBtn").addEventListener("click", buildPlan);
+    if ($("briefBtn")) {
+      $("briefBtn").addEventListener("click", () => loadAiBrief({ retest: false }));
+    }
     async function copyText(content, successMessage) {
       try {
         await navigator.clipboard.writeText(content);

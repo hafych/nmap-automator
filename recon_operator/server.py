@@ -32,6 +32,7 @@ from recon_operator import config as _config
 from recon_operator.ai_pack import build_ai_pack, normalize_budget
 from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 from recon_operator.metrics import METRICS
+from recon_operator.posture import evaluate_posture, load_expected_posture
 from recon_operator.presets import (
     PHASE_ORDER,
     apply_preset_to_payload,
@@ -126,6 +127,7 @@ FERNET_PREVIOUS_KEYS_RAW = _config.FERNET_PREVIOUS_KEYS_RAW
 AUDIT_LOG_PATH = _config.AUDIT_LOG_PATH
 AUDIT_LOG_MAX_EVENTS = _config.AUDIT_LOG_MAX_EVENTS
 METRICS_AUTH_REQUIRED = _config.METRICS_AUTH_REQUIRED
+STRUCTURED_LOGS = _config.STRUCTURED_LOGS
 
 # --- Auth surface (source of truth: recon_operator.auth) ---
 API_KEY_SCOPES = _auth.API_KEY_SCOPES
@@ -251,7 +253,28 @@ def get_scan_type_choices() -> str:
     return ", ".join(f"'{k}'" for k in SUPPORTED_SCAN_TYPES.keys())
 
 
-def log_event(event: str):
+def log_event(event: str, **fields: Any):
+    """Emit an operator log line; optional JSON when STRUCTURED_LOGS=true."""
+    if STRUCTURED_LOGS:
+        payload = {
+            "ts": _utc_now_iso(),
+            "level": "info",
+            "message": str(event),
+            "product": PRODUCT_NAME,
+            "version": VERSION,
+            "worker_id": WORKER_ID,
+        }
+        for key, value in fields.items():
+            if value is None:
+                continue
+            # Never log secrets.
+            if key.lower() in {"token", "api_token", "fernet_key", "password", "secret"}:
+                continue
+            payload[key] = value
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        logging.info(line)
+        print(line)
+        return
     logging.info(event)
     print(event)
 
@@ -1459,6 +1482,14 @@ async def create_scan_job(
         task = asyncio.create_task(_run_scan_job(job_id))
         job["task"] = task
         METRICS.inc("recon_operator_jobs_created_total", kind=str(kind or "immediate"))
+        log_event(
+            f"Scan job queued {job_id}",
+            job_id=job_id,
+            target=target,
+            scan_type=scan_type,
+            kind=kind,
+            owner_prefix=(owner[:12] if owner else None),
+        )
         record_audit_event(
             "scan.create",
             target=target,
@@ -1535,6 +1566,39 @@ async def presets_list():
         ),
         200,
     )
+
+
+@app.route("/posture/evaluate", methods=["POST"])
+async def posture_evaluate():
+    """Evaluate a scan (or stored result) against expected service posture."""
+    auth_error = require_api_auth("read")
+    if auth_error:
+        return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    body = await request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Expected JSON body"}), 400
+    scan, error, _, _ = await _resolve_scan_for_pack(body=body)
+    if error:
+        return jsonify({"error": error}), 400 if "not found" not in error.lower() else 404
+    try:
+        expected = body.get("posture") or body.get("expected")
+        if expected is None:
+            expected = load_expected_posture()
+        elif isinstance(expected, str):
+            expected = load_expected_posture(expected)
+        elif not isinstance(expected, dict):
+            return jsonify({"error": "posture must be an object or JSON string"}), 400
+        else:
+            # Normalize list form under services if caller posted raw list.
+            if "services" not in expected and isinstance(expected.get("ports"), list):
+                expected = {"services": expected["ports"], "deny_unexpected": True}
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    report = evaluate_posture(scan, expected)
+    return jsonify(report), 200
 
 
 @app.route("/scan", methods=["POST"])

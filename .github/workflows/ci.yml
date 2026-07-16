@@ -69,7 +69,7 @@ jobs:
 
       - name: Security checks
         run: |
-          bandit -q -ll -r . -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_scan_engine.py,./test_state_store.py,./test_tool_inventory.py,./test_openapi_contract.py,./test_package_layout.py,./test_metrics.py,./test_crypto.py,./test_ai_pack.py,./test_presets.py,./test_retest_pack.py,./test_metrics_policy.py,./e2e
+          bandit -q -ll -r . -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_scan_engine.py,./test_state_store.py,./test_tool_inventory.py,./test_openapi_contract.py,./test_package_layout.py,./test_metrics.py,./test_crypto.py,./test_ai_pack.py,./test_presets.py,./test_retest_pack.py,./test_metrics_policy.py,./test_posture.py,./e2e
           pip-audit -r requirements.txt
 
   e2e:

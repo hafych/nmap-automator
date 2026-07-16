@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from recon_operator.posture import load_expected_posture, posture_pack_rows
 from recon_planner import build_recon_plan
 from scan_engine import diff_scan_results
 
@@ -31,6 +32,7 @@ _BUDGET_LIMITS = {
         "max_ask": 3,
         "max_inv": 6,
         "max_changes": 8,
+        "max_drift": 8,
         "include_plan": True,
         "include_defense": True,
         "prefer_ready_next": True,
@@ -45,6 +47,7 @@ _BUDGET_LIMITS = {
         "max_ask": 5,
         "max_inv": 16,
         "max_changes": 24,
+        "max_drift": 20,
         "include_plan": True,
         "include_defense": True,
         "prefer_ready_next": False,
@@ -59,6 +62,7 @@ _BUDGET_LIMITS = {
         "max_ask": 8,
         "max_inv": 40,
         "max_changes": 80,
+        "max_drift": 60,
         "include_plan": True,
         "include_defense": True,
         "prefer_ready_next": False,
@@ -218,6 +222,7 @@ def build_ai_pack_rows(
     job_id: Optional[str] = None,
     result_id: Optional[str] = None,
     plan: Optional[Dict[str, Any]] = None,
+    expected_posture: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Build ordered pack rows for the given budget.
 
@@ -227,6 +232,11 @@ def build_ai_pack_rows(
     limits = _BUDGET_LIMITS[budget_key]
     if not isinstance(scan, dict):
         raise ValueError("scan must be a parsed result object")
+    if expected_posture is None:
+        try:
+            expected_posture = load_expected_posture()
+        except RuntimeError:
+            expected_posture = None
 
     services = list(_iter_open_services(scan))
     # Optionally surface closed ports only when explicitly requested (not default).
@@ -385,6 +395,12 @@ def build_ai_pack_rows(
             max_rows=int(limits["max_inv"]),
         )
         rows.extend(inv_rows)
+
+    # Defense posture drift (optional expected posture).
+    posture_rows = posture_pack_rows(
+        scan, expected_posture, max_rows=int(limits["max_drift"])
+    )
+    rows.extend(posture_rows)
 
     # Clarifying questions (cheap, capped).
     ask_rows: List[Dict[str, Any]] = []
@@ -562,6 +578,7 @@ def build_retest_pack_rows(
     *,
     budget: str = "s",
     inventory: Optional[Dict[str, Any]] = None,
+    expected_posture: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Compact retest brief: current open services + defense + diff-focused changes."""
     if not isinstance(baseline, dict) or not isinstance(current, dict):
@@ -571,7 +588,12 @@ def build_retest_pack_rows(
     diff = diff_scan_results(baseline, current)
 
     # Start from current pack (open services, findings, defense, next/gap).
-    rows = build_ai_pack_rows(current, budget=budget, inventory=inventory)
+    rows = build_ai_pack_rows(
+        current,
+        budget=budget,
+        inventory=inventory,
+        expected_posture=expected_posture,
+    )
     if rows and rows[0].get("t") == "meta":
         meta = dict(rows[0])
         meta["mode"] = "retest"
@@ -660,6 +682,7 @@ def build_ai_pack(
     include_closed: bool = False,
     baseline: Optional[Dict[str, Any]] = None,
     mode: Optional[str] = None,
+    expected_posture: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, List[Dict[str, Any]]]:
     """Return (body, content_type, rows).
 
@@ -670,7 +693,11 @@ def build_ai_pack(
         if baseline is None:
             raise ValueError("retest mode requires baseline scan object")
         rows = build_retest_pack_rows(
-            baseline, scan, budget=budget, inventory=inventory
+            baseline,
+            scan,
+            budget=budget,
+            inventory=inventory,
+            expected_posture=expected_posture,
         )
     else:
         rows = build_ai_pack_rows(
@@ -681,6 +708,7 @@ def build_ai_pack(
             job_id=job_id,
             result_id=result_id,
             plan=plan,
+            expected_posture=expected_posture,
         )
     fmt = str(format or "jsonl").strip().lower()
     if fmt in {"json", "application/json"}:
