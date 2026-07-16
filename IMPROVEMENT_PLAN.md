@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.11.0  
+**Текущая версия кода:** 1.11.1  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -203,7 +203,7 @@
 | PRD-05 | Export PDF/HTML report | reporting tools | L |
 | PRD-06 | Batch targets file upload | automation | S |
 | PRD-07 | Progress streaming (SSE/WebSocket) | long scans UX | M |
-| PRD-08 | Cancel running Nmap process tree | real cancel, not only job flag | M |
+| PRD-08 | ~~Cancel running Nmap process tree~~ | `kill_active_process(job_id)` process group | M |
 | PRD-09 | Import masscan/naabu JSON as discovery input | modern recon pipeline | M |
 | PRD-10 | Optional Masscan front-end (like Hybrid) | speed at scale | M |
 | PRD-11 | Locale RU/EN switch | mixed audience | M |
@@ -421,6 +421,7 @@
 | 2026-07-16 | 1.10.0 | Master-plan remainder: presets, retest pack, CLI pack, metrics auth policy, threat model |
 | 2026-07-16 | 1.10.1 | Posture drift, UI AI Brief/presets, structured logs |
 | 2026-07-16 | 1.11.0 | Playbook chain runner (POST /playbook/run sequential phases) |
+| 2026-07-16 | 1.11.1 | Hard-cancel Nmap process group + ensure_operator_result schema bridge |
 
 ---
 

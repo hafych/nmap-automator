@@ -727,6 +727,8 @@ def pack_from_json_file(
     """Offline helper: load scan JSON from disk and build a pack (CLI path)."""
     from pathlib import Path
 
+    from scan_engine import ensure_operator_result
+
     text = Path(path).read_text(encoding="utf-8")
     scan = json.loads(text)
     if not isinstance(scan, dict):
@@ -736,6 +738,7 @@ def pack_from_json_file(
         scan = scan["scan"]
     if "hosts" not in scan and isinstance(scan.get("result"), dict):
         scan = scan["result"]
+    scan = ensure_operator_result(scan)
     baseline = None
     if baseline_path:
         base_raw = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
@@ -748,6 +751,7 @@ def pack_from_json_file(
                 baseline = base_raw["result"]
         if baseline is None:
             raise ValueError("baseline file must contain a parsed scan object")
+        baseline = ensure_operator_result(baseline)
     return build_ai_pack(
         scan,
         budget=budget,

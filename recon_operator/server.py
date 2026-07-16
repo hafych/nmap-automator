@@ -52,9 +52,11 @@ from scan_engine import (
     NmapNotFoundError,
     NmapScanError,
     NmapTimeoutError,
+    ScanCancelledError,
     available_discovery_engines,
     diff_scan_results,
     import_nmap_xml,
+    kill_active_process,
     run_nmap_scan,
     supported_scan_types,
     validate_discovery,
@@ -918,6 +920,7 @@ def scan_network(
     ports: Optional[str] = None,
     scripts: Optional[str] = None,
     discovery: Optional[str] = None,
+    process_token: Optional[str] = None,
 ) -> dict:
     """
     Synchronous scan entry point used by the async executor.
@@ -925,7 +928,8 @@ def scan_network(
     """
     log_event(
         f"Starting scan {target} type={scan_type} ports={ports} "
-        f"scripts={scripts} discovery={discovery}"
+        f"scripts={scripts} discovery={discovery}",
+        job_id=process_token,
     )
     try:
         return run_nmap_scan(
@@ -937,7 +941,10 @@ def scan_network(
             ports=ports,
             scripts=scripts,
             discovery=discovery,
+            process_token=process_token,
         )
+    except ScanCancelledError:
+        raise
     except NmapTimeoutError as exc:
         raise TimeoutError(str(exc)) from exc
     except DiscoveryError as exc:
@@ -1264,10 +1271,16 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
                         ports=ports,
                         scripts=scripts,
                         discovery=discovery,
+                        process_token=job_id,
                     ),
                 ),
                 timeout=SCAN_TIMEOUT_SECONDS + 5,
             )
+        # If cancel won the race, do not overwrite cancelled status with completed.
+        async with _jobs_lock:
+            current = scan_jobs.get(job_id)
+            if current and current.get("status") == "cancelled":
+                return
         result_file = await save_scan_results_async(results, target, scan_type, owner_id=owner_id)
         await _set_job_fields(
             job_id,
@@ -1287,6 +1300,7 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
     except asyncio.CancelledError:
+        kill_active_process(job_id)
         await _set_job_fields(
             job_id,
             status="cancelled",
@@ -1302,9 +1316,25 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
         raise
+    except ScanCancelledError:
+        await _set_job_fields(
+            job_id,
+            status="cancelled",
+            finished_at=_utc_now_iso(),
+            error="Scan cancelled",
+        )
+        record_audit_event(
+            "scan.finish",
+            target=target,
+            scan_type=scan_type,
+            job_id=job_id,
+            status="cancelled",
+            actor_owner_prefix=(owner_id[:12] if owner_id else None),
+        )
     except asyncio.TimeoutError:
+        kill_active_process(job_id)
         err = f"Scan timeout for {target} ({scan_type})"
-        log_event(err)
+        log_event(err, job_id=job_id)
         await send_telegram_message(err)
         await _set_job_fields(
             job_id,
@@ -1321,8 +1351,9 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
     except TimeoutError as exc:
+        kill_active_process(job_id)
         err = str(exc)
-        log_event(err)
+        log_event(err, job_id=job_id)
         await send_telegram_message(err)
         await _set_job_fields(
             job_id,
@@ -1339,8 +1370,14 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
     except (NmapNotFoundError, NmapScanError, Exception) as exc:
+        # Prefer cancelled if cancel_job already won.
+        async with _jobs_lock:
+            current = scan_jobs.get(job_id)
+            already_cancelled = bool(current and current.get("status") == "cancelled")
+        if already_cancelled:
+            return
         err = f"Scan error for {target} ({scan_type}): {exc}"
-        log_event(err)
+        log_event(err, job_id=job_id)
         await send_telegram_message(err)
         await _set_job_fields(
             job_id,
@@ -1358,6 +1395,7 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
     finally:
+        kill_active_process(job_id)
         if heartbeat is not None:
             heartbeat.cancel()
             try:
@@ -1975,16 +2013,29 @@ async def cancel_job(job_id: str):
         if task is not None and not task.done():
             task.cancel()
         _persist_job(job)
+    # Hard-cancel Nmap/discovery process group (task.cancel alone does not stop executor).
+    killed = kill_active_process(job_id)
     _release_redis_job_lease(job_id)
-    log_event(f"Job {job_id} cancelled")
+    log_event(
+        f"Job {job_id} cancelled",
+        job_id=job_id,
+        process_killed=killed,
+    )
     record_audit_event(
         "scan.cancel",
         target=job.get("target"),
         scan_type=job.get("scan_type"),
         job_id=job_id,
         status="cancelled",
+        detail=f"process_killed={killed}",
     )
-    return jsonify({"message": f"Job {job_id} cancelled", "job_id": job_id}), 200
+    return jsonify(
+        {
+            "message": f"Job {job_id} cancelled",
+            "job_id": job_id,
+            "process_killed": killed,
+        }
+    ), 200
 
 
 def _try_redis_leadership(lock_name: str, *, renew: bool = False) -> bool:
