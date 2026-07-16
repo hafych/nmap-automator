@@ -80,7 +80,8 @@ class AiPackBuilderTests(unittest.TestCase):
         self.assertIn("ndjson", content_type)
         self.assertLessEqual(len(rows), BUDGET_S_MAX_LINES)
         self.assertLessEqual(pack_bytes(rows), BUDGET_S_MAX_BYTES)
-        self.assertLessEqual(len(body.encode("utf-8")), BUDGET_S_MAX_BYTES + 64)
+        self.assertLessEqual(len(body.encode("utf-8")), BUDGET_S_MAX_BYTES)
+        self.assertEqual(len(body.encode("utf-8")), pack_bytes(rows))
 
         types = {row.get("t") for row in rows}
         self.assertIn("meta", types)
@@ -100,6 +101,48 @@ class AiPackBuilderTests(unittest.TestCase):
         self.assertNotIn(os.environ["FERNET_KEY"], blob)
         # Closed SMTP must not appear as an open service fact.
         self.assertFalse(any(r.get("t") == "svc" and r.get("name") == "smtp" for r in rows))
+
+    def test_small_pack_hard_cap_holds_when_truncated(self):
+        """Force truncation with many open services; final pack must stay under hard caps."""
+        ports = []
+        for index in range(40):
+            ports.append(
+                {
+                    "port": 8000 + index,
+                    "state": "open",
+                    "name": "http",
+                    "product": "nginx-long-product-name-for-bytes",
+                    "version": f"1.18.{index}-build-extra-detail",
+                }
+            )
+        fat_scan = {
+            "schema": "recon-operator-result/v1",
+            "target": "192.0.2.10",
+            "scan_type": "Version",
+            "hosts": [
+                {
+                    "host": "192.0.2.10",
+                    "hostname": "app.example.test",
+                    "state": "up",
+                    "protocols": {"tcp": ports},
+                }
+            ],
+        }
+        rows = build_ai_pack_rows(fat_scan, budget="s", inventory=INVENTORY)
+        body, _, body_rows = build_ai_pack(fat_scan, budget="s", inventory=INVENTORY)
+        body_bytes = len(body.encode("utf-8"))
+        self.assertLessEqual(len(rows), BUDGET_S_MAX_LINES)
+        self.assertLessEqual(pack_bytes(rows), BUDGET_S_MAX_BYTES)
+        self.assertLessEqual(body_bytes, BUDGET_S_MAX_BYTES)
+        self.assertEqual(body_bytes, pack_bytes(body_rows))
+        self.assertEqual(rows[0].get("t"), "meta")
+        self.assertTrue(rows[0].get("truncated"), "expected truncation on fat scan")
+        self.assertEqual(rows[0].get("lines"), len(rows))
+        self.assertEqual(rows[0].get("bytes"), pack_bytes(rows))
+        # Uncapped builder path would exceed; stamp must not push over the hard cap.
+        self.assertGreater(40, 1)  # fat input present
+        self.assertNotIn("test-token", body)
+        self.assertNotIn(os.environ["FERNET_KEY"], body)
 
     def test_medium_pack_is_strictly_larger_than_small(self):
         rows_s = build_ai_pack_rows(SCAN, budget="s", inventory=INVENTORY)
@@ -148,9 +191,10 @@ class AiPackHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("ndjson", response.headers.get("Content-Type", ""))
         self.assertTrue(body.strip())
-        self.assertLessEqual(len(body.encode("utf-8")), BUDGET_S_MAX_BYTES + 128)
+        self.assertLessEqual(len(body.encode("utf-8")), BUDGET_S_MAX_BYTES)
         lines = [json.loads(line) for line in body.splitlines() if line.strip()]
         self.assertLessEqual(len(lines), BUDGET_S_MAX_LINES)
+        self.assertLessEqual(pack_bytes(lines), BUDGET_S_MAX_BYTES)
         self.assertEqual(lines[0]["t"], "meta")
         self.assertEqual(lines[0]["budget"], "s")
         self.assertNotIn("test-token", body)
