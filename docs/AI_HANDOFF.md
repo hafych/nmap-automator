@@ -1,0 +1,59 @@
+# AI handoff (low-token packs)
+
+Recon Operator already stores **full-fidelity** encrypted scan results.  
+For LLMs and agents, **do not paste full `/results/<id>` JSON** into chat.
+
+## Prefer `/ai/pack`
+
+Default response is a **small** NDJSON pack (`budget=s`):
+
+- host + **open** services only (closed ports omitted)
+- compact findings
+- next-step / missing-tool signals (from the review-only planner)
+- short defense hints
+- hard cap: **≤ 4 KiB or ≤ 100 lines**
+
+```bash
+# From a posted scan object
+curl -sS -X POST "http://127.0.0.1:5000/ai/pack?budget=s" \
+  -H "X-API-KEY: $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @scan_result.json
+
+# From a stored result or completed job
+curl -sS -H "X-API-KEY: $API_TOKEN" \
+  "http://127.0.0.1:5000/ai/pack?result_id=<filename>&budget=s"
+
+curl -sS -H "X-API-KEY: $API_TOKEN" \
+  "http://127.0.0.1:5000/ai/pack?job_id=<uuid>&budget=m&format=json"
+```
+
+### Budgets
+
+| Budget | Use |
+| --- | --- |
+| `s` (default) | One LLM turn / brief |
+| `m` | Session context (more next/gap/defense rows; still no closed-port noise) |
+| `l` or `detail=full` | Larger pack when needed; full archive remains `GET /results/<id>` |
+
+### Line types (`t`)
+
+`meta`, `host`, `svc`, `finding`, `next`, `gap`, `defense`, `ask`
+
+Schema: `recon-ai-pack/v1`.
+
+## Agent rules (short)
+
+1. Call **one** `/ai/pack` per turn when possible.  
+2. Never put API tokens or Fernet keys into the model context.  
+3. Treat `next` as **operator-reviewed** suggestions only (no auto-exec).  
+4. Escalate to full result only if the pack meta marks truncation and deep analysis is required.
+
+## Related surfaces
+
+| Endpoint | Role |
+| --- | --- |
+| `GET /tools/ai-context` | Inventory context (jsonl/md) |
+| `POST /recon/plan` | Full review-only plan |
+| `GET /results/<id>` | Full fidelity archive (encrypted storage) |
+| `GET /ai/pack` | **Default AI path** |

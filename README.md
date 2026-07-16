@@ -16,6 +16,11 @@
 > Use this project only on systems you own or are explicitly authorized to assess.
 > Unauthorized scanning may be illegal and disruptive.
 
+## AI handoff (low tokens)
+
+Prefer **`GET|POST /ai/pack?budget=s`** over pasting full result JSON into an LLM.
+See [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md) for budgets (`s`/`m`/`l`), line types, and agent rules.
+
 ## Why Recon Operator?
 
 Running one scanner is easy. Operating repeatable recon safely is harder. This project adds the controls and artifacts operators need without auto-exploiting targets.
@@ -202,6 +207,7 @@ curl http://127.0.0.1:5000/openapi.json
 | `GET` | `/tasks` | List scheduled tasks |
 | `DELETE` | `/tasks/<id>` | Cancel a scheduled task |
 | `GET` | `/metrics` | Prometheus text metrics (jobs, scans, durations; no auth) |
+| `GET`/`POST` | `/ai/pack` | Budgeted AI recon pack (default `budget=s` NDJSON; see AI_HANDOFF) |
 | `GET` | `/audit` | Recent audit events (admin; no secrets) |
 | `GET` | `/results` | List encrypted result files |
 | `GET` | `/results/<id>` | Decrypt and return a stored result |
