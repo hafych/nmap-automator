@@ -32,6 +32,12 @@ from recon_operator import config as _config
 from recon_operator.ai_pack import build_ai_pack, normalize_budget
 from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 from recon_operator.metrics import METRICS
+from recon_operator.playbook import (
+    build_engagement_record,
+    list_playbooks,
+    public_engagement_view,
+    resolve_phases,
+)
 from recon_operator.posture import evaluate_posture, load_expected_posture
 from recon_operator.presets import (
     PHASE_ORDER,
@@ -208,11 +214,14 @@ app = Quart(
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BODY_BYTES
 scan_tasks: Dict[str, asyncio.Task] = {}
 scan_jobs: Dict[str, Dict[str, Any]] = {}
+engagements: Dict[str, Dict[str, Any]] = {}
+_engagement_tasks: Dict[str, asyncio.Task] = {}
 rate_limits = defaultdict(list)
 tool_inventory_cache = {}
 tool_inventory_locks = defaultdict(threading.Lock)
 _scan_semaphore: Optional[asyncio.Semaphore] = None
 _jobs_lock = asyncio.Lock()
+_engagements_lock = asyncio.Lock()
 state_store = StateStore(STATE_DB_PATH)
 
 SUPPORTED_SCAN_TYPES = {name: name for name in supported_scan_types()}
@@ -1561,11 +1570,232 @@ async def presets_list():
             {
                 "phases": PHASE_ORDER,
                 "presets": list_presets(),
+                "playbooks": list_playbooks(),
                 "usage": 'POST /scan with {"target":"...","preset":"map"}',
+                "playbook_usage": 'POST /playbook/run with {"target":"...","playbook":"standard"}',
             }
         ),
         200,
     )
+
+
+async def _wait_job_terminal(job_id: str) -> Dict[str, Any]:
+    """Poll until a job reaches a terminal status; return the job dict."""
+    terminal = _TERMINAL_JOB_STATUSES
+    while True:
+        async with _jobs_lock:
+            current = scan_jobs.get(job_id)
+        if current is None:
+            current = await asyncio.to_thread(state_store.get_job, job_id)
+        if current and current.get("status") in terminal:
+            return current
+        await asyncio.sleep(0.1)
+
+
+async def _run_engagement(engagement_id: str) -> None:
+    """Sequentially queue playbook phases as scan jobs (no planner auto-exec)."""
+    async with _engagements_lock:
+        eng = engagements.get(engagement_id)
+        if not eng:
+            return
+        eng["status"] = "running"
+        steps = eng.get("steps") or []
+        owner = eng.get("owner_id") or "local"
+        target = eng.get("target")
+
+    try:
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            async with _engagements_lock:
+                eng = engagements.get(engagement_id)
+                if not eng or eng.get("status") == "cancelled":
+                    return
+                eng["current_index"] = index
+                step["status"] = "running"
+            payload = {
+                "target": target,
+                "preset": step.get("phase"),
+            }
+            merged, err = apply_preset_to_payload(payload)
+            if err or not merged:
+                async with _engagements_lock:
+                    step["status"] = "failed"
+                    step["error"] = err or "preset failed"
+                    eng["status"] = "failed"
+                return
+            try:
+                job = await create_scan_job(
+                    str(merged["target"]),
+                    str(merged["scan_type"]),
+                    kind="playbook",
+                    ports=merged.get("ports"),
+                    scripts=merged.get("scripts"),
+                    discovery=merged.get("discovery"),
+                    owner_id=owner,
+                )
+            except Exception as exc:
+                async with _engagements_lock:
+                    step["status"] = "failed"
+                    step["error"] = str(exc)
+                    eng["status"] = "failed"
+                log_event(
+                    f"Playbook step failed to queue: {exc}",
+                    engagement_id=engagement_id,
+                    phase=step.get("phase"),
+                )
+                return
+            job_id = job.get("job_id")
+            async with _engagements_lock:
+                step["job_id"] = job_id
+            finished = await _wait_job_terminal(str(job_id))
+            async with _engagements_lock:
+                step["status"] = finished.get("status") or "failed"
+                step["result_file"] = finished.get("result_file")
+                step["error"] = finished.get("error")
+                if finished.get("status") != "completed":
+                    eng["status"] = "failed"
+                    log_event(
+                        f"Playbook stopped after phase {step.get('phase')}",
+                        engagement_id=engagement_id,
+                        job_id=job_id,
+                        status=finished.get("status"),
+                    )
+                    return
+            log_event(
+                f"Playbook phase completed: {step.get('phase')}",
+                engagement_id=engagement_id,
+                job_id=job_id,
+                phase=step.get("phase"),
+            )
+        async with _engagements_lock:
+            eng = engagements.get(engagement_id)
+            if eng and eng.get("status") == "running":
+                eng["status"] = "completed"
+                eng["current_index"] = len(steps)
+        log_event(f"Playbook completed {engagement_id}", engagement_id=engagement_id)
+    except asyncio.CancelledError:
+        async with _engagements_lock:
+            eng = engagements.get(engagement_id)
+            if eng:
+                eng["status"] = "cancelled"
+        raise
+    except Exception as exc:
+        async with _engagements_lock:
+            eng = engagements.get(engagement_id)
+            if eng:
+                eng["status"] = "failed"
+        log_event(f"Playbook error {engagement_id}: {exc}", engagement_id=engagement_id)
+
+
+@app.route("/playbook/run", methods=["POST"])
+async def playbook_run():
+    """Start an ordered engagement playbook (queues sequential scan jobs)."""
+    auth_error = require_api_auth("scan")
+    if auth_error:
+        return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    data = await request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected JSON body with target"}), 400
+    target = data.get("target")
+    if not isinstance(target, str) or not target.strip():
+        return jsonify({"error": "target is required"}), 400
+    target = target.strip()
+    # Validate target using the same payload rules as a Ping scan.
+    probe = {"target": target, "scan_type": "Ping"}
+    _t, _st, _i, _p, _s, _d, error = _validate_scan_payload(probe)
+    if error:
+        return jsonify({"error": error}), 400
+    target = _t or target
+
+    phases, playbook_id, phase_error = resolve_phases(
+        playbook=data.get("playbook") or data.get("playbook_id"),
+        phases=data.get("phases"),
+    )
+    if phase_error or not phases or not playbook_id:
+        return jsonify({"error": phase_error or "Unable to resolve playbook phases"}), 400
+
+    owner = current_owner_id()
+    record = build_engagement_record(
+        target=target,
+        phase_ids=phases,
+        playbook_id=playbook_id,
+        owner_id=owner,
+    )
+    engagement_id = record["engagement_id"]
+    async with _engagements_lock:
+        engagements[engagement_id] = record
+        # Prune old completed engagements if map grows large.
+        if len(engagements) > 200:
+            finished = [
+                eid
+                for eid, row in engagements.items()
+                if row.get("status") in {"completed", "failed", "cancelled"}
+            ]
+            for eid in finished[: max(0, len(engagements) - 150)]:
+                engagements.pop(eid, None)
+                task = _engagement_tasks.pop(eid, None)
+                if task and not task.done():
+                    task.cancel()
+
+    task = asyncio.create_task(_run_engagement(engagement_id))
+    _engagement_tasks[engagement_id] = task
+    record_audit_event(
+        "playbook.start",
+        target=target,
+        status="queued",
+        detail=f"playbook={playbook_id};phases={','.join(phases)}",
+    )
+    log_event(
+        f"Playbook started {engagement_id}",
+        engagement_id=engagement_id,
+        playbook=playbook_id,
+        target=target,
+    )
+    return jsonify(public_engagement_view(record)), 202
+
+
+@app.route("/playbook/<engagement_id>", methods=["GET"])
+async def playbook_status(engagement_id: str):
+    """Return status of a playbook engagement."""
+    auth_error = require_api_auth("read")
+    if auth_error:
+        return auth_error
+    async with _engagements_lock:
+        eng = engagements.get(engagement_id)
+    if not eng:
+        return jsonify({"error": "Engagement not found"}), 404
+    owner = current_owner_id()
+    if eng.get("owner_id") not in (None, owner) and owner != "local":
+        # Hide other operators' engagements.
+        if eng.get("owner_id") != owner:
+            return jsonify({"error": "Engagement not found"}), 404
+    return jsonify(public_engagement_view(eng)), 200
+
+
+@app.route("/playbook/<engagement_id>", methods=["DELETE"])
+async def playbook_cancel(engagement_id: str):
+    """Cancel a running playbook (does not kill in-flight Nmap process tree)."""
+    auth_error = require_api_auth("scan")
+    if auth_error:
+        return auth_error
+    async with _engagements_lock:
+        eng = engagements.get(engagement_id)
+        if not eng:
+            return jsonify({"error": "Engagement not found"}), 404
+        owner = current_owner_id()
+        if eng.get("owner_id") not in (None, owner) and owner != "local":
+            if eng.get("owner_id") != owner:
+                return jsonify({"error": "Engagement not found"}), 404
+        eng["status"] = "cancelled"
+        task = _engagement_tasks.get(engagement_id)
+    if task and not task.done():
+        task.cancel()
+    record_audit_event("playbook.cancel", status="cancelled", detail=engagement_id)
+    return jsonify(public_engagement_view(eng)), 200
 
 
 @app.route("/posture/evaluate", methods=["POST"])

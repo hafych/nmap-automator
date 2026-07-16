@@ -81,6 +81,22 @@ curl -sS -X POST http://127.0.0.1:5000/scan \
 
 Ordered phases: `discovery` → `map` → `safe` (plus `depth` / `vuln` / `hybrid`).
 
+### Playbook chain (sequential jobs)
+
+```bash
+# Start standard chain (discovery → map → safe)
+curl -sS -X POST http://127.0.0.1:5000/playbook/run \
+  -H "X-API-KEY: $API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"target":"127.0.0.1","playbook":"standard"}'
+# -> 202 { engagement_id, steps:[{phase,job_id,status}...] }
+
+curl -sS -H "X-API-KEY: $API_TOKEN" \
+  http://127.0.0.1:5000/playbook/<engagement_id>
+```
+
+Playbooks: `standard`, `quick` (discovery→map), `deep` (…→depth).  
+Custom: `{"target":"...","phases":["discovery","map"]}`.
+
 ## Agent rules (short)
 
 1. Call **one** `/ai/pack` per turn when possible.  

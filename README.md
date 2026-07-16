@@ -210,6 +210,8 @@ curl http://127.0.0.1:5000/openapi.json
 | `GET`/`POST` | `/ai/pack` | Budgeted AI recon pack (default `budget=s` NDJSON; retest via `mode=retest`) |
 | `GET` | `/presets` | Named recon engagement presets / phases |
 | `POST` | `/posture/evaluate` | Compare scan vs expected service posture (drift) |
+| `POST` | `/playbook/run` | Start ordered engagement chain (sequential scan jobs) |
+| `GET`/`DELETE` | `/playbook/<id>` | Playbook status / cancel |
 | `GET` | `/audit` | Recent audit events (admin; no secrets) |
 | `GET` | `/results` | List encrypted result files |
 | `GET` | `/results/<id>` | Decrypt and return a stored result |
