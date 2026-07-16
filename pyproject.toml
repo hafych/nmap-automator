@@ -14,6 +14,7 @@ ignore = ["B904"]
 branch = true
 source = [
   "autonmap",
+  "recon_operator",
   "decrypt",
   "kali_ai_scan",
   "recon_planner",
