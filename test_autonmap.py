@@ -572,6 +572,90 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("refresh({ announce: false })", body)
 
 
+class TargetAllowlistTests(unittest.TestCase):
+    def test_empty_allowlist_permits_any_valid_target(self):
+        self.assertTrue(autonmap.target_in_allowlist("8.8.8.8", allowlist=[]))
+        self.assertIsNone(autonmap.target_allowlist_error("evil.example", allowlist=[]))
+
+    def test_ip_and_cidr_rules(self):
+        rules = ["127.0.0.1", "10.0.0.0/8", "192.0.2.0/24"]
+        self.assertTrue(autonmap.target_in_allowlist("127.0.0.1", allowlist=rules))
+        self.assertTrue(autonmap.target_in_allowlist("10.1.2.3", allowlist=rules))
+        self.assertTrue(autonmap.target_in_allowlist("10.0.0.0/16", allowlist=rules))
+        self.assertTrue(autonmap.target_in_allowlist("192.0.2.10", allowlist=rules))
+        self.assertFalse(autonmap.target_in_allowlist("8.8.8.8", allowlist=rules))
+        self.assertFalse(autonmap.target_in_allowlist("172.16.0.0/12", allowlist=rules))
+        error = autonmap.target_allowlist_error("8.8.8.8", allowlist=rules)
+        self.assertIn("allowlist", error.lower())
+
+    def test_hostname_and_wildcard_rules(self):
+        rules = ["localhost", "lab.example.com", "*.corp.example"]
+        self.assertTrue(autonmap.target_in_allowlist("localhost", allowlist=rules))
+        self.assertTrue(autonmap.target_in_allowlist("LAB.EXAMPLE.COM", allowlist=rules))
+        self.assertTrue(autonmap.target_in_allowlist("app.corp.example", allowlist=rules))
+        self.assertFalse(autonmap.target_in_allowlist("corp.example", allowlist=rules))
+        self.assertFalse(autonmap.target_in_allowlist("evil.com", allowlist=rules))
+        # IP-shaped rules must not match hostnames by string equality alone.
+        self.assertFalse(autonmap.target_in_allowlist("lab.example.com", allowlist=["10.0.0.0/8"]))
+
+    def test_payload_validation_enforces_allowlist(self):
+        original = list(autonmap.TARGET_ALLOWLIST)
+        autonmap.TARGET_ALLOWLIST[:] = ["127.0.0.1"]
+        try:
+            *_, ok_error = autonmap._validate_scan_payload(
+                {"target": "127.0.0.1", "scan_type": "Ping"}
+            )
+            *_, denied = autonmap._validate_scan_payload(
+                {"target": "192.0.2.1", "scan_type": "Ping"}
+            )
+        finally:
+            autonmap.TARGET_ALLOWLIST[:] = original
+
+        self.assertIsNone(ok_error)
+        self.assertIn("allowlist", denied.lower())
+
+    def test_load_target_allowlist_from_env_and_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scope.txt"
+            path.write_text("# engagement\n10.0.0.0/8\nlab.local\n\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "TARGET_ALLOWLIST": "127.0.0.1, 127.0.0.1",
+                    "TARGET_ALLOWLIST_FILE": str(path),
+                },
+                clear=False,
+            ):
+                loaded = autonmap._load_target_allowlist()
+        self.assertEqual(loaded, ["127.0.0.1", "10.0.0.0/8", "lab.local"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"TARGET_ALLOWLIST": '["192.0.2.1"]', "TARGET_ALLOWLIST_FILE": ""},
+            clear=False,
+        ):
+            self.assertEqual(autonmap._load_target_allowlist(), ["192.0.2.1"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"TARGET_ALLOWLIST": "[not-json", "TARGET_ALLOWLIST_FILE": ""},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                autonmap._load_target_allowlist()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TARGET_ALLOWLIST": "",
+                "TARGET_ALLOWLIST_FILE": "/tmp/recon-operator-missing-allowlist.txt",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                autonmap._load_target_allowlist()
+
+
 class PayloadHardeningRegressionTests(unittest.TestCase):
     def test_non_finite_intervals_are_rejected(self):
         for interval in (math.nan, math.inf, -math.inf):

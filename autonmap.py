@@ -63,7 +63,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -223,6 +223,60 @@ MAX_IMPORT_XML_BYTES = _parse_int_env(
 STATE_DB_PATH = (
     os.getenv("STATE_DB_PATH", "data/recon_operator.db").strip() or "data/recon_operator.db"
 )
+
+
+def _load_target_allowlist() -> List[str]:
+    """Load engagement-scope allowlist from env and optional file.
+
+    Empty list means unrestricted (backward compatible). Entries may be IPs,
+    CIDRs, exact hostnames, or ``*.example.com`` wildcard suffixes.
+    """
+    entries: List[str] = []
+    raw = os.getenv("TARGET_ALLOWLIST", "").strip()
+    if raw:
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "TARGET_ALLOWLIST must be a JSON array or comma-separated list"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise RuntimeError("TARGET_ALLOWLIST JSON value must be an array of strings")
+            entries.extend(str(item).strip() for item in parsed if str(item).strip())
+        else:
+            entries.extend(part.strip() for part in raw.split(",") if part.strip())
+
+    file_path = os.getenv("TARGET_ALLOWLIST_FILE", "").strip()
+    if file_path:
+        path = Path(file_path)
+        if not path.is_file():
+            raise RuntimeError(f"TARGET_ALLOWLIST_FILE not found: {file_path}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"Unable to read TARGET_ALLOWLIST_FILE: {exc}") from exc
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.append(line)
+
+    unique: List[str] = []
+    seen = set()
+    for entry in entries:
+        key = entry.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+        if len(unique) > 10_000:
+            raise RuntimeError("TARGET_ALLOWLIST exceeds 10000 entries")
+    return unique
+
+
+TARGET_ALLOWLIST = _load_target_allowlist()
+
 if MIN_SCHEDULE_INTERVAL_MINUTES > MAX_SCHEDULE_INTERVAL_MINUTES:
     raise RuntimeError(
         "MIN_SCHEDULE_INTERVAL_MINUTES must not exceed MAX_SCHEDULE_INTERVAL_MINUTES"
@@ -415,6 +469,18 @@ def _validate_scan_payload(
             scripts,
             discovery,
             "Invalid IP, CIDR, or hostname",
+        )
+
+    allowlist_error = target_allowlist_error(target)
+    if allowlist_error:
+        return (
+            target,
+            scan_type,
+            interval_value,
+            ports,
+            scripts,
+            discovery,
+            allowlist_error,
         )
 
     return (
@@ -621,6 +687,83 @@ def validate_ip_or_host(target: str) -> bool:
             re.IGNORECASE,
         )
         return auth_domain_re.fullmatch(target) is not None
+
+
+def _allowlist_entry_matches_ip(entry: str, addr: Any) -> bool:
+    try:
+        return addr == ipaddress.ip_address(entry)
+    except ValueError:
+        pass
+    try:
+        return addr in ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return False
+
+
+def _allowlist_entry_covers_network(entry: str, network: Any) -> bool:
+    try:
+        allowed = ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return False
+    if allowed.version != network.version:
+        return False
+    return bool(network.subnet_of(allowed))
+
+
+def _allowlist_entry_matches_host(entry: str, host: str) -> bool:
+    entry_lower = entry.strip().lower()
+    host_lower = host.strip().lower()
+    if not entry_lower or not host_lower:
+        return False
+    # Reject IP/CIDR-shaped entries for hostname targets.
+    try:
+        ipaddress.ip_network(entry_lower, strict=False)
+        return False
+    except ValueError:
+        pass
+    if entry_lower.startswith("*."):
+        suffix = entry_lower[1:]  # ".example.com"
+        return host_lower.endswith(suffix) and host_lower != suffix.lstrip(".")
+    return entry_lower == host_lower
+
+
+def target_in_allowlist(target: str, allowlist: Optional[List[str]] = None) -> bool:
+    """Return True when target is permitted by the engagement allowlist."""
+    return target_allowlist_error(target, allowlist) is None
+
+
+def target_allowlist_error(target: str, allowlist: Optional[List[str]] = None) -> Optional[str]:
+    """Return an error string if target is outside the configured allowlist.
+
+    Empty allowlist means unrestricted (default single-operator behavior).
+    """
+    rules = TARGET_ALLOWLIST if allowlist is None else allowlist
+    if not rules:
+        return None
+    if not isinstance(target, str) or not target.strip():
+        return "Target is outside the configured allowlist"
+
+    candidate = target.strip()
+    try:
+        addr = ipaddress.ip_address(candidate)
+        if any(_allowlist_entry_matches_ip(entry, addr) for entry in rules):
+            return None
+        return "Target is outside the configured allowlist"
+    except ValueError:
+        pass
+
+    try:
+        network = ipaddress.ip_network(candidate, strict=False)
+        # Single-host network is already covered by the address path above for bare IPs.
+        if any(_allowlist_entry_covers_network(entry, network) for entry in rules):
+            return None
+        return "Target is outside the configured allowlist"
+    except ValueError:
+        pass
+
+    if any(_allowlist_entry_matches_host(entry, candidate) for entry in rules):
+        return None
+    return "Target is outside the configured allowlist"
 
 
 def _canonicalize_valid_target(target: str) -> str:
@@ -1616,6 +1759,8 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
         "max_scan_jobs": MAX_SCAN_JOBS,
         "max_target_addresses": MAX_TARGET_ADDRESSES,
+        "target_allowlist_enabled": bool(TARGET_ALLOWLIST),
+        "target_allowlist_count": len(TARGET_ALLOWLIST),
         "results_max_files": RESULTS_MAX_FILES,
         "results_max_age_days": RESULTS_MAX_AGE_DAYS,
         "legacy_results_shared": LEGACY_RESULTS_SHARED,
