@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.8.3  
+**Текущая версия кода:** 1.8.4  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -161,9 +161,9 @@
 | --- | --- | --- | ---: |
 | P1-10 | ~~Coverage `autonmap.py` ≥ 75%~~ | jobs, ownership, tools, planner, Telegram (~82%) | M |
 | P1-11 | ~~Overall coverage ≥ 75%, fail_under поднять~~ | `fail_under = 75` in pyproject (~78%) | S |
-| P1-12 | Browser E2E в CI (Playwright) | scan mock, history, a11y smoke | L |
+| P1-12 | ~~Browser E2E в CI (Playwright)~~ | `e2e/` dashboard smoke + CI job | L |
 | P1-13 | axe-core / accessibility regression | keyboard, ARIA, contrast | M |
-| P1-14 | OpenAPI contract tests | schemathesis или generated checks | M |
+| P1-14 | ~~OpenAPI contract tests~~ | route parity + schema shape (`test_openapi_contract.py`) | M |
 
 **Критерий done P1:** 2+ API tokens с изоляцией; rate-limit корректный при 2 workers; coverage gate 75%; E2E smoke в CI.
 
@@ -409,6 +409,7 @@
 | 2026-07-16 | 1.8.1 | P1-01 optional Redis shared rate limits + owner-aware buckets |
 | 2026-07-16 | 1.8.2 | P1-02 multi-worker job leases (SQLite claim, Redis fence, poller) |
 | 2026-07-16 | 1.8.3 | P1-03 scheduler leader election; fix claim-path unit tests |
+| 2026-07-16 | 1.8.4 | P1-12 Playwright e2e smoke CI; P1-14 OpenAPI contract tests |
 
 ---
 
