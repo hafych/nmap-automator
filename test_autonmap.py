@@ -697,6 +697,82 @@ class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
             autonmap.scan_tasks.clear()
 
+    def test_try_become_scheduler_leader_paths(self):
+        original_acquire = autonmap.state_store.try_acquire_leadership
+        original_redis = autonmap._try_redis_leadership
+        original_release = autonmap._release_redis_leadership
+        releases = []
+        try:
+            autonmap._try_redis_leadership = lambda *_a, **_k: True
+            autonmap.state_store.try_acquire_leadership = lambda *_a, **_k: True
+            self.assertTrue(autonmap.try_become_scheduler_leader())
+
+            autonmap.state_store.try_acquire_leadership = lambda *_a, **_k: False
+            autonmap._release_redis_leadership = lambda name: releases.append(name)
+            self.assertFalse(autonmap.try_become_scheduler_leader())
+            self.assertEqual(releases, [autonmap.SCHEDULER_LOCK_NAME])
+
+            autonmap._try_redis_leadership = lambda *_a, **_k: False
+            self.assertFalse(autonmap.try_become_scheduler_leader())
+        finally:
+            autonmap.state_store.try_acquire_leadership = original_acquire
+            autonmap._try_redis_leadership = original_redis
+            autonmap._release_redis_leadership = original_release
+
+    async def test_scheduler_leader_loop_gain_and_loss(self):
+        async def noop_periodic(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        original_periodic = autonmap.periodic_scan
+        original_list = autonmap.state_store.list_scheduled_tasks
+        original_try = autonmap.try_become_scheduler_leader
+        original_leader = autonmap._is_scheduler_leader
+        calls = {"n": 0}
+
+        def fake_try():
+            calls["n"] += 1
+            # First call gains leadership, then loses it.
+            return calls["n"] == 1
+
+        stop = asyncio.Event()
+        autonmap.periodic_scan = noop_periodic
+        autonmap.state_store.list_scheduled_tasks = lambda owner_id=None: [
+            {
+                "task_id": "oloop-127.0.0.1-Ping",
+                "target": "127.0.0.1",
+                "scan_type": "Ping",
+                "interval_minutes": 20,
+                "ports": None,
+                "scripts": None,
+                "discovery": None,
+                "owner_id": "local",
+            }
+        ]
+        autonmap.try_become_scheduler_leader = fake_try
+        autonmap._is_scheduler_leader = False
+        original_poll = autonmap.SCHEDULER_LEADER_POLL_SECONDS
+        autonmap.SCHEDULER_LEADER_POLL_SECONDS = 1
+        try:
+            task = asyncio.create_task(autonmap.scheduler_leader_loop(stop))
+            await asyncio.sleep(0.05)
+            self.assertTrue(autonmap._is_scheduler_leader)
+            self.assertIn("oloop-127.0.0.1-Ping", autonmap.scan_tasks)
+            # Second iteration loses leadership.
+            await asyncio.sleep(1.2)
+            self.assertFalse(autonmap._is_scheduler_leader)
+            stop.set()
+            await asyncio.wait_for(task, timeout=2)
+        finally:
+            stop.set()
+            autonmap.periodic_scan = original_periodic
+            autonmap.state_store.list_scheduled_tasks = original_list
+            autonmap.try_become_scheduler_leader = original_try
+            autonmap._is_scheduler_leader = original_leader
+            autonmap.SCHEDULER_LEADER_POLL_SECONDS = original_poll
+            for task in list(autonmap.scan_tasks.values()):
+                task.cancel()
+            autonmap.scan_tasks.clear()
+
     async def test_run_scan_job_skips_when_claim_fails(self):
         autonmap.scan_jobs["j-skip"] = {
             "job_id": "j-skip",
