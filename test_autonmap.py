@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import json
 import math
 import os
 import stat
@@ -695,7 +696,16 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
         legacy = "legacy_Ping_20260101_000000_3.json"
         self.assertTrue(autonmap.result_visible_to_owner(file_a, owner_a))
         self.assertFalse(autonmap.result_visible_to_owner(file_b, owner_a))
-        self.assertTrue(autonmap.result_visible_to_owner(legacy, owner_a))
+        # Default LEGACY_RESULTS_SHARED=true keeps pre-ownership files visible.
+        original_legacy = autonmap.LEGACY_RESULTS_SHARED
+        try:
+            autonmap.LEGACY_RESULTS_SHARED = True
+            self.assertTrue(autonmap.result_visible_to_owner(legacy, owner_a))
+            autonmap.LEGACY_RESULTS_SHARED = False
+            self.assertFalse(autonmap.result_visible_to_owner(legacy, owner_a))
+            self.assertTrue(autonmap.result_visible_to_owner(file_a, owner_a))
+        finally:
+            autonmap.LEGACY_RESULTS_SHARED = original_legacy
 
     async def test_rate_limit_blocks_excess_requests(self):
         original_max = autonmap.MAX_REQUESTS_PER_WINDOW
@@ -826,6 +836,816 @@ class ReadinessRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/scan", payload["paths"])
         self.assertIn("/live", payload["paths"])
         self.assertIn("ApiKeyAuth", payload["components"]["securitySchemes"])
+
+
+class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
+    """Coverage sprint for Release D: jobs, tools, planner, ownership edges."""
+
+    async def asyncSetUp(self):
+        autonmap.scan_tasks.clear()
+        autonmap.scan_jobs.clear()
+        autonmap.rate_limits.clear()
+        self.client = autonmap.app.test_client()
+        self.headers = {"X-API-KEY": "test-token"}
+
+    async def asyncTearDown(self):
+        for task in list(autonmap.scan_tasks.values()):
+            task.cancel()
+        autonmap.scan_tasks.clear()
+        autonmap.scan_jobs.clear()
+        autonmap.rate_limits.clear()
+
+    def test_parse_helpers_and_token_loader(self):
+        self.assertTrue(autonmap._parse_bool_env("MISSING_BOOL_FOR_TEST", True))
+        with mock.patch.dict(os.environ, {"BOOL_TEST_FLAG": "yes"}, clear=False):
+            self.assertTrue(autonmap._parse_bool_env("BOOL_TEST_FLAG", False))
+        with mock.patch.dict(os.environ, {"BOOL_TEST_FLAG": "0"}, clear=False):
+            self.assertFalse(autonmap._parse_bool_env("BOOL_TEST_FLAG", True))
+
+        with mock.patch.dict(os.environ, {"INT_TEST_FLAG": "12"}, clear=False):
+            self.assertEqual(
+                autonmap._parse_int_env("INT_TEST_FLAG", 1, min_value=1, max_value=20), 12
+            )
+        with mock.patch.dict(os.environ, {"INT_TEST_FLAG": "nope"}, clear=False):
+            with self.assertRaises(RuntimeError):
+                autonmap._parse_int_env("INT_TEST_FLAG", 1)
+        with mock.patch.dict(os.environ, {"INT_TEST_FLAG": "0"}, clear=False):
+            with self.assertRaises(RuntimeError):
+                autonmap._parse_int_env("INT_TEST_FLAG", 1, min_value=1)
+        with mock.patch.dict(os.environ, {"INT_TEST_FLAG": "99"}, clear=False):
+            with self.assertRaises(RuntimeError):
+                autonmap._parse_int_env("INT_TEST_FLAG", 1, max_value=10)
+
+        with mock.patch.dict(
+            os.environ,
+            {"API_AUTH_TOKENS": '["tok-a","tok-b"]', "API_AUTH_TOKEN": "tok-c"},
+            clear=False,
+        ):
+            tokens = autonmap._load_api_auth_tokens()
+        self.assertEqual(tokens, ["tok-a", "tok-b", "tok-c"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"API_AUTH_TOKENS": "alpha, beta, alpha", "API_AUTH_TOKEN": ""},
+            clear=False,
+        ):
+            self.assertEqual(autonmap._load_api_auth_tokens(), ["alpha", "beta"])
+
+        with mock.patch.dict(
+            os.environ, {"API_AUTH_TOKENS": "{bad", "API_AUTH_TOKEN": ""}, clear=False
+        ):
+            # Non-JSON multi form is treated as a single comma-separated token.
+            self.assertEqual(autonmap._load_api_auth_tokens(), ["{bad"])
+
+        with mock.patch.dict(
+            os.environ, {"API_AUTH_TOKENS": "[not-json", "API_AUTH_TOKEN": ""}, clear=False
+        ):
+            with self.assertRaises(RuntimeError):
+                autonmap._load_api_auth_tokens()
+
+        self.assertEqual(autonmap._parse_optional_limit(None, 50, 500), 50)
+        self.assertEqual(autonmap._parse_optional_limit("abc", 50, 500), 50)
+        self.assertEqual(autonmap._parse_optional_limit("0", 50, 500), 50)
+        self.assertEqual(autonmap._parse_optional_limit("999", 50, 100), 100)
+        self.assertEqual(autonmap._parse_optional_limit("7", 50, 500), 7)
+
+        self.assertIsNone(autonmap._normalize_scan_type(""))
+        self.assertIsNone(autonmap._normalize_scan_type("Nope"))
+        self.assertEqual(autonmap._normalize_scan_type("ping"), "Ping")
+        self.assertIn("'Ping'", autonmap.get_scan_type_choices())
+
+        args = autonmap.build_scan_args("Ping")
+        self.assertIn("Ping", args)
+        with self.assertRaises(ValueError):
+            autonmap.build_scan_args("NotAType")
+
+        self.assertFalse(autonmap.validate_ip_or_host(""))
+        self.assertFalse(autonmap.validate_ip_or_host("host;rm"))
+        self.assertFalse(autonmap.validate_ip_or_host("a" * 300))
+        self.assertEqual(autonmap._canonicalize_valid_target("Example.COM"), "example.com")
+
+    def test_payload_validation_edge_cases(self):
+        *_, error = autonmap._validate_scan_payload(None)
+        self.assertIn("body", error.lower())
+        *_, error = autonmap._validate_scan_payload({})
+        self.assertEqual(error, "target is required")
+        *_, error = autonmap._validate_scan_payload({"target": "127.0.0.1", "scan_type": 1})
+        self.assertIn("scan_type", error)
+        *_, error = autonmap._validate_scan_payload({"target": "127.0.0.1", "scan_type": "Nope"})
+        self.assertIn("Invalid scan_type", error)
+        *_, error = autonmap._validate_scan_payload(
+            {"target": "127.0.0.1", "scan_type": "Ping", "scripts": "bad;script"}
+        )
+        self.assertIsNotNone(error)
+        *_, error = autonmap._validate_scan_payload(
+            {"target": "127.0.0.1", "scan_type": "Ping", "discovery": "masscan"}
+        )
+        self.assertIsNotNone(error)
+        *_, error = autonmap._validate_scan_payload(
+            {"target": "127.0.0.1", "scan_type": "Ping", "interval": True}
+        )
+        self.assertEqual(error, "interval must be a number")
+
+    def test_job_and_owner_helpers(self):
+        self.assertTrue(autonmap.job_visible_to_owner({"owner_id": None}, "abc"))
+        self.assertTrue(autonmap.job_visible_to_owner({"owner_id": "owner-a"}, "owner-a"))
+        self.assertFalse(autonmap.job_visible_to_owner({"owner_id": "owner-a"}, "owner-b"))
+        task_id = autonmap.make_task_id("127.0.0.1", "Ping", "deadbeefcafe01")
+        self.assertTrue(task_id.startswith("odeadbeefcafe-"))
+        self.assertEqual(autonmap.owner_result_prefix("deadbeefcafe01"), "odeadbeefcafe_")
+        self.assertEqual(autonmap.current_owner_id(), "local")
+
+    def test_rate_limit_evicts_oldest_when_bucket_table_full(self):
+        original_limit = autonmap.MAX_RATE_LIMIT_CLIENTS
+        original_key = autonmap._client_key
+        now = time.time()
+        autonmap.MAX_RATE_LIMIT_CLIENTS = 1
+        autonmap.rate_limits.clear()
+        autonmap.rate_limits["busy"] = [now]
+        autonmap._client_key = lambda: "other"
+        try:
+            allowed = autonmap.check_rate_limit()
+        finally:
+            autonmap.MAX_RATE_LIMIT_CLIENTS = original_limit
+            autonmap._client_key = original_key
+            remaining = dict(autonmap.rate_limits)
+            autonmap.rate_limits.clear()
+        self.assertTrue(allowed)
+        self.assertIn("other", remaining)
+        self.assertNotIn("busy", remaining)
+
+    async def test_cleanup_finished_task_with_exception(self):
+        async def boom():
+            raise RuntimeError("task boom")
+
+        task = asyncio.create_task(boom())
+        try:
+            await task
+        except RuntimeError:
+            pass
+        autonmap.scan_tasks["boom-task"] = task
+        removed = autonmap._cleanup_finished_tasks()
+        self.assertEqual(removed, ["boom-task"])
+        self.assertEqual(autonmap.scan_tasks, {})
+
+    async def test_save_empty_results_returns_none(self):
+        self.assertIsNone(await autonmap.save_scan_results_async({}, "127.0.0.1", "Ping"))
+
+    async def test_run_scan_job_failure_and_timeout_paths(self):
+        original_scan = autonmap.scan_network
+        original_sender = autonmap.send_telegram_message
+
+        async def ignore_message(_message):
+            return None
+
+        autonmap.send_telegram_message = ignore_message
+        try:
+            autonmap.scan_jobs["fail-job"] = {
+                "job_id": "fail-job",
+                "target": "127.0.0.1",
+                "scan_type": "Ping",
+                "status": "queued",
+                "created_at": "t0",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "result": None,
+                "result_file": None,
+                "kind": "immediate",
+                "owner_id": "local",
+                "task": None,
+            }
+
+            def boom(*_a, **_k):
+                raise RuntimeError("engine failed")
+
+            autonmap.scan_network = boom
+            await autonmap._run_scan_job("fail-job")
+            self.assertEqual(autonmap.scan_jobs["fail-job"]["status"], "failed")
+            self.assertIn("engine failed", autonmap.scan_jobs["fail-job"]["error"])
+
+            autonmap.scan_jobs["timeout-job"] = {
+                "job_id": "timeout-job",
+                "target": "127.0.0.1",
+                "scan_type": "Ping",
+                "status": "queued",
+                "created_at": "t0",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "result": None,
+                "result_file": None,
+                "kind": "immediate",
+                "owner_id": "local",
+                "task": None,
+            }
+
+            def timeout(*_a, **_k):
+                raise TimeoutError("took too long")
+
+            autonmap.scan_network = timeout
+            await autonmap._run_scan_job("timeout-job")
+            self.assertEqual(autonmap.scan_jobs["timeout-job"]["status"], "timeout")
+        finally:
+            autonmap.scan_network = original_scan
+            autonmap.send_telegram_message = original_sender
+            autonmap.scan_jobs.clear()
+
+    async def test_async_scan_returns_result_and_raises_on_failure(self):
+        original_scan = autonmap.scan_network
+        original_sender = autonmap.send_telegram_message
+        original_results_dir = autonmap.RESULTS_DIR
+
+        async def ignore_message(_message):
+            return None
+
+        def fake_scan(target, scan_type, ports=None, scripts=None, discovery=None, **_k):
+            return {"hosts": [], "scan_count": 0, "target": target, "scan_type": scan_type}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            autonmap.scan_network = fake_scan
+            autonmap.send_telegram_message = ignore_message
+            try:
+                result = await autonmap.async_scan("127.0.0.1", "Ping", owner_id="local")
+                self.assertEqual(result["scan_count"], 0)
+
+                def boom(*_a, **_k):
+                    raise RuntimeError("async fail")
+
+                autonmap.scan_network = boom
+                with self.assertRaises(RuntimeError):
+                    await autonmap.async_scan("127.0.0.1", "Ping", owner_id="local")
+            finally:
+                autonmap.scan_network = original_scan
+                autonmap.send_telegram_message = original_sender
+                autonmap.RESULTS_DIR = original_results_dir
+
+    async def test_prune_jobs_and_persist_errors(self):
+        original_max = autonmap.MAX_SCAN_JOBS
+        original_persist = autonmap.state_store.upsert_job
+        original_delete = autonmap.state_store.delete_job
+        autonmap.MAX_SCAN_JOBS = 2
+        autonmap.scan_jobs.clear()
+        for index in range(4):
+            job_id = f"old-{index}"
+            autonmap.scan_jobs[job_id] = {
+                "job_id": job_id,
+                "target": "127.0.0.1",
+                "scan_type": "Ping",
+                "status": "completed",
+                "created_at": f"t{index}",
+                "finished_at": f"t{index}",
+                "task": None,
+            }
+
+        def boom_delete(_job_id):
+            raise RuntimeError("delete failed")
+
+        autonmap.state_store.delete_job = boom_delete
+        try:
+            async with autonmap._jobs_lock:
+                await autonmap._prune_jobs_locked()
+            self.assertLessEqual(len(autonmap.scan_jobs), 2)
+
+            def boom_upsert(_job):
+                raise RuntimeError("upsert failed")
+
+            autonmap.state_store.upsert_job = boom_upsert
+            autonmap._persist_job({"job_id": "x", "status": "completed"})
+        finally:
+            autonmap.MAX_SCAN_JOBS = original_max
+            autonmap.state_store.upsert_job = original_persist
+            autonmap.state_store.delete_job = original_delete
+            autonmap.scan_jobs.clear()
+
+    async def test_job_ownership_and_cancel_terminal(self):
+        owner = autonmap.owner_id_from_token("test-token")
+        other = autonmap.owner_id_from_token("other-token")
+        autonmap.scan_jobs["owned"] = {
+            "job_id": "owned",
+            "target": "127.0.0.1",
+            "scan_type": "Ping",
+            "status": "completed",
+            "created_at": "t0",
+            "finished_at": "t1",
+            "error": None,
+            "result": {"hosts": []},
+            "result_file": None,
+            "kind": "immediate",
+            "owner_id": owner,
+            "task": None,
+        }
+        autonmap.scan_jobs["foreign"] = {
+            "job_id": "foreign",
+            "target": "127.0.0.1",
+            "scan_type": "Ping",
+            "status": "queued",
+            "created_at": "t0",
+            "finished_at": None,
+            "error": None,
+            "result": None,
+            "result_file": None,
+            "kind": "immediate",
+            "owner_id": other,
+            "task": None,
+        }
+
+        listed = await self.client.get("/jobs", headers=self.headers)
+        listed_payload = await listed.get_json()
+        ids = {job["job_id"] for job in listed_payload}
+        self.assertIn("owned", ids)
+        self.assertNotIn("foreign", ids)
+
+        foreign = await self.client.get("/jobs/foreign", headers=self.headers)
+        self.assertEqual(foreign.status_code, 404)
+
+        missing = await self.client.get("/jobs/missing-id", headers=self.headers)
+        self.assertEqual(missing.status_code, 404)
+
+        cancel_done = await self.client.delete("/jobs/owned", headers=self.headers)
+        cancel_payload = await cancel_done.get_json()
+        self.assertEqual(cancel_done.status_code, 200)
+        self.assertIn("already", cancel_payload["message"].lower())
+
+        unauth = await self.client.get("/jobs")
+        self.assertEqual(unauth.status_code, 401)
+
+    async def test_schedule_duplicate_and_validation_errors(self):
+        async def noop_periodic(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        original = autonmap.periodic_scan
+        autonmap.periodic_scan = noop_periodic
+        try:
+            first = await self.client.post(
+                "/schedule",
+                headers=self.headers,
+                json={"target": "127.0.0.1", "scan_type": "Ping", "interval": 30},
+            )
+            self.assertEqual(first.status_code, 200)
+            second = await self.client.post(
+                "/schedule",
+                headers=self.headers,
+                json={"target": "127.0.0.1", "scan_type": "Ping", "interval": 30},
+            )
+            payload = await second.get_json()
+            self.assertEqual(second.status_code, 400)
+            self.assertIn("already", payload["error"].lower())
+
+            bad = await self.client.post(
+                "/schedule",
+                headers=self.headers,
+                json={"target": "not a host!!!", "scan_type": "Ping", "interval": 30},
+            )
+            self.assertEqual(bad.status_code, 400)
+
+            unauth = await self.client.post(
+                "/schedule", json={"target": "127.0.0.1", "scan_type": "Ping", "interval": 30}
+            )
+            self.assertEqual(unauth.status_code, 401)
+        finally:
+            autonmap.periodic_scan = original
+
+    async def test_tasks_hide_other_owner_and_cancel_missing(self):
+        class Pending:
+            @staticmethod
+            def done():
+                return False
+
+            @staticmethod
+            def cancelled():
+                return False
+
+            @staticmethod
+            def cancel():
+                return None
+
+        owner = autonmap.owner_id_from_token("test-token")[:12]
+        autonmap.scan_tasks[f"o{owner}-127.0.0.1-Ping"] = Pending()
+        # Pre-ownership task ids without the o{hash}- prefix stay visible.
+        autonmap.scan_tasks["127.0.0.1-legacy-Ping"] = Pending()
+        autonmap.scan_tasks["oforeignowner1-127.0.0.1-TCP"] = Pending()
+
+        listed = await self.client.get("/tasks", headers=self.headers)
+        payload = await listed.get_json()
+        ids = {item["id"] for item in payload}
+        self.assertIn(f"o{owner}-127.0.0.1-Ping", ids)
+        self.assertIn("127.0.0.1-legacy-Ping", ids)
+        self.assertNotIn("oforeignowner1-127.0.0.1-TCP", ids)
+
+        missing = await self.client.delete("/tasks/missing-task", headers=self.headers)
+        self.assertEqual(missing.status_code, 404)
+        foreign = await self.client.delete(
+            "/tasks/oforeignowner1-127.0.0.1-TCP", headers=self.headers
+        )
+        self.assertEqual(foreign.status_code, 404)
+
+    async def test_legacy_results_hidden_when_flag_off(self):
+        original_flag = autonmap.LEGACY_RESULTS_SHARED
+        original_dir = autonmap.RESULTS_DIR
+        sample = {"hosts": [], "scan_count": 0}
+        encrypted = autonmap.cipher.encrypt(b'{"hosts":[]}')
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            legacy = Path(tmp) / "legacy_Ping_20260101_000000_1.json"
+            legacy.write_bytes(encrypted)
+            owned_name = (
+                f"{autonmap.owner_result_prefix(autonmap.owner_id_from_token('test-token'))}"
+                f"host_Ping_20260101_000000_2.json"
+            )
+            (Path(tmp) / owned_name).write_bytes(encrypted)
+            try:
+                autonmap.LEGACY_RESULTS_SHARED = False
+                listed = await self.client.get("/results", headers=self.headers)
+                payload = await listed.get_json()
+                names = {item["id"] for item in payload["results"]}
+                self.assertNotIn(legacy.name, names)
+                self.assertIn(owned_name, names)
+
+                hidden = await self.client.get(f"/results/{legacy.name}", headers=self.headers)
+                self.assertEqual(hidden.status_code, 404)
+
+                autonmap.LEGACY_RESULTS_SHARED = True
+                listed_shared = await self.client.get("/results", headers=self.headers)
+                shared_payload = await listed_shared.get_json()
+                shared_names = {item["id"] for item in shared_payload["results"]}
+                self.assertIn(legacy.name, shared_names)
+            finally:
+                autonmap.LEGACY_RESULTS_SHARED = original_flag
+                autonmap.RESULTS_DIR = original_dir
+
+        # silence unused
+        self.assertEqual(sample["scan_count"], 0)
+
+    async def test_get_result_corrupt_and_bad_token_payload(self):
+        original_dir = autonmap.RESULTS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            name = (
+                f"{autonmap.owner_result_prefix(autonmap.owner_id_from_token('test-token'))}"
+                f"host_Ping_20260101_000000_9.json"
+            )
+            path = Path(tmp) / name
+            path.write_bytes(b"not-a-fernet-token")
+            try:
+                response = await self.client.get(f"/results/{name}", headers=self.headers)
+                payload = await response.get_json()
+                self.assertEqual(response.status_code, 500)
+                self.assertIn("decrypt", payload["error"].lower())
+            finally:
+                autonmap.RESULTS_DIR = original_dir
+
+    async def test_diff_by_result_id_and_import_raw_xml(self):
+        sample_xml = """<?xml version="1.0"?>
+<nmaprun scanner="nmap" args="nmap" start="1" version="7.95" xmloutputversion="1.05">
+  <host>
+    <status state="up"/>
+    <address addr="192.0.2.20" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="443"><state state="open"/><service name="https"/></port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+        original_dir = autonmap.RESULTS_DIR
+        original_sender = autonmap.send_telegram_message
+
+        async def ignore_message(_message):
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            autonmap.send_telegram_message = ignore_message
+            try:
+                import_response = await self.client.post(
+                    "/results/import?target=192.0.2.20",
+                    headers={**self.headers, "Content-Type": "application/xml"},
+                    data=sample_xml.encode("utf-8"),
+                )
+                import_payload = await import_response.get_json()
+                self.assertEqual(import_response.status_code, 201)
+                result_id = import_payload["id"]
+
+                bad_import = await self.client.post(
+                    "/results/import",
+                    headers=self.headers,
+                    json={"xml": 123},
+                )
+                self.assertEqual(bad_import.status_code, 400)
+
+                empty_import = await self.client.post(
+                    "/results/import",
+                    headers={**self.headers, "Content-Type": "application/xml"},
+                    data=b"",
+                )
+                self.assertEqual(empty_import.status_code, 400)
+
+                baseline = {
+                    "hosts": [
+                        {
+                            "host": "192.0.2.20",
+                            "hostname": "N/A",
+                            "state": "up",
+                            "protocols": {},
+                        }
+                    ]
+                }
+                diff_response = await self.client.post(
+                    "/results/diff",
+                    headers=self.headers,
+                    json={"baseline": baseline, "current": {"id": result_id}},
+                )
+                self.assertEqual(diff_response.status_code, 200)
+
+                bad_diff = await self.client.post(
+                    "/results/diff",
+                    headers=self.headers,
+                    json={"baseline": "missing.json", "current": baseline},
+                )
+                self.assertEqual(bad_diff.status_code, 400)
+
+                no_body = await self.client.post(
+                    "/results/diff",
+                    headers={**self.headers, "Content-Type": "text/plain"},
+                    data=b"not-json",
+                )
+                self.assertEqual(no_body.status_code, 400)
+            finally:
+                autonmap.RESULTS_DIR = original_dir
+                autonmap.send_telegram_message = original_sender
+
+    async def test_tools_ai_context_and_recon_plan_formats(self):
+        inventory = {
+            "schema": "pentest-tool-inventory/v1",
+            "summary": {
+                "packages_checked": 0,
+                "available": 0,
+                "missing": 0,
+                "missing_packages": [],
+            },
+            "packages": [],
+            "tools": [],
+            "profiles": [{"profile": "core", "install": "kali-linux-core"}],
+            "ai_handoff": {"prompt_hint": "use available tools only"},
+        }
+        original = autonmap.get_cached_tool_inventory
+        autonmap.get_cached_tool_inventory = lambda expand=False: inventory
+        try:
+            jsonl = await self.client.get("/tools/ai-context", headers=self.headers)
+            self.assertEqual(jsonl.status_code, 200)
+            self.assertIn("ndjson", jsonl.headers.get("Content-Type", ""))
+
+            md = await self.client.get("/tools/ai-context?format=markdown", headers=self.headers)
+            self.assertEqual(md.status_code, 200)
+            self.assertIn("markdown", md.headers.get("Content-Type", ""))
+
+            plan = await self.client.post(
+                "/recon/plan",
+                headers=self.headers,
+                json={
+                    "hosts": [
+                        {
+                            "host": "192.0.2.30",
+                            "hostname": "N/A",
+                            "state": "up",
+                            "protocols": {"tcp": [{"port": 80, "state": "open", "name": "http"}]},
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(plan.status_code, 200)
+
+            plan_md = await self.client.post(
+                "/recon/plan?format=md",
+                headers=self.headers,
+                json={
+                    "hosts": [
+                        {
+                            "host": "192.0.2.30",
+                            "hostname": "N/A",
+                            "state": "up",
+                            "protocols": {"tcp": [{"port": 22, "state": "open", "name": "ssh"}]},
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(plan_md.status_code, 200)
+            self.assertIn("markdown", plan_md.headers.get("Content-Type", ""))
+
+            plan_jsonl = await self.client.post(
+                "/recon/plan?format=jsonl",
+                headers=self.headers,
+                json={
+                    "hosts": [
+                        {
+                            "host": "192.0.2.30",
+                            "hostname": "N/A",
+                            "state": "up",
+                            "protocols": {"tcp": [{"port": 443, "state": "open", "name": "https"}]},
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(plan_jsonl.status_code, 200)
+
+            bad_plan = await self.client.post(
+                "/recon/plan", headers=self.headers, json={"no_hosts": True}
+            )
+            self.assertEqual(bad_plan.status_code, 400)
+            not_json = await self.client.post(
+                "/recon/plan",
+                headers={**self.headers, "Content-Type": "text/plain"},
+                data=b"x",
+            )
+            self.assertEqual(not_json.status_code, 400)
+        finally:
+            autonmap.get_cached_tool_inventory = original
+
+    async def test_api_docs_and_scan_validation_errors(self):
+        docs = await self.client.get("/api/docs")
+        payload = await docs.get_json()
+        self.assertEqual(docs.status_code, 200)
+        self.assertEqual(payload["version"], autonmap.VERSION)
+        self.assertIn("POST /scan", payload["endpoints"])
+
+        bad_scan = await self.client.post(
+            "/scan", headers=self.headers, json={"target": "bad host!!"}
+        )
+        self.assertEqual(bad_scan.status_code, 400)
+
+        unauth = await self.client.post("/scan", json={"target": "127.0.0.1"})
+        self.assertEqual(unauth.status_code, 401)
+
+        health = await self.client.get("/health")
+        # nmap may or may not be available; payload shape matters
+        health_payload = await health.get_json()
+        self.assertIn("legacy_results_shared", health_payload)
+        self.assertIn(health.status_code, {200, 503})
+
+    async def test_load_initial_tasks_and_persisted_schedules(self):
+        async def noop_periodic(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        original_periodic = autonmap.periodic_scan
+        original_env = os.environ.get("INITIAL_TASKS")
+        autonmap.periodic_scan = noop_periodic
+        try:
+            os.environ["INITIAL_TASKS"] = "[]"
+            await autonmap.load_initial_tasks()
+
+            os.environ["INITIAL_TASKS"] = "not-json"
+            await autonmap.load_initial_tasks()
+
+            os.environ["INITIAL_TASKS"] = '{"not":"list"}'
+            await autonmap.load_initial_tasks()
+
+            os.environ["INITIAL_TASKS"] = json.dumps(
+                [
+                    {"target": "127.0.0.1", "scan_type": "Ping", "interval": 45},
+                    "bad-entry",
+                    {"target": "%%%", "scan_type": "Ping"},
+                ]
+            )
+            await autonmap.load_initial_tasks()
+            self.assertTrue(any("Ping" in task_id for task_id in autonmap.scan_tasks))
+
+            def fake_list_tasks():
+                return [
+                    {
+                        "task_id": "orestoredlocal-127.0.0.1-TCP",
+                        "target": "127.0.0.1",
+                        "scan_type": "TCP",
+                        "interval_minutes": 60,
+                        "ports": None,
+                        "scripts": None,
+                        "discovery": None,
+                        "owner_id": "local",
+                    }
+                ]
+
+            original_list = autonmap.state_store.list_scheduled_tasks
+            original_jobs = autonmap.state_store.list_jobs
+            autonmap.state_store.list_scheduled_tasks = fake_list_tasks
+            autonmap.state_store.list_jobs = lambda limit=200: []
+            try:
+                await autonmap.load_persisted_state()
+                self.assertIn("orestoredlocal-127.0.0.1-TCP", autonmap.scan_tasks)
+            finally:
+                autonmap.state_store.list_scheduled_tasks = original_list
+                autonmap.state_store.list_jobs = original_jobs
+        finally:
+            autonmap.periodic_scan = original_periodic
+            if original_env is None:
+                os.environ.pop("INITIAL_TASKS", None)
+            else:
+                os.environ["INITIAL_TASKS"] = original_env
+            for task in list(autonmap.scan_tasks.values()):
+                task.cancel()
+            autonmap.scan_tasks.clear()
+
+    async def test_send_telegram_paths_and_nmap_check(self):
+        await autonmap.send_telegram_message("no bot configured")
+
+        class FakeBot:
+            def __init__(self):
+                self.calls = []
+
+            async def send_message(self, chat_id, text):
+                self.calls.append((chat_id, text))
+
+        original_bot = autonmap.bot
+        original_chat = autonmap.CHAT_ID
+        fake = FakeBot()
+        autonmap.bot = fake
+        autonmap.CHAT_ID = "chat-1"
+        try:
+            await autonmap.send_telegram_message("hello")
+            self.assertEqual(fake.calls, [("chat-1", "hello")])
+
+            class BoomBot:
+                async def send_message(self, chat_id, text):
+                    raise RuntimeError("network")
+
+            autonmap.bot = BoomBot()
+            await autonmap.send_telegram_message("fail path")
+        finally:
+            autonmap.bot = original_bot
+            autonmap.CHAT_ID = original_chat
+
+        with mock.patch("autonmap.shutil.which", return_value=None):
+            self.assertFalse(autonmap._check_nmap_available())
+
+        with (
+            mock.patch("autonmap.shutil.which", return_value="/usr/bin/nmap"),
+            mock.patch(
+                "autonmap.subprocess.run",
+                side_effect=FileNotFoundError(),
+            ),
+        ):
+            self.assertFalse(autonmap._check_nmap_available())
+
+    async def test_safe_result_path_rejects_bad_names(self):
+        self.assertIsNone(autonmap._safe_result_path("../etc/passwd"))
+        self.assertIsNone(autonmap._safe_result_path("no-extension"))
+        self.assertIsNone(autonmap._safe_result_path("bad name with spaces.json"))
+
+    async def test_scan_wait_internal_error(self):
+        original = autonmap.async_scan
+
+        async def boom(*_a, **_k):
+            raise RuntimeError("unexpected")
+
+        autonmap.async_scan = boom
+        try:
+            response = await self.client.post(
+                "/scan?wait=1",
+                headers=self.headers,
+                json={"target": "127.0.0.1", "scan_type": "Ping"},
+            )
+            payload = await response.get_json()
+        finally:
+            autonmap.async_scan = original
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("Internal", payload["error"])
+
+    async def test_periodic_scan_handles_errors_and_cancel(self):
+        original_async = autonmap.async_scan
+        original_sender = autonmap.send_telegram_message
+        calls = {"n": 0}
+
+        async def ignore_message(_message):
+            return None
+
+        async def flaky(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("first fail")
+            raise asyncio.CancelledError()
+
+        autonmap.async_scan = flaky
+        autonmap.send_telegram_message = ignore_message
+        try:
+            await autonmap.periodic_scan("127.0.0.1", "Ping", 0.0001, owner_id="local")
+        finally:
+            autonmap.async_scan = original_async
+            autonmap.send_telegram_message = original_sender
+        self.assertGreaterEqual(calls["n"], 1)
+
+        with self.assertRaises(ValueError):
+            await autonmap.periodic_scan("127.0.0.1", "Ping", 0)
+        with self.assertRaises(ValueError):
+            await autonmap.periodic_scan("127.0.0.1", "Ping", "nope")
+
+    async def test_retention_missing_dir_and_result_files_empty(self):
+        summary = autonmap.apply_results_retention("/tmp/recon-operator-missing-dir-xyz")
+        self.assertEqual(summary, {"deleted": 0, "remaining": 0})
+        original = autonmap.RESULTS_DIR
+        autonmap.RESULTS_DIR = "/tmp/recon-operator-missing-dir-xyz"
+        try:
+            self.assertEqual(autonmap._result_files(), [])
+        finally:
+            autonmap.RESULTS_DIR = original
 
 
 if __name__ == "__main__":

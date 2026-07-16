@@ -1,6 +1,8 @@
 # Recon Operator — полный аудит, исправления и backlog
 
-Обновлено: 2026-07-15. Этот файл — живой список: выполненные пункты отмечены `[x]` и зачёркнуты; незачёркнутые пункты остаются рекомендациями и могут быть возвращены в работу после повторной проверки.
+Обновлено: 2026-07-16. Этот файл — живой список: выполненные пункты отмечены `[x]` и зачёркнуты; незачёркнутые пункты остаются рекомендациями и могут быть возвращены в работу после повторной проверки.
+
+> **Полный roadmap улучшений:** см. [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) (приоритеты P0–P3, релизы D–G, DoD, риски).
 
 ## Итог
 
@@ -170,9 +172,10 @@ Missing tools не устанавливались автоматически: э
 
 - [x] ~~SQLite persistence for jobs/schedules (single-node).~~ Redis multi-worker still open.
 - [x] ~~Multi API tokens (`API_AUTH_TOKENS`) + per-token ownership of jobs/tasks/new results.~~
+- [x] ~~`LEGACY_RESULTS_SHARED` flag to hide pre-ownership result files (default true).~~
 - [ ] Full multi-tenant RBAC / UI accounts (token isolation only today).
 - [ ] Redis multi-worker rate limits / leases.
-- [ ] Поднять `autonmap.py` coverage до ≥75% (improved, still below target).
+- [x] ~~Поднять `autonmap.py` coverage до ≥75% (~82%; overall ~78%; fail_under 75).~~
 - [ ] Добавить CI browser E2E + axe-core для keyboard/ARIA/responsive regressions.
 
 ### P2 — security и maintainability
@@ -211,7 +214,7 @@ Missing tools не устанавливались автоматически: э
 - [ ] Optional locale switch.
 - [ ] Rename GitHub repository path from `nmap-automator` → `recon-operator` (when ready).
 - [ ] CI browser E2E + axe-core.
-- [ ] Raise `autonmap.py` coverage toward ≥75%.
+- [x] ~~Raise `autonmap.py` coverage toward ≥75%.~~
 
 ## 7. Журнал найденных проблем и решений
 

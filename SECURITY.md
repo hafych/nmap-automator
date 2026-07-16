@@ -17,6 +17,8 @@ contact channel without disclosing the vulnerability.
 ## Deployment baseline
 
 - Keep `API_AUTH_REQUIRED=true` and use a randomly generated token.
+- For multi-token deploys, set `LEGACY_RESULTS_SHARED=false` so pre-ownership result files
+  are not visible to every operator.
 - Bind to loopback unless a trusted reverse proxy or firewall restricts access.
 - Never publish `.env`, Fernet keys, API tokens, Telegram credentials, decrypted results, or
   assessment artifacts.

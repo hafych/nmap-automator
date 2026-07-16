@@ -63,7 +63,7 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -214,6 +214,9 @@ RESULTS_MAX_FILES = _parse_int_env("RESULTS_MAX_FILES", default=500, min_value=1
 RESULTS_MAX_AGE_DAYS = _parse_int_env(
     "RESULTS_MAX_AGE_DAYS", default=0, min_value=0, max_value=3650
 )
+# When false, result files without an owner prefix (pre-1.7 legacy) are hidden
+# from all operators. Prefer false for multi-token / semi-public deploys.
+LEGACY_RESULTS_SHARED = _parse_bool_env("LEGACY_RESULTS_SHARED", True)
 MAX_IMPORT_XML_BYTES = _parse_int_env(
     "MAX_IMPORT_XML_BYTES", default=64 * 1024 * 1024, min_value=1024, max_value=64 * 1024 * 1024
 )
@@ -456,11 +459,16 @@ def owner_result_prefix(owner_id: Optional[str] = None) -> str:
 
 
 def result_visible_to_owner(filename: str, owner_id: Optional[str] = None) -> bool:
-    """Legacy files (no owner prefix) remain visible to any authenticated operator."""
+    """Decide whether a stored result file is visible to the given owner.
+
+    Owned files (``o{12hex}_…``) are only visible to that owner. Legacy files
+    without a prefix are shared only when ``LEGACY_RESULTS_SHARED`` is true
+    (default for single-operator compatibility).
+    """
     owner = owner_id or current_owner_id()
     match = OWNER_RESULT_PREFIX_RE.match(filename)
     if not match:
-        return True
+        return LEGACY_RESULTS_SHARED
     return match.group(1) == owner[:12]
 
 
@@ -1610,6 +1618,7 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "max_target_addresses": MAX_TARGET_ADDRESSES,
         "results_max_files": RESULTS_MAX_FILES,
         "results_max_age_days": RESULTS_MAX_AGE_DAYS,
+        "legacy_results_shared": LEGACY_RESULTS_SHARED,
         "state_db": STATE_DB_PATH,
         "discovery_engines": {
             name: bool(path) for name, path in available_discovery_engines().items()
