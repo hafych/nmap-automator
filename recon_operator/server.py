@@ -1,7 +1,6 @@
 """Recon Operator server implementation (package entry for routes, jobs, auth)."""
 
 import asyncio
-import hashlib
 import ipaddress
 import json
 import logging
@@ -28,6 +27,8 @@ from quart import Quart, g, jsonify, request
 from telegram import Bot
 from telegram.error import TelegramError
 
+from recon_operator import auth as _auth
+from recon_operator import config as _config
 from recon_planner import build_recon_plan, recon_plan_to_jsonl, recon_plan_to_markdown
 from scan_engine import (
     PRODUCT_NAME,
@@ -65,39 +66,70 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
-VERSION = "1.9.0"
-SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
-RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
-APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
 
+# --- Config surface (source of truth: recon_operator.config) ---
+VERSION = _config.VERSION
+SCAN_LOG_PATH = _config.SCAN_LOG_PATH
+RESULTS_DIR = _config.RESULTS_DIR
+APP_HOST = _config.APP_HOST
+APP_PORT = _config.APP_PORT
+_parse_bool_env = _config._parse_bool_env
+_parse_int_env = _config._parse_int_env
+API_AUTH_REQUIRED = _config.API_AUTH_REQUIRED
+API_AUTH_HEADER = _config.API_AUTH_HEADER
+RATE_LIMIT_WINDOW_SECONDS = _config.RATE_LIMIT_WINDOW_SECONDS
+MAX_REQUESTS_PER_WINDOW = _config.MAX_REQUESTS_PER_WINDOW
+MAX_RATE_LIMIT_CLIENTS = _config.MAX_RATE_LIMIT_CLIENTS
+REDIS_URL = _config.REDIS_URL
+REDIS_RATE_LIMIT_PREFIX = _config.REDIS_RATE_LIMIT_PREFIX
+RATE_LIMIT_INCLUDE_OWNER = _config.RATE_LIMIT_INCLUDE_OWNER
+WORKER_ID = _config.WORKER_ID
+JOB_LEASE_SECONDS = _config.JOB_LEASE_SECONDS
+JOB_CLAIM_POLL_SECONDS = _config.JOB_CLAIM_POLL_SECONDS
+REDIS_JOB_LEASE_PREFIX = _config.REDIS_JOB_LEASE_PREFIX
+SCHEDULER_LOCK_NAME = _config.SCHEDULER_LOCK_NAME
+SCHEDULER_LEADER_SECONDS = _config.SCHEDULER_LEADER_SECONDS
+SCHEDULER_LEADER_POLL_SECONDS = _config.SCHEDULER_LEADER_POLL_SECONDS
+REDIS_LEADER_PREFIX = _config.REDIS_LEADER_PREFIX
+MAX_CONCURRENT_SCANS = _config.MAX_CONCURRENT_SCANS
+MAX_SCHEDULED_TASKS = _config.MAX_SCHEDULED_TASKS
+MAX_SCAN_JOBS = _config.MAX_SCAN_JOBS
+SCAN_TIMEOUT_SECONDS = _config.SCAN_TIMEOUT_SECONDS
+TOOL_INVENTORY_CACHE_SECONDS = _config.TOOL_INVENTORY_CACHE_SECONDS
+MAX_TARGET_ADDRESSES = _config.MAX_TARGET_ADDRESSES
+MAX_REQUEST_BODY_BYTES = _config.MAX_REQUEST_BODY_BYTES
+MIN_SCHEDULE_INTERVAL_MINUTES = _config.MIN_SCHEDULE_INTERVAL_MINUTES
+MAX_SCHEDULE_INTERVAL_MINUTES = _config.MAX_SCHEDULE_INTERVAL_MINUTES
+RESULTS_MAX_FILES = _config.RESULTS_MAX_FILES
+RESULTS_MAX_AGE_DAYS = _config.RESULTS_MAX_AGE_DAYS
+LEGACY_RESULTS_SHARED = _config.LEGACY_RESULTS_SHARED
+MAX_IMPORT_XML_BYTES = _config.MAX_IMPORT_XML_BYTES
+STATE_DB_PATH = _config.STATE_DB_PATH
+_load_target_allowlist = _config._load_target_allowlist
+TARGET_ALLOWLIST = _config.TARGET_ALLOWLIST
+HOST_TIMEOUT_SEC = _config.HOST_TIMEOUT_SEC
+NMAP_MAX_RETRIES = _config.NMAP_MAX_RETRIES
+FERNET_KEY = _config.FERNET_KEY
 
-def _parse_bool_env(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
-def _parse_int_env(
-    name: str,
-    default: int,
-    min_value: Optional[int] = None,
-    max_value: Optional[int] = None,
-) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (ValueError, TypeError):
-        raise RuntimeError(f"{name} must be integer, got: {value!r}")
-
-    if min_value is not None and parsed < min_value:
-        raise RuntimeError(f"{name} must be >= {min_value}, got: {parsed}")
-    if max_value is not None and parsed > max_value:
-        raise RuntimeError(f"{name} must be <= {max_value}, got: {parsed}")
-
-    return parsed
+# --- Auth surface (source of truth: recon_operator.auth) ---
+API_KEY_SCOPES = _auth.API_KEY_SCOPES
+API_KEY_ID_RE = _auth.API_KEY_ID_RE
+_normalize_key_scopes = _auth._normalize_key_scopes
+_expand_scopes = _auth._expand_scopes
+_public_api_key_view = _auth._public_api_key_view
+_load_api_auth_keys = _auth._load_api_auth_keys
+_load_api_auth_tokens = _auth._load_api_auth_tokens
+API_AUTH_KEYS = _auth.API_AUTH_KEYS
+API_AUTH_TOKENS = _auth.API_AUTH_TOKENS
+API_AUTH_TOKEN = _auth.API_AUTH_TOKEN
+_resolve_api_key = _auth._resolve_api_key
+_token_is_authorized = _auth._token_is_authorized
+scopes_allow = _auth.scopes_allow
+owner_id_from_token = _auth.owner_id_from_token
+current_owner_id = _auth.current_owner_id
+current_api_key_id = _auth.current_api_key_id
+current_scopes = _auth.current_scopes
+require_api_auth = _auth.require_api_auth
 
 
 def _create_log_handler():
@@ -127,335 +159,19 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN and CHAT_ID else None
 
-API_AUTH_REQUIRED = _parse_bool_env("API_AUTH_REQUIRED", True)
-API_AUTH_HEADER = os.getenv("API_AUTH_HEADER", "X-API-KEY").strip() or "X-API-KEY"
+_redis_client: Any = None
+_redis_init_attempted = False
+_redis_available = False
+_job_worker_task: Optional[asyncio.Task] = None
+_scheduler_leader_task: Optional[asyncio.Task] = None
+_is_scheduler_leader = False
 
-
-API_KEY_SCOPES = frozenset({"read", "scan", "admin"})
-API_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-
-
-def _normalize_key_scopes(raw: Any) -> List[str]:
-    if raw is None:
-        return ["admin"]
-    if isinstance(raw, str):
-        values = [part.strip().lower() for part in raw.split(",") if part.strip()]
-    elif isinstance(raw, (list, tuple, set)):
-        values = [str(part).strip().lower() for part in raw if str(part).strip()]
-    else:
-        raise RuntimeError("API key scopes must be a list or comma-separated string")
-    if not values:
-        raise RuntimeError("API key scopes must not be empty")
-    unknown = sorted(set(values) - API_KEY_SCOPES)
-    if unknown:
-        raise RuntimeError(
-            f"Unknown API key scopes: {', '.join(unknown)}. "
-            f"Allowed: {', '.join(sorted(API_KEY_SCOPES))}"
-        )
-    # Preserve declared order without duplicates.
-    ordered: List[str] = []
-    seen = set()
-    for scope in values:
-        if scope in seen:
-            continue
-        seen.add(scope)
-        ordered.append(scope)
-    return ordered
-
-
-def _expand_scopes(scopes: List[str]) -> frozenset:
-    """admin ⊃ scan ⊃ read."""
-    have = set(scopes)
-    if "admin" in have:
-        return frozenset(API_KEY_SCOPES)
-    if "scan" in have:
-        have.add("read")
-    return frozenset(have)
-
-
-def _public_api_key_view(key: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "id": key["id"],
-        "label": key.get("label") or key["id"],
-        "scopes": list(key.get("scopes") or []),
-        "created_at": key.get("created_at"),
-        "revoked": bool(key.get("revoked")),
-    }
-
-
-def _load_api_auth_keys() -> List[Dict[str, Any]]:
-    """Load named API keys and legacy raw tokens.
-
-    Supports:
-    - API_AUTH_KEYS JSON array of objects:
-      ``{"id","label","token","scopes","created_at","revoked"}``
-    - API_AUTH_TOKEN / API_AUTH_TOKENS (legacy full-access tokens)
-    """
-    keys: List[Dict[str, Any]] = []
-    seen_tokens: set = set()
-    seen_ids: set = set()
-
-    def add_key(
-        *,
-        key_id: str,
-        label: str,
-        token: str,
-        scopes: Any,
-        created_at: Optional[str] = None,
-        revoked: bool = False,
-    ) -> None:
-        token = (token or "").strip()
-        key_id = (key_id or "").strip()
-        if not token:
-            raise RuntimeError("API key token must not be empty")
-        if token in seen_tokens:
-            return
-        if not key_id or not API_KEY_ID_RE.fullmatch(key_id):
-            raise RuntimeError(
-                f"Invalid API key id {key_id!r}. Use 1-64 chars: letters, digits, ._- "
-                "(must start alphanumeric)."
-            )
-        if key_id in seen_ids:
-            raise RuntimeError(f"Duplicate API key id: {key_id}")
-        normalized_scopes = _normalize_key_scopes(scopes)
-        seen_tokens.add(token)
-        seen_ids.add(key_id)
-        keys.append(
-            {
-                "id": key_id,
-                "label": (label or key_id).strip()[:120] or key_id,
-                "token": token,
-                "scopes": normalized_scopes,
-                "effective_scopes": sorted(_expand_scopes(normalized_scopes)),
-                "created_at": created_at,
-                "revoked": bool(revoked),
-            }
-        )
-
-    structured = os.getenv("API_AUTH_KEYS", "").strip()
-    if structured:
-        try:
-            parsed = json.loads(structured)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("API_AUTH_KEYS must be a JSON array of key objects") from exc
-        if not isinstance(parsed, list):
-            raise RuntimeError("API_AUTH_KEYS must be a JSON array of key objects")
-        for index, item in enumerate(parsed):
-            if not isinstance(item, dict):
-                raise RuntimeError(f"API_AUTH_KEYS[{index}] must be an object")
-            token = item.get("token") or item.get("secret") or item.get("key")
-            if not isinstance(token, str) or not token.strip():
-                raise RuntimeError(f"API_AUTH_KEYS[{index}] requires a non-empty token")
-            key_id = item.get("id") or item.get("key_id") or f"key-{index + 1}"
-            label = item.get("label") or item.get("name") or str(key_id)
-            created_at = item.get("created_at")
-            if created_at is not None:
-                created_at = str(created_at)
-            add_key(
-                key_id=str(key_id),
-                label=str(label),
-                token=token,
-                scopes=item.get("scopes", ["admin"]),
-                created_at=created_at,
-                revoked=bool(item.get("revoked", False)),
-            )
-
-    # Legacy multi-token list (full admin access).
-    multi_raw = os.getenv("API_AUTH_TOKENS", "").strip()
-    legacy_tokens: List[str] = []
-    if multi_raw:
-        if multi_raw.startswith("["):
-            try:
-                parsed = json.loads(multi_raw)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    "API_AUTH_TOKENS must be a JSON array or comma-separated list"
-                ) from exc
-            if not isinstance(parsed, list):
-                raise RuntimeError("API_AUTH_TOKENS JSON value must be an array of strings")
-            legacy_tokens.extend(str(item).strip() for item in parsed if str(item).strip())
-        else:
-            legacy_tokens.extend(part.strip() for part in multi_raw.split(",") if part.strip())
-
-    single = os.getenv("API_AUTH_TOKEN", "").strip()
-    if single:
-        legacy_tokens.append(single)
-
-    for index, token in enumerate(legacy_tokens):
-        if token in seen_tokens:
-            continue
-        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
-        add_key(
-            key_id=f"legacy-{digest}" if index or len(legacy_tokens) > 1 else "primary",
-            label="Primary token"
-            if index == 0 and len(legacy_tokens) == 1
-            else f"Legacy token {index + 1}",
-            token=token,
-            scopes=["admin"],
-            created_at=None,
-            revoked=False,
-        )
-
-    return keys
-
-
-def _load_api_auth_tokens() -> list:
-    """Backward-compatible raw token list (active keys only)."""
-    return [key["token"] for key in _load_api_auth_keys() if not key.get("revoked")]
-
-
-API_AUTH_KEYS = _load_api_auth_keys()
-API_AUTH_TOKENS = [key["token"] for key in API_AUTH_KEYS if not key.get("revoked")]
-# Backward-compatible alias used by docs and older code paths.
-API_AUTH_TOKEN = API_AUTH_TOKENS[0] if API_AUTH_TOKENS else ""
 if API_AUTH_REQUIRED and not API_AUTH_TOKENS:
     raise RuntimeError(
         "API_AUTH_REQUIRED=true, but no API tokens are configured. "
         "Set API_AUTH_TOKEN, API_AUTH_TOKENS, and/or API_AUTH_KEYS."
     )
 
-RATE_LIMIT_WINDOW_SECONDS = _parse_int_env(
-    "RATE_LIMIT_WINDOW_SECONDS", default=60, min_value=1, max_value=3600
-)
-MAX_REQUESTS_PER_WINDOW = _parse_int_env(
-    "MAX_REQUESTS_PER_WINDOW", default=10, min_value=1, max_value=200
-)
-MAX_RATE_LIMIT_CLIENTS = _parse_int_env(
-    "MAX_RATE_LIMIT_CLIENTS", default=10_000, min_value=100, max_value=100_000
-)
-# Optional shared rate-limit backend for multi-worker deploys (empty = in-process memory).
-REDIS_URL = os.getenv("REDIS_URL", "").strip()
-REDIS_RATE_LIMIT_PREFIX = (
-    os.getenv("REDIS_RATE_LIMIT_PREFIX", "recon_operator:rl:").strip() or "recon_operator:rl:"
-)
-# Include authenticated owner hash in the bucket so tokens are limited independently of IP.
-RATE_LIMIT_INCLUDE_OWNER = _parse_bool_env("RATE_LIMIT_INCLUDE_OWNER", True)
-_redis_client: Any = None
-_redis_init_attempted = False
-_redis_available = False
-# Multi-worker job leases (SQLite claim + optional Redis fence).
-WORKER_ID = (os.getenv("WORKER_ID", "").strip() or f"worker-{uuid.uuid4().hex[:12]}")[:64]
-JOB_LEASE_SECONDS = _parse_int_env("JOB_LEASE_SECONDS", default=90, min_value=15, max_value=3600)
-JOB_CLAIM_POLL_SECONDS = _parse_int_env(
-    "JOB_CLAIM_POLL_SECONDS", default=2, min_value=1, max_value=60
-)
-REDIS_JOB_LEASE_PREFIX = (
-    os.getenv("REDIS_JOB_LEASE_PREFIX", "recon_operator:job_lease:").strip()
-    or "recon_operator:job_lease:"
-)
-SCHEDULER_LOCK_NAME = "scheduler"
-SCHEDULER_LEADER_SECONDS = _parse_int_env(
-    "SCHEDULER_LEADER_SECONDS", default=30, min_value=10, max_value=600
-)
-SCHEDULER_LEADER_POLL_SECONDS = _parse_int_env(
-    "SCHEDULER_LEADER_POLL_SECONDS", default=5, min_value=1, max_value=60
-)
-REDIS_LEADER_PREFIX = (
-    os.getenv("REDIS_LEADER_PREFIX", "recon_operator:leader:").strip() or "recon_operator:leader:"
-)
-_job_worker_task: Optional[asyncio.Task] = None
-_scheduler_leader_task: Optional[asyncio.Task] = None
-_is_scheduler_leader = False
-MAX_CONCURRENT_SCANS = _parse_int_env("MAX_CONCURRENT_SCANS", default=2, min_value=1, max_value=20)
-MAX_SCHEDULED_TASKS = _parse_int_env(
-    "MAX_SCHEDULED_TASKS", default=100, min_value=1, max_value=10_000
-)
-MAX_SCAN_JOBS = _parse_int_env("MAX_SCAN_JOBS", default=200, min_value=10, max_value=10_000)
-SCAN_TIMEOUT_SECONDS = _parse_int_env(
-    "SCAN_TIMEOUT_SECONDS", default=1800, min_value=60, max_value=7200
-)
-APP_PORT = _parse_int_env("APP_PORT", default=5000, min_value=1, max_value=65535)
-TOOL_INVENTORY_CACHE_SECONDS = _parse_int_env(
-    "TOOL_INVENTORY_CACHE_SECONDS", default=300, min_value=0, max_value=3600
-)
-MAX_TARGET_ADDRESSES = _parse_int_env(
-    "MAX_TARGET_ADDRESSES", default=4096, min_value=1, max_value=1_048_576
-)
-MAX_REQUEST_BODY_BYTES = _parse_int_env(
-    "MAX_REQUEST_BODY_BYTES", default=1_048_576, min_value=1024, max_value=16_777_216
-)
-MIN_SCHEDULE_INTERVAL_MINUTES = _parse_int_env(
-    "MIN_SCHEDULE_INTERVAL_MINUTES", default=1, min_value=1, max_value=1440
-)
-MAX_SCHEDULE_INTERVAL_MINUTES = _parse_int_env(
-    "MAX_SCHEDULE_INTERVAL_MINUTES", default=10_080, min_value=1, max_value=525_600
-)
-RESULTS_MAX_FILES = _parse_int_env("RESULTS_MAX_FILES", default=500, min_value=1, max_value=100_000)
-RESULTS_MAX_AGE_DAYS = _parse_int_env(
-    "RESULTS_MAX_AGE_DAYS", default=0, min_value=0, max_value=3650
-)
-# When false, result files without an owner prefix (pre-1.7 legacy) are hidden
-# from all operators. Prefer false for multi-token / semi-public deploys.
-LEGACY_RESULTS_SHARED = _parse_bool_env("LEGACY_RESULTS_SHARED", True)
-MAX_IMPORT_XML_BYTES = _parse_int_env(
-    "MAX_IMPORT_XML_BYTES", default=64 * 1024 * 1024, min_value=1024, max_value=64 * 1024 * 1024
-)
-STATE_DB_PATH = (
-    os.getenv("STATE_DB_PATH", "data/recon_operator.db").strip() or "data/recon_operator.db"
-)
-
-
-def _load_target_allowlist() -> List[str]:
-    """Load engagement-scope allowlist from env and optional file.
-
-    Empty list means unrestricted (backward compatible). Entries may be IPs,
-    CIDRs, exact hostnames, or ``*.example.com`` wildcard suffixes.
-    """
-    entries: List[str] = []
-    raw = os.getenv("TARGET_ALLOWLIST", "").strip()
-    if raw:
-        if raw.startswith("["):
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    "TARGET_ALLOWLIST must be a JSON array or comma-separated list"
-                ) from exc
-            if not isinstance(parsed, list):
-                raise RuntimeError("TARGET_ALLOWLIST JSON value must be an array of strings")
-            entries.extend(str(item).strip() for item in parsed if str(item).strip())
-        else:
-            entries.extend(part.strip() for part in raw.split(",") if part.strip())
-
-    file_path = os.getenv("TARGET_ALLOWLIST_FILE", "").strip()
-    if file_path:
-        path = Path(file_path)
-        if not path.is_file():
-            raise RuntimeError(f"TARGET_ALLOWLIST_FILE not found: {file_path}")
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise RuntimeError(f"Unable to read TARGET_ALLOWLIST_FILE: {exc}") from exc
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            entries.append(line)
-
-    unique: List[str] = []
-    seen = set()
-    for entry in entries:
-        key = entry.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(entry)
-        if len(unique) > 10_000:
-            raise RuntimeError("TARGET_ALLOWLIST exceeds 10000 entries")
-    return unique
-
-
-TARGET_ALLOWLIST = _load_target_allowlist()
-
-if MIN_SCHEDULE_INTERVAL_MINUTES > MAX_SCHEDULE_INTERVAL_MINUTES:
-    raise RuntimeError(
-        "MIN_SCHEDULE_INTERVAL_MINUTES must not exceed MAX_SCHEDULE_INTERVAL_MINUTES"
-    )
-
-HOST_TIMEOUT_SEC = _parse_int_env("NMAP_HOST_TIMEOUT_SEC", default=300, min_value=1, max_value=3600)
-NMAP_MAX_RETRIES = _parse_int_env("NMAP_MAX_RETRIES", default=2, min_value=0, max_value=10)
-
-FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
 if not FERNET_KEY:
     raise RuntimeError(
         "FERNET_KEY is not set. Provide it in .env or the environment. "
@@ -664,86 +380,6 @@ def _validate_scan_payload(
     )
 
 
-def _resolve_api_key(candidate: str) -> Optional[Dict[str, Any]]:
-    """Return the matching non-revoked key record for a presented token."""
-    if not candidate:
-        return None
-
-    # Prefer structured key registry.
-    for key in API_AUTH_KEYS:
-        if key.get("revoked"):
-            continue
-        allowed = str(key.get("token") or "")
-        if not allowed or len(candidate) != len(allowed):
-            continue
-        if secrets.compare_digest(candidate, allowed):
-            return key
-
-    # Fallback for tests that patch API_AUTH_TOKENS only.
-    for allowed in API_AUTH_TOKENS:
-        if not allowed or len(candidate) != len(allowed):
-            continue
-        if secrets.compare_digest(candidate, allowed):
-            digest = hashlib.sha256(allowed.encode("utf-8")).hexdigest()[:8]
-            return {
-                "id": f"legacy-{digest}",
-                "label": "Legacy token",
-                "token": allowed,
-                "scopes": ["admin"],
-                "effective_scopes": sorted(API_KEY_SCOPES),
-                "created_at": None,
-                "revoked": False,
-            }
-    return None
-
-
-def _token_is_authorized(candidate: str) -> bool:
-    """Multi-token check with compare_digest when lengths match."""
-    return _resolve_api_key(candidate) is not None
-
-
-def scopes_allow(have: Any, required: Any) -> bool:
-    """Return True when effective scopes satisfy the required set."""
-    have_set = set(have or [])
-    need_set = set(required or [])
-    if not need_set:
-        return True
-    if "admin" in have_set:
-        return True
-    if "scan" in have_set:
-        have_set.add("read")
-    return need_set.issubset(have_set)
-
-
-def owner_id_from_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def current_owner_id() -> str:
-    try:
-        return getattr(g, "owner_id", "local")
-    except RuntimeError:
-        # Outside a request context (startup tasks, unit helpers).
-        return "local"
-
-
-def current_api_key_id() -> str:
-    try:
-        return getattr(g, "api_key_id", "local")
-    except RuntimeError:
-        return "local"
-
-
-def current_scopes() -> frozenset:
-    try:
-        scopes = getattr(g, "scopes", None)
-        if scopes is not None:
-            return frozenset(scopes)
-    except RuntimeError:
-        pass
-    return frozenset(API_KEY_SCOPES) if not API_AUTH_REQUIRED else frozenset()
-
-
 def owner_result_prefix(owner_id: Optional[str] = None) -> str:
     value = owner_id or current_owner_id()
     return f"o{value[:12]}_"
@@ -772,46 +408,6 @@ def job_visible_to_owner(job: Dict[str, Any], owner_id: Optional[str] = None) ->
 def make_task_id(target: str, scan_type: str, owner_id: Optional[str] = None) -> str:
     owner = owner_id or current_owner_id()
     return f"o{owner[:12]}-{target}-{scan_type}"
-
-
-def require_api_auth(*required_scopes: str):
-    """Authenticate the request and optionally enforce least-privilege scopes.
-
-    Scope hierarchy: ``admin`` includes all; ``scan`` includes ``read``.
-    """
-    if not API_AUTH_REQUIRED:
-        g.owner_id = "local"
-        g.api_key_id = "local"
-        g.api_key_label = "local"
-        g.scopes = frozenset(API_KEY_SCOPES)
-        return None
-
-    token = request.headers.get(API_AUTH_HEADER)
-    if not token:
-        return jsonify({"error": f"API token missing ({API_AUTH_HEADER})"}), 401
-    key = _resolve_api_key(token)
-    if key is None:
-        return jsonify({"error": "Invalid API token"}), 403
-    if key.get("revoked"):
-        return jsonify({"error": "API key has been revoked"}), 403
-
-    g.owner_id = owner_id_from_token(token)
-    g.api_key_id = key["id"]
-    g.api_key_label = key.get("label") or key["id"]
-    g.scopes = _expand_scopes(list(key.get("scopes") or []))
-
-    if required_scopes and not scopes_allow(g.scopes, required_scopes):
-        return (
-            jsonify(
-                {
-                    "error": "Insufficient API key scope",
-                    "required": sorted(set(required_scopes)),
-                    "scopes": sorted(g.scopes),
-                }
-            ),
-            403,
-        )
-    return None
 
 
 def _client_key() -> str:
