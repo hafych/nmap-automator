@@ -189,6 +189,7 @@ curl http://127.0.0.1:5000/openapi.json
 | `GET` | `/static/*` | Dashboard CSS/JS/favicon assets (public cache) |
 | `GET` | `/favicon.ico` | Favicon (SVG) |
 | `GET` | `/live` | Liveness probe (process up) |
+| `GET` | `/metrics` | Prometheus scrape (job queues, finish totals, scan durations) |
 | `GET` | `/ready` | Readiness probe (Nmap available) |
 | `GET` | `/health` | Detailed health snapshot |
 | `GET` | `/openapi.json` | OpenAPI 3 schema |
@@ -200,6 +201,7 @@ curl http://127.0.0.1:5000/openapi.json
 | `POST` | `/schedule` | Recurring scan |
 | `GET` | `/tasks` | List scheduled tasks |
 | `DELETE` | `/tasks/<id>` | Cancel a scheduled task |
+| `GET` | `/metrics` | Prometheus text metrics (jobs, scans, durations; no auth) |
 | `GET` | `/audit` | Recent audit events (admin; no secrets) |
 | `GET` | `/results` | List encrypted result files |
 | `GET` | `/results/<id>` | Decrypt and return a stored result |
