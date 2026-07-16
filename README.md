@@ -263,6 +263,9 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `JOB_LEASE_SECONDS` | `90` | How long a worker holds an exclusive scan-job lease |
 | `JOB_CLAIM_POLL_SECONDS` | `2` | Poll interval for reclaiming queued / expired-lease jobs |
 | `REDIS_JOB_LEASE_PREFIX` | `recon_operator:job_lease:` | Redis key prefix for optional job-lease fence |
+| `SCHEDULER_LEADER_SECONDS` | `30` | Leadership lease for recurring schedules |
+| `SCHEDULER_LEADER_POLL_SECONDS` | `5` | How often workers contest/renew scheduler leadership |
+| `REDIS_LEADER_PREFIX` | `recon_operator:leader:` | Redis key prefix for optional leadership fence |
 | `MIN_SCHEDULE_INTERVAL_MINUTES` | `1` | Smallest recurring-scan interval |
 | `MAX_SCHEDULE_INTERVAL_MINUTES` | `10080` | Largest interval, in minutes |
 | `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
@@ -344,6 +347,10 @@ WORKER_ID=worker-a STATE_DB_PATH=/shared/recon.db REDIS_URL=redis://127.0.0.1:63
 # process B
 WORKER_ID=worker-b STATE_DB_PATH=/shared/recon.db REDIS_URL=redis://127.0.0.1:6379/0 python autonmap.py
 ```
+
+Recurring schedules use **scheduler leader election** (SQLite `leadership` table + optional
+Redis fence). Only the leader runs `periodic_scan` loops; other workers persist
+`POST /schedule` and cancel requests to the shared DB, and the leader syncs them.
 
 ## Development
 

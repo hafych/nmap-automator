@@ -177,8 +177,8 @@ Missing tools не устанавливались автоматически: э
 - [x] ~~Named API keys + scopes (`API_AUTH_KEYS`, `read`/`scan`/`admin`, `/auth/whoami`).~~
 - [x] ~~Optional Redis shared rate limits (`REDIS_URL`; memory fallback).~~
 - [x] ~~Multi-worker job leases (SQLite claim + optional Redis fence + claim loop).~~
+- [x] ~~Schedule multi-instance leader election (P1-03).~~
 - [ ] Full multi-tenant RBAC / UI accounts (token isolation only today).
-- [ ] Schedule multi-instance leader election (P1-03).
 - [x] ~~Поднять `autonmap.py` coverage до ≥75% (~82%; overall ~78%; fail_under 75).~~
 - [ ] Добавить CI browser E2E + axe-core для keyboard/ARIA/responsive regressions.
 

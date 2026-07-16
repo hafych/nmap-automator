@@ -147,6 +147,31 @@ class StateStoreTests(unittest.TestCase):
             released = store.get_job("lease-2")
             self.assertIsNone(released.get("lease_owner"))
 
+    def test_leadership_is_exclusive_until_expired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "leader.db"))
+            now = 2_000_000.0
+            self.assertTrue(
+                store.try_acquire_leadership("scheduler", "worker-a", now=now, lease_seconds=30)
+            )
+            self.assertFalse(
+                store.try_acquire_leadership("scheduler", "worker-b", now=now + 1, lease_seconds=30)
+            )
+            # Owner can renew.
+            self.assertTrue(
+                store.try_acquire_leadership("scheduler", "worker-a", now=now + 5, lease_seconds=30)
+            )
+            # Expired lease is stealeable.
+            self.assertTrue(
+                store.try_acquire_leadership(
+                    "scheduler", "worker-b", now=now + 40, lease_seconds=30
+                )
+            )
+            leader = store.get_leader("scheduler")
+            self.assertEqual(leader["owner_id"], "worker-b")
+            store.release_leadership("scheduler", "worker-b")
+            self.assertIsNone(store.get_leader("scheduler"))
+
 
 if __name__ == "__main__":
     unittest.main()
