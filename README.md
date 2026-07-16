@@ -360,7 +360,7 @@ ruff format --check .
 ruff check .
 python -m coverage run -m unittest discover -v
 python -m coverage report
-# Optional browser smoke (needs: python -m playwright install chromium)
+# Optional browser smoke + axe a11y (needs: python -m playwright install chromium)
 RUN_E2E=1 python -m unittest discover -s e2e -v
 bandit -q -ll -r . \
   -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_scan_engine.py,./test_tool_inventory.py,./test_openapi_contract.py,./e2e
