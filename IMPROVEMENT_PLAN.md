@@ -128,7 +128,7 @@
 | P0-03 | Docker runtime smoke: `compose up`, `/live`, `/ready`, Ping scan | подтвердить container path | S |
 | P0-04 | Обновить GitNexus index после merge | актуальный code graph | S |
 
-**Статус 2026-07-16:** код Release D (1.7.1) готов локально; push/PR/Docker smoke — ждут owner (см. §13).
+**Статус 2026-07-16:** ~~P0-01 push~~ + ~~P0-02 PR~~ → https://github.com/hafych/nmap-automator/pull/10 (1.7.2). P0-03 Docker smoke / P0-04 reindex after merge.
 
 **Критерий done:** PR green CI, compose health ok, README quick start воспроизводим.
 
@@ -233,12 +233,13 @@
 
 ### Release D — «Ship & stabilize» (1 неделя)
 
-1. P0-01…P0-04 push/PR/smoke — **open** (needs owner push/Docker)  
-2. ~~P1-10…P1-11 coverage~~ — **done** (autonmap ~82%, overall ~78%, fail_under 75)  
+1. ~~P0-01 push + P0-02 PR~~ — **done** ([PR #10](https://github.com/hafych/nmap-automator/pull/10)); P0-03 Docker smoke / P0-04 reindex still open  
+2. ~~P1-10…P1-11 coverage~~ — **done** (autonmap ~82%, overall ~79%, fail_under 75)  
 3. ~~P1-08 legacy results policy flag~~ — **done** (`LEGACY_RESULTS_SHARED`)  
-4. ~~Changelog + migration notes~~ — **done** (README + §13 / SECURITY notes)
+4. ~~Changelog + migration notes~~ — **done** (README + §13 / SECURITY notes)  
+5. ~~P1-04 target allowlist~~ — **done** (1.7.2)
 
-**Ship:** 1.7.1 ready for PR → `main` after P0 push/smoke.
+**Ship:** 1.7.2 on PR #10 → `main` after CI + optional Docker smoke.
 
 ### Release E — «Team operators» (2–3 недели)
 
