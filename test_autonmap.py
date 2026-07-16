@@ -644,6 +644,108 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("refresh({ announce: false })", body)
 
 
+class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        autonmap.scan_jobs.clear()
+        autonmap.rate_limits.clear()
+
+    async def asyncTearDown(self):
+        for job in list(autonmap.scan_jobs.values()):
+            task = job.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+        autonmap.scan_jobs.clear()
+        autonmap.rate_limits.clear()
+
+    async def test_run_scan_job_skips_when_claim_fails(self):
+        autonmap.scan_jobs["j-skip"] = {
+            "job_id": "j-skip",
+            "target": "127.0.0.1",
+            "scan_type": "Ping",
+            "status": "queued",
+            "created_at": "t0",
+            "kind": "immediate",
+            "task": None,
+            "owner_id": "local",
+        }
+        original_claim = autonmap._claim_job_for_worker
+        original_get = autonmap.state_store.get_job
+        autonmap._claim_job_for_worker = lambda _job_id: None
+        autonmap.state_store.get_job = lambda _job_id: {
+            "job_id": "j-skip",
+            "target": "127.0.0.1",
+            "scan_type": "Ping",
+            "status": "running",
+            "lease_owner": "other-worker",
+            "kind": "immediate",
+            "created_at": "t0",
+            "owner_id": "local",
+            "task": None,
+        }
+        try:
+            await autonmap._run_scan_job("j-skip")
+            self.assertEqual(autonmap.scan_jobs["j-skip"]["lease_owner"], "other-worker")
+            self.assertIsNone(autonmap.scan_jobs["j-skip"].get("task"))
+        finally:
+            autonmap._claim_job_for_worker = original_claim
+            autonmap.state_store.get_job = original_get
+
+    async def test_adopt_claimed_job_runs_with_already_claimed(self):
+        original_scan = autonmap.scan_network
+        original_sender = autonmap.send_telegram_message
+        original_results = autonmap.RESULTS_DIR
+        original_release = autonmap.state_store.release_job_lease
+        original_renew = autonmap._renew_job_lease
+
+        async def ignore_message(_message):
+            return None
+
+        def fake_scan(*_a, **_k):
+            return {"hosts": [], "scan_count": 0}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            autonmap.RESULTS_DIR = tmp
+            autonmap.scan_network = fake_scan
+            autonmap.send_telegram_message = ignore_message
+            autonmap.state_store.release_job_lease = lambda *_a, **_k: None
+            autonmap._renew_job_lease = lambda _job_id: True
+            try:
+                claimed = {
+                    "job_id": "j-adopt",
+                    "target": "127.0.0.1",
+                    "scan_type": "Ping",
+                    "status": "running",
+                    "created_at": "t0",
+                    "started_at": "t1",
+                    "kind": "immediate",
+                    "owner_id": "local",
+                    "lease_owner": autonmap.WORKER_ID,
+                    "lease_until": time.time() + 60,
+                    "ports": None,
+                    "scripts": None,
+                    "discovery": None,
+                    "result": None,
+                    "result_file": None,
+                    "error": None,
+                    "finished_at": None,
+                    "task": None,
+                }
+                await autonmap._adopt_claimed_job(claimed)
+                for _ in range(50):
+                    status = autonmap.scan_jobs["j-adopt"]["status"]
+                    if status in {"completed", "failed", "timeout"}:
+                        break
+                    await asyncio.sleep(0.02)
+            finally:
+                autonmap.scan_network = original_scan
+                autonmap.send_telegram_message = original_sender
+                autonmap.RESULTS_DIR = original_results
+                autonmap.state_store.release_job_lease = original_release
+                autonmap._renew_job_lease = original_renew
+
+        self.assertEqual(autonmap.scan_jobs["j-adopt"]["status"], "completed")
+
+
 class NamedApiKeyScopeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         autonmap.scan_tasks.clear()
@@ -1048,7 +1150,7 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 404)
 
-    async def test_load_persisted_state_marks_inflight_failed(self):
+    async def test_load_persisted_state_requeues_expired_inflight(self):
         original_results = list(autonmap.scan_jobs.items())
         autonmap.scan_jobs.clear()
 
@@ -1061,6 +1163,8 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
                     "status": "running",
                     "kind": "immediate",
                     "created_at": "t0",
+                    "lease_owner": "old-worker",
+                    "lease_until": time.time() - 10,
                     "task": None,
                 }
             ]
@@ -1069,8 +1173,8 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
             return []
 
         def fake_upsert(job):
-            self.assertEqual(job["status"], "failed")
-            self.assertIn("restart", job["error"].lower())
+            self.assertEqual(job["status"], "queued")
+            self.assertIsNone(job.get("lease_owner"))
 
         original_jobs = autonmap.state_store.list_jobs
         original_tasks = autonmap.state_store.list_scheduled_tasks
@@ -1080,7 +1184,7 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
         autonmap.state_store.upsert_job = fake_upsert
         try:
             await autonmap.load_persisted_state()
-            self.assertEqual(autonmap.scan_jobs["inflight-1"]["status"], "failed")
+            self.assertEqual(autonmap.scan_jobs["inflight-1"]["status"], "queued")
         finally:
             autonmap.state_store.list_jobs = original_jobs
             autonmap.state_store.list_scheduled_tasks = original_tasks

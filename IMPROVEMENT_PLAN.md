@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.8.1  
+**Текущая версия кода:** 1.8.2  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -141,7 +141,7 @@
 | ID | Задача | Детали | Effort |
 | --- | --- | --- | ---: |
 | P1-01 | ~~Redis (или shared store) для rate limits~~ | `REDIS_URL` sliding window; memory fallback | M |
-| P1-02 | Job queue multi-worker | lease/lock: только один worker крутит job | L |
+| P1-02 | ~~Job queue multi-worker~~ | SQLite lease + optional Redis fence + claim loop | L |
 | P1-03 | Schedule durability under multi-instance | leader election или external cron + claim | L |
 | P1-04 | ~~Explicit target allowlist / engagement scopes~~ | `TARGET_ALLOWLIST` + `TARGET_ALLOWLIST_FILE` | M |
 
@@ -407,6 +407,7 @@
 | 2026-07-16 | 1.7.2 | P1-04 target allowlist (`TARGET_ALLOWLIST` / file), health flags |
 | 2026-07-16 | 1.8.0 | P1-05/06/07 named API keys, scopes, whoami + dashboard key meta |
 | 2026-07-16 | 1.8.1 | P1-01 optional Redis shared rate limits + owner-aware buckets |
+| 2026-07-16 | 1.8.2 | P1-02 multi-worker job leases (SQLite claim, Redis fence, poller) |
 
 ---
 
