@@ -1,7 +1,7 @@
 # Recon Operator — полный план улучшений
 
 **Продукт:** Recon Operator (ранее Nmap Automator)  
-**Текущая версия кода:** 1.9.5  
+**Текущая версия кода:** 1.9.6  
 **Ветка:** `beta-hardening`  
 **Дата плана:** 2026-07-16  
 **Связанные файлы:** `AUDIT_CHECKLIST.md`, `README.md`, `SECURITY.md`
@@ -417,6 +417,7 @@
 | 2026-07-16 | 1.9.3 | P2-04/05/08: pin GHA+redis digests; trusted proxy mode |
 | 2026-07-16 | 1.9.4 | P2-06/07: Fernet multi-key rotation + audit log |
 | 2026-07-16 | 1.9.5 | P2-11: Prometheus `/metrics` (Release F / P2 done bar) |
+| 2026-07-16 | 1.9.6 | AI-01: budgeted `/ai/pack` (token-efficient recon handoff) |
 
 ---
 

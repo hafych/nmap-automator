@@ -29,6 +29,7 @@ from telegram.error import TelegramError
 
 from recon_operator import auth as _auth
 from recon_operator import config as _config
+from recon_operator.ai_pack import build_ai_pack, normalize_budget
 from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 from recon_operator.metrics import METRICS
 from recon_planner import build_recon_plan, recon_plan_to_jsonl, recon_plan_to_markdown
@@ -2266,6 +2267,148 @@ async def recon_plan():
     return jsonify(plan), 200
 
 
+async def _resolve_scan_for_pack(
+    *,
+    body: Optional[Dict[str, Any]] = None,
+    result_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str], Optional[str]]:
+    """Return (scan, error, resolved_result_id, resolved_job_id)."""
+    body = body or {}
+    result_id = (result_id or body.get("result_id") or body.get("id") or "").strip() or None
+    job_id = (job_id or body.get("job_id") or "").strip() or None
+
+    # Explicit scan payload wins when it looks like a parsed result.
+    scan = body.get("scan") or body.get("result")
+    if isinstance(scan, dict) and isinstance(scan.get("hosts"), list):
+        return scan, None, result_id, job_id
+    if (
+        not result_id
+        and not job_id
+        and isinstance(body, dict)
+        and isinstance(body.get("hosts"), list)
+    ):
+        return body, None, None, None
+
+    if job_id:
+        async with _jobs_lock:
+            job = scan_jobs.get(job_id)
+        if job is None:
+            job = await asyncio.to_thread(state_store.get_job, job_id)
+        if not job or not job_visible_to_owner(job):
+            return None, "Job not found", None, job_id
+        if job.get("status") != "completed":
+            return (
+                None,
+                f"Job is not completed (status={job.get('status')})",
+                None,
+                job_id,
+            )
+        result = job.get("result")
+        if isinstance(result, dict) and isinstance(result.get("hosts"), list):
+            return result, None, job.get("result_file"), job_id
+        file_name = job.get("result_file")
+        if file_name:
+            result_id = str(file_name)
+        else:
+            return None, "Job completed without a loadable result", None, job_id
+
+    if result_id:
+        path = _safe_result_path(result_id)
+        if path is None or not result_visible_to_owner(path.name):
+            return None, "Result not found", result_id, job_id
+        try:
+            encrypted = await asyncio.to_thread(path.read_bytes)
+            plaintext = cipher.decrypt(encrypted)
+            payload = json.loads(plaintext.decode("utf-8"))
+        except InvalidToken:
+            return None, "Unable to decrypt result with configured FERNET_KEY", result_id, job_id
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None, "Result file is unreadable", result_id, job_id
+        if not isinstance(payload, dict) or not isinstance(payload.get("hosts"), list):
+            return None, "Stored result is not a parsed scan with hosts[]", result_id, job_id
+        return payload, None, path.name, job_id
+
+    return None, "Provide scan JSON body, result_id, or job_id", None, None
+
+
+@app.route("/ai/pack", methods=["GET", "POST"])
+async def ai_pack():
+    """Budgeted AI recon pack (default small/compact NDJSON, not full archive)."""
+    auth_error = require_api_auth("read")
+    if auth_error:
+        return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    body: Dict[str, Any] = {}
+    if request.method == "POST":
+        payload = await request.get_json(silent=True)
+        if isinstance(payload, dict):
+            body = payload
+
+    budget_raw = request.args.get("budget") or body.get("budget") or "s"
+    try:
+        budget = normalize_budget(budget_raw)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    output_format = (
+        request.args.get("format") or body.get("format") or "jsonl"
+    ).strip().lower()
+    include_closed = _bool_query_param("include_closed", False) or bool(
+        body.get("include_closed")
+    )
+    # Full archive still available via detail=full|l budget or /results/<id>.
+    if str(request.args.get("detail") or body.get("detail") or "").lower() in {
+        "full",
+        "l",
+        "large",
+        "archive",
+    }:
+        budget = "l"
+
+    result_id = (request.args.get("result_id") or request.args.get("id") or "").strip() or None
+    job_id = (request.args.get("job_id") or "").strip() or None
+    scan, error, resolved_result_id, resolved_job_id = await _resolve_scan_for_pack(
+        body=body, result_id=result_id, job_id=job_id
+    )
+    if error:
+        status = 404 if "not found" in error.lower() else 400
+        return jsonify({"error": error}), status
+
+    inventory = await asyncio.to_thread(
+        get_cached_tool_inventory, expand=_bool_query_param("expand", False)
+    )
+    try:
+        pack_body, content_type, rows = await asyncio.to_thread(
+            build_ai_pack,
+            scan,
+            budget=budget,
+            inventory=inventory,
+            format=output_format,
+            job_id=resolved_job_id,
+            result_id=resolved_result_id,
+            include_closed=include_closed and budget == "l",
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        log_event(f"AI pack build failed: {exc}")
+        return jsonify({"error": "Failed to build AI pack"}), 500
+
+    record_audit_event(
+        "ai.pack",
+        target=str(scan.get("target") or "")[:256] or None,
+        scan_type=str(scan.get("scan_type") or "")[:64] or None,
+        job_id=resolved_job_id,
+        result_file=resolved_result_id,
+        status=budget,
+        detail=f"lines={len(rows)};format={output_format}",
+    )
+    return pack_body, 200, {"Content-Type": content_type, "Cache-Control": "no-store"}
+
+
 def _render_dashboard_html() -> tuple:
     nonce = secrets.token_urlsafe(18)
     html = UI_HTML.replace("__CSP_NONCE__", nonce)
@@ -2826,6 +2969,54 @@ def build_openapi_spec() -> dict:
                     "responses": {"200": {"description": "Plan JSON/Markdown/JSONL"}},
                 }
             },
+            "/ai/pack": {
+                "get": {
+                    "summary": "Budgeted AI recon pack (result_id or job_id)",
+                    "parameters": [
+                        {
+                            "name": "budget",
+                            "in": "query",
+                            "schema": {
+                                "type": "string",
+                                "enum": ["s", "m", "l"],
+                                "default": "s",
+                            },
+                            "description": "s=brief (default), m=session, l=fuller pack",
+                        },
+                        {"name": "result_id", "in": "query", "schema": {"type": "string"}},
+                        {"name": "job_id", "in": "query", "schema": {"type": "string"}},
+                        {
+                            "name": "format",
+                            "in": "query",
+                            "schema": {
+                                "type": "string",
+                                "enum": ["jsonl", "json"],
+                                "default": "jsonl",
+                            },
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Compact NDJSON/JSON pack"},
+                        "400": {"description": "Missing reference or bad budget"},
+                        "404": {"description": "Job/result not found"},
+                    },
+                },
+                "post": {
+                    "summary": "Budgeted AI recon pack from posted scan JSON",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "description": "scan/result with hosts[], or result_id/job_id",
+                                }
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "Compact NDJSON/JSON pack"}},
+                },
+            },
             "/": {
                 "get": {
                     "summary": "Operator dashboard",
@@ -3018,6 +3209,26 @@ async def api_docs():
                     "scope": "read",
                     "request": {"scan": "Parsed scan response or object with hosts[]"},
                     "formats": "json|jsonl|markdown",
+                },
+                "GET|POST /ai/pack": {
+                    "description": (
+                        "Token-efficient AI recon pack (default budget=s NDJSON). "
+                        "Prefer this over pasting full /results JSON into an LLM."
+                    ),
+                    "scope": "read",
+                    "query": {
+                        "budget": "s|m|l (default s; s ≤4KiB/100 lines)",
+                        "result_id": "stored encrypted result filename",
+                        "job_id": "completed job id",
+                        "format": "jsonl|json",
+                        "detail": "full|l upgrades to large pack",
+                    },
+                    "request": {
+                        "scan": "parsed scan with hosts[]",
+                        "budget": "optional s|m|l",
+                        "result_id": "optional",
+                        "job_id": "optional",
+                    },
                 },
             },
         }
