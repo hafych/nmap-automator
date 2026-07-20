@@ -192,6 +192,9 @@ def _run_tracked(
         )
     finally:
         _unregister_process(process_token, proc)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def supported_scan_types() -> Sequence[str]:

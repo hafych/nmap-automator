@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -6,6 +7,16 @@ from state_store import StateStore
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_connection_context_closes_after_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "connection.db"))
+            conn = store._connect()
+            with conn as active:
+                self.assertEqual(active.execute("SELECT 1").fetchone()[0], 1)
+
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
     def test_scheduled_tasks_and_jobs_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(os.path.join(tmp, "state.db"))

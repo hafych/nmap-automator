@@ -70,6 +70,16 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action);
 """
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """SQLite connection that closes after its transaction context exits."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class StateStore:
     """Thread-safe SQLite store for durable operator state."""
 
@@ -83,7 +93,12 @@ class StateStore:
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        conn = sqlite3.connect(
+            self.path,
+            timeout=30,
+            check_same_thread=False,
+            factory=_ClosingConnection,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
