@@ -102,6 +102,18 @@ command as `ready`, `missing`, or `unknown`, and leaves execution to the operato
 
 ## Core workflows
 
+### Operator dashboard
+
+The browser UI follows the full local operator loop instead of exposing a long form:
+
+1. **Connect** — open `Connection`, enter the API token, and verify the key identity/scopes. The token stays in tab-scoped session storage and is never placed in a URL.
+2. **Operate** — choose an authorized target and named preset. The dashboard explains the scan profile and impact before launch; ports, NSE scripts, discovery frontends, schedules, and XML import remain available as progressive controls.
+3. **Activity** — follow queued/running/completed work, durations, result availability, and cancel active jobs or schedules with an explicit confirmation.
+4. **Results** — select encrypted history, review host/service metrics and the structured service table, then switch between Summary, JSON, JSONL, Recon Plan, AI Brief, and Diff views.
+5. **Assurance** — run visible multi-phase playbooks, evaluate expected-service posture drift, inspect tool readiness, and view admin audit events. Plans and AI recommendations remain review-only.
+
+The shell supports light/dark system themes, keyboard navigation, reduced motion, and narrow screens down to 320 px without horizontal page overflow.
+
 ### Run an immediate scan
 
 Scans are queued as jobs by default (`202 Accepted`). Poll until completion, or pass
@@ -417,7 +429,9 @@ python -m recon_operator
 ## Roadmap
 
 The prioritized improvement plan (completed work, P0–P3 backlog, release sequence, and
-definition of done) lives in [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md).
+definition of done) lives in [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md). The professional
+product audit and verified 1.12 hardening checklist live in
+[PROFESSIONAL_MASTER_PLAN.md](PROFESSIONAL_MASTER_PLAN.md).
 
 ## Contributing
 

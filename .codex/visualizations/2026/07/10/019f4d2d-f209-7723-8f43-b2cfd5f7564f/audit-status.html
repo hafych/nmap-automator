@@ -1,0 +1,169 @@
+<div id="nmap-audit-status">
+  <div class="viz-grid audit-metrics" aria-label="Ключевые результаты аудита">
+    <div class="card viz-stat">
+      <span class="text-muted">Tests</span>
+      <span class="viz-stat-value">41 / 41</span>
+      <span class="text-small">62% branch coverage</span>
+    </div>
+    <div class="card viz-stat">
+      <span class="text-muted">API routes</span>
+      <span class="viz-stat-value">8 / 8</span>
+      <span class="text-small">functional smoke passed</span>
+    </div>
+    <div class="card viz-stat">
+      <span class="text-muted">Tool catalog</span>
+      <span class="viz-stat-value">29 + 13</span>
+      <span class="text-small">essential tools + Kali profiles</span>
+    </div>
+  </div>
+
+  <div class="viz-controls" aria-label="Срез результатов">
+    <button class="btn btn-primary" type="button" data-mode="verified" aria-pressed="true">Проверено</button>
+    <button class="btn" type="button" data-mode="fixed" aria-pressed="false">Исправлено</button>
+    <button class="btn" type="button" data-mode="backlog" aria-pressed="false">Backlog</button>
+  </div>
+
+  <div class="audit-chart" role="img" aria-labelledby="audit-chart-label">
+    <span id="audit-chart-label" class="sr-only">Проверки по слоям приложения</span>
+    <div class="audit-rows" aria-live="polite"></div>
+  </div>
+</div>
+
+<style>
+  #nmap-audit-status {
+    display: grid;
+    gap: 16px;
+    width: 100%;
+  }
+
+  #nmap-audit-status .audit-rows {
+    display: grid;
+    gap: 12px;
+  }
+
+  #nmap-audit-status .audit-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 180px) minmax(100px, 1fr) minmax(66px, auto);
+    gap: 12px;
+    align-items: center;
+  }
+
+  #nmap-audit-status .audit-track {
+    height: 14px;
+    background: color-mix(in srgb, var(--muted) 70%, transparent);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  #nmap-audit-status .audit-bar {
+    height: 100%;
+    width: var(--audit-width);
+    background: var(--audit-color);
+    border-radius: inherit;
+    transition: width 220ms ease;
+  }
+
+  #nmap-audit-status .audit-value {
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 480px) {
+    #nmap-audit-status .audit-row {
+      grid-template-columns: 1fr auto;
+      gap: 6px 10px;
+    }
+
+    #nmap-audit-status .audit-track {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #nmap-audit-status .audit-bar {
+      transition: none;
+    }
+  }
+</style>
+
+<script>
+  (() => {
+    const root = document.getElementById("nmap-audit-status");
+    const rows = root.querySelector(".audit-rows");
+    const label = root.querySelector("#audit-chart-label");
+    const datasets = {
+      verified: {
+        description: "Доля завершённых проверок по слоям",
+        color: "var(--viz-series-1)",
+        items: [
+          ["UI / UX", 100, "11 / 11"],
+          ["API", 100, "10 / 10"],
+          ["Tools & artifacts", 100, "50 / 50"],
+          ["Backend & security", 90, "9 / 10"],
+          ["CI & delivery", 92, "11 / 12"]
+        ]
+      },
+      fixed: {
+        description: "Восемь реализованных product и maintenance исправлений",
+        color: "var(--viz-series-2)",
+        items: [
+          ["UI / accessibility", 4, "4 fixes"],
+          ["CLI / artifact security", 2, "2 fixes"],
+          ["Dependencies / CI", 2, "2 fixes"]
+        ]
+      },
+      backlog: {
+        description: "Оставшиеся улучшения по приоритету и одно ограничение среды",
+        color: "var(--viz-series-3)",
+        items: [
+          ["P1 deployment", 4, "4 items"],
+          ["P2 hardening", 7, "7 items"],
+          ["P3 operator UX", 4, "4 items"],
+          ["Environment", 1, "Docker"]
+        ]
+      }
+    };
+
+    function render(mode) {
+      const dataset = datasets[mode];
+      const max = Math.max(...dataset.items.map((item) => item[1]));
+      label.textContent = dataset.description;
+      rows.replaceChildren(...dataset.items.map(([name, value, display]) => {
+        const row = document.createElement("div");
+        row.className = "audit-row";
+        row.setAttribute("aria-label", `${name}: ${display}`);
+
+        const nameNode = document.createElement("span");
+        nameNode.textContent = name;
+
+        const track = document.createElement("div");
+        track.className = "audit-track";
+        const bar = document.createElement("div");
+        bar.className = "audit-bar";
+        bar.style.setProperty("--audit-width", `${Math.max(4, (value / max) * 100)}%`);
+        bar.style.setProperty("--audit-color", dataset.color);
+        track.appendChild(bar);
+
+        const valueNode = document.createElement("span");
+        valueNode.className = "audit-value";
+        valueNode.textContent = display;
+
+        row.append(nameNode, track, valueNode);
+        return row;
+      }));
+
+      root.querySelectorAll("[data-mode]").forEach((button) => {
+        const selected = button.dataset.mode === mode;
+        button.setAttribute("aria-pressed", String(selected));
+        button.classList.toggle("btn-primary", selected);
+      });
+    }
+
+    root.querySelectorAll("[data-mode]").forEach((button) => {
+      button.addEventListener("click", () => render(button.dataset.mode));
+    });
+
+    render("verified");
+  })();
+</script>
